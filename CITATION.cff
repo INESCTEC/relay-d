@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Relay-D"
+abstract: >-
+  A combined ROS 2 package for the full Learning-from-Demonstration loop:
+  recording robot sensor data, converting it into training data, and running
+  the trained policy back on the robot.
+type: software
+authors:
+  - given-names: Pedro
+    family-names: Dias
+    affiliation: INESC TEC
+  - given-names: Artur
+    family-names: Cordeiro
+    affiliation: INESC TEC
+version: 0.1.0
+date-released: "2026-08-10"
+repository-code: "https://github.com/pascd/Relay-D"
+url: "https://github.com/pascd/Relay-D"
+license: GPL-3.0-or-later
+keywords:
+  - robotics
+  - ros2
+  - learning-from-demonstration
+  - imitation-learning
+  - robomimic

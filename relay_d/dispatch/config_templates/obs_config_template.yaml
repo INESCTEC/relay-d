@@ -1,0 +1,468 @@
+# =============================================================================
+# obs_config.yaml — Full Reference Template
+# =============================================================================
+# This file documents every supported input type and field spec syntax.
+# Copy the parts you need into your working obs_config.yaml.
+#
+# Structure:
+#   config.sync        — optional admissible timestamp gap between inputs
+#   config.input       — define data sources (topics and TF pairs)
+#   config.observations — define what the model receives, in training order
+#
+# IMPORTANT: observation order must exactly match the training checkpoint.
+#
+# Camera / organized-pointcloud obs (passthrough — see the "source:" example
+# near the bottom of config.input / config.observations below) require
+# --backend robomimic at inference time. The default --backend custom has no
+# vision encoder and will raise a clear error if handed one of these.
+# =============================================================================
+
+config:
+
+  # ===========================================================================
+  # SYNC — admissible timestamp gap between an observation's live inputs
+  # ===========================================================================
+  # Topic inputs carry their own timestamp (msg.header.stamp), or the arrival
+  # time if the message has no header (e.g. std_msgs/Bool, Float64). TF inputs
+  # use the TransformStamped's header.stamp from the lookup. Static inputs
+  # never carry a real timestamp and are always treated as "now".
+  #
+  # When an observation is built from 2+ distinct live (non-static) inputs,
+  # their timestamps must fall within `threshold` seconds of each other or
+  # the observation is skipped this cycle (sample-and-hold — it keeps its
+  # last value until inputs realign). A warning is logged once per
+  # observation the first time this happens.
+  #
+  # Tune `threshold` to your slowest relevant publish/poll rate. TF is
+  # polled at 50 Hz (20 ms period), so 0.05 (50 ms) covers a couple of
+  # missed poll cycles as a starting point.
+  #
+  # Omit this whole section to disable the sync check (all inputs are
+  # combined as soon as they're available, regardless of timestamp).
+  # ===========================================================================
+  # sync:
+  #   threshold: 0.05   # seconds
+
+  # ===========================================================================
+  # INPUTS — physical data sources
+  # ===========================================================================
+  # Topic inputs: identified by presence of "topic" key.
+  #   - Message type is AUTO-DISCOVERED from the ROS2 topic graph (no msg_type needed).
+  #   - If the topic isn't advertised yet, the node retries every 1 s automatically.
+  #   - joint_names (optional): filter and order JointState joints.
+  #
+  # TF inputs: identified by presence of "parent_frame" + "child_frame".
+  #   - Polled at 50 Hz via tf2_ros.Buffer.
+  #   - tf_topic / tf_static_topic (optional): read this TF tree from a
+  #     topic other than the global /tf and /tf_static (e.g. a namespaced
+  #     robot_state_publisher publishing to /robot_1/tf instead of
+  #     remapping to /tf). Defaults shown below — omit either key to use
+  #     the default. Per-input: each TF entry can point at a different
+  #     topic pair independently. A custom tf_topic that can't be
+  #     subscribed to, or never produces the configured transform, makes
+  #     node startup fail loudly (TfTopicSubscriptionError) — it never
+  #     silently falls back to reading /tf, /tf_static instead.
+  # ===========================================================================
+  input:
+
+    # --- JointState topic (with optional joint filter + ordering) ---
+    # joint_1:
+    #   topic: /joint_states
+    #   joint_names:              # optional — filters to these joints in this order
+    #     - iiwa_joint_1
+    #     - iiwa_joint_2
+    #     - iiwa_joint_3
+    #     - iiwa_joint_4
+    #     - iiwa_joint_5
+    #     - iiwa_joint_6
+    #     - iiwa_joint_7
+
+    # --- JointState without filter (returns all joints in message order) ---
+    # joint_all:
+    #   topic: /joint_states
+
+    # --- Scalar numeric topics (Float32, Float64, Int32, Int64) ---
+    # force_z:
+    #   topic: /force_sensor/z
+    # mode_flag:
+    #   topic: /current_mode      # std_msgs/Int32 — use .data in observation spec
+
+    # --- Bool topic (True -> 1.0, False -> 0.0) ---
+    # gripper_contact:
+    #   topic: /gripper/contact   # std_msgs/Bool — use .data in observation spec
+
+    # --- PoseStamped topic ---
+    # ee_pose:
+    #   topic: /ee_pose_stamped   # geometry_msgs/PoseStamped
+
+    # --- WrenchStamped topic ---
+    # ft_sensor:
+    #   topic: /ft_sensor/wrench  # geometry_msgs/WrenchStamped
+
+    # --- Imu topic ---
+    # imu:
+    #   topic: /imu/data          # sensor_msgs/Imu
+
+    # --- TransformStamped topic (not TF lookup — a topic that publishes a transform) ---
+    # tf_pub:
+    #   topic: /published_transform  # geometry_msgs/TransformStamped
+
+    # --- Gripper or custom topic ---
+    # gripper_state:
+    #   topic: /RobotiqGripperState
+
+    # --- Camera (rgb/depth Image) and organized PointCloud2 (scan) ---
+    # Same input form as acquisition's config_template.yaml — message type is
+    # auto-discovered the same way as any other topic input. `modality: depth`
+    # decodes with cv_bridge's "passthrough" mode instead of "bgr8" so the
+    # native depth encoding is preserved; omit for plain rgb. Reference these
+    # in config.observations below via the "source:" passthrough form, NOT a
+    # normal field spec (there is no float field to extract — see below).
+    # camera_rgb:
+    #   topic: /camera/color/image_raw
+    # camera_depth:
+    #   topic: /camera/depth/image_rect_raw
+    #   modality: depth
+    # camera_pointcloud:
+    #   topic: /camera/depth/points   # must be an ORGANIZED cloud (height > 1);
+    #                                 # unorganized/ragged clouds are not
+    #                                 # supported here (same restriction as the
+    #                                 # acquisition-side config_template.yaml).
+
+    # --- Static (constant) inputs — no topic required ---
+    # Use when a topic is not available in the deployment system but the model
+    # was trained expecting that observation. The value never changes at runtime.
+    # Reference in observations as: <name>.data[:] (list) or <name>.data (scalar).
+    #
+    # gripper_state:
+    #   static: [1.0]       # list form → use gripper_state.data[:]
+    # some_flag:
+    #   static: 0.0         # scalar form → use some_flag.data
+
+    # --- TF inputs (parent_frame + child_frame) ---
+    # tf_eef:
+      # parent_frame: base
+      # child_frame: tool0
+
+    # --- TF input read from a non-default TF tree ---
+    # tf_object:
+      # parent_frame: base
+      # child_frame: object_frame
+      # tf_topic: /robot_1/tf
+      # tf_static_topic: /robot_1/tf_static
+
+  # ===========================================================================
+  # OBSERVATIONS — vectors the model receives, in training order
+  # ===========================================================================
+  # Each key maps to a flat float32 vector built from one or more field specs.
+  # Specs within a key are concatenated in listed order.
+  #
+  # Spec syntax:
+  #   <input_name>.<field>           — scalar: one float
+  #   <input_name>.<field>[:]        — slice: all elements of an iterable
+  #   sin(<spec>)  /  cos(<spec>)    — element-wise trig applied to any spec above
+  #   zero:N                         — N literal zeros (no input needed)
+  #   <spec> <op> <spec>             — arithmetic between two SCALAR specs.
+  #                                    op is one of + - * /  and MUST have spaces
+  #                                    around it (e.g. "a.x - b.x") — that's what
+  #                                    distinguishes it from an ordinary dotted
+  #                                    path. One operation per spec; slices ([:])
+  #                                    are not valid operands. sin()/cos() may
+  #                                    wrap either operand or the whole expression.
+  #
+  # TF field paths (auto-prefixed with "transform." internally):
+  #   translation.x / translation.y / translation.z
+  #   rotation.x / rotation.y / rotation.z / rotation.w
+  #   euler.roll / euler.pitch / euler.yaw         (ZYX radians)
+  #   rot6d.i0 .. rot6d.i5                         (first 2 cols of R, col-major)
+  #   rot_matrix.r00 .. rot_matrix.r22             (full 3x3, row-major)
+  #
+  # NORMALIZATION:
+  #   Plain list form → values passed through unchanged (no normalization).
+  #   Dict form → optional linear mapping from real-world range to model range.
+  #
+  #   Plain list (no normalization):
+  #     my_obs:
+  #       - input.field[:]
+  #
+  #   Dict form with normalization:
+  #     my_obs:
+  #       specs:
+  #         - input.field[:]
+  #       normalize: true
+  #       normalized_range: [-1.0, 1.0]   # target range (default [-1, 1])
+  #       limits:
+  #         - {lower_lim: -3.14, upper_lim: 3.14}   # one per element, OR
+  #         - {lower_lim: -2.09, upper_lim: 2.09}   #   one entry → broadcast to all
+  #
+  #   Key names match action_config.yaml (lower_lim / upper_lim).
+  #   Normalization and action denormalization are exact inverses — same limits apply.
+  #
+  # ROTATION FORMAT (dict form only):
+  #   rotation_format: rpy
+  #     Treats the 4 listed specs as one quaternion in x, y, z, w order and
+  #     converts it to (roll, pitch, yaw) — ZYX radians, same convention as the
+  #     <tf>.euler.* paths and action_config.yaml's euler_to_quat.
+  #
+  #     Conversion happens BEFORE normalization, so the observation is 3
+  #     elements wide (not 4) and `limits` takes 3 entries — one per axis —
+  #     or 1 to broadcast.
+  #
+  #     Unlike the <tf_input>.euler.roll shortcut, which only exists for TF
+  #     inputs, rotation_format works for ANY input that carries a quaternion:
+  #     TF, geometry_msgs/PoseStamped, sensor_msgs/Imu, TransformStamped
+  #     topics, custom messages.
+  #
+  #     Requires exactly 4 specs, each a plain scalar field path: no "[:]"
+  #     slices, no zero:N, no arithmetic, no sin()/cos().
+  # ===========================================================================
+  observations:
+
+    # --- Placeholder zeros ---
+    # object:
+    #   - zero:10
+
+    # --- EEF Euler angles (Quat -> Euler, ZYX radians) ---
+    # The system reads the TF quaternion and converts automatically to roll/pitch/yaw.
+    # ZYX convention matches the euler_to_quat transform in action_config.yaml, so the
+    # model sees and outputs Euler angles in the same convention.
+    #
+    # Plain (no normalization):
+    # robot0_eef_euler:
+    #   - tf_eef.euler.roll
+    #   - tf_eef.euler.pitch
+    #   - tf_eef.euler.yaw
+    #
+    # With per-element normalization (recommended when limits differ per axis):
+    # robot0_eef_euler:
+    #   specs:
+    #     - tf_eef.euler.roll
+    #     - tf_eef.euler.pitch
+    #     - tf_eef.euler.yaw
+    #   normalize: true
+    #   normalized_range: [-1.0, 1.0]
+    #   limits:
+    #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # roll  (±180°)
+    #     - {lower_lim: -1.5708, upper_lim: 1.5708}   # pitch (±90°, avoids gimbal lock zone)
+    #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # yaw   (±180°)
+    #
+    # NOTE: if the model also outputs Euler angles (action side), use the same limits
+    # in action_config.yaml → euler_to_quat entry so normalization and denormalization
+    # are exact inverses.
+
+    # --- Quaternion -> roll/pitch/yaw via rotation_format (ANY input) ---
+    # Same result as the euler.* block above, but works for non-TF inputs too.
+    # The 4 quaternion specs collapse to 3 values, so limits has 3 entries.
+    #
+    # From a PoseStamped topic:
+    # ee_rotation_rpy:
+    #   specs:
+    #     - ee_pose.pose.orientation.x
+    #     - ee_pose.pose.orientation.y
+    #     - ee_pose.pose.orientation.z
+    #     - ee_pose.pose.orientation.w
+    #   rotation_format: rpy
+    #   normalize: true
+    #   normalized_range: [-1.0, 1.0]
+    #   limits:
+    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # roll
+    #     - {lower_lim: -1.57079633, upper_lim: 1.57079633}   # pitch
+    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # yaw
+    #
+    # From a TF input (equivalent to listing tf_eef.euler.roll/pitch/yaw):
+    # eef_rotation_action:
+    #   specs:
+    #     - tf_eef.rotation.x
+    #     - tf_eef.rotation.y
+    #     - tf_eef.rotation.z
+    #     - tf_eef.rotation.w
+    #   rotation_format: rpy
+    #   normalize: true
+    #   normalized_range: [-1.0, 1.0]
+    #   limits:
+    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # roll
+    #     - {lower_lim: -1.57079633, upper_lim: 1.57079633}   # pitch
+    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # yaw
+    #
+    # Order matters: x, y, z, w (w LAST). A wrong order yields wrong angles
+    # silently — the node logs a warning if the 4 field names aren't x/y/z/w.
+
+    # --- EEF 6D rotation (preferred for learned policies — continuous, no gimbal lock) ---
+    # robot0_eef_rot6d:
+    #   - tf_eef.rot6d.i0
+    #   - tf_eef.rot6d.i1
+    #   - tf_eef.rot6d.i2
+    #   - tf_eef.rot6d.i3
+    #   - tf_eef.rot6d.i4
+    #   - tf_eef.rot6d.i5
+
+    # --- EEF full 3x3 rotation matrix (row-major) ---
+    # robot0_eef_rotmat:
+    #   - tf_eef.rot_matrix.r00
+    #   - tf_eef.rot_matrix.r01
+    #   - tf_eef.rot_matrix.r02
+    #   - tf_eef.rot_matrix.r10
+    #   - tf_eef.rot_matrix.r11
+    #   - tf_eef.rot_matrix.r12
+    #   - tf_eef.rot_matrix.r20
+    #   - tf_eef.rot_matrix.r21
+    #   - tf_eef.rot_matrix.r22
+
+    # --- Mix translation + rotation in one observation ---
+    # robot0_eef_pose6d:
+    #   - tf_eef.translation.x
+    #   - tf_eef.translation.y
+    #   - tf_eef.translation.z
+    #   - tf_eef.euler.roll
+    #   - tf_eef.euler.pitch
+    #   - tf_eef.euler.yaw
+
+    # --- Joint positions — plain list (no normalization) ---
+    # robot0_joint_pos:
+    #   - joint_1.position[:]
+
+    # --- Joint positions — with per-element normalization ---
+    # robot0_joint_pos:
+    #   specs:
+    #     - joint_1.position[:]
+    #   normalize: true
+    #   normalized_range: [-1.0, 1.0]
+    #   limits:                                        # one entry per joint
+    #     - {lower_lim: -2.9671, upper_lim: 2.9671}   # iiwa_joint_1  (±170°)
+    #     - {lower_lim: -2.0944, upper_lim: 2.0944}   # iiwa_joint_2  (±120°)
+    #     - {lower_lim: -2.9671, upper_lim: 2.9671}   # iiwa_joint_3  (±170°)
+    #     - {lower_lim: -2.0944, upper_lim: 2.0944}   # iiwa_joint_4  (±120°)
+    #     - {lower_lim: -2.9671, upper_lim: 2.9671}   # iiwa_joint_5  (±170°)
+    #     - {lower_lim: -2.0944, upper_lim: 2.0944}   # iiwa_joint_6  (±120°)
+    #     - {lower_lim: -3.0543, upper_lim: 3.0543}   # iiwa_joint_7  (±175°)
+
+    # --- EEF position — with broadcast normalization (same range for x, y, z) ---
+    # robot0_eef_pos:
+    #   specs:
+    #     - tf_eef.translation.x
+    #     - tf_eef.translation.y
+    #     - tf_eef.translation.z
+    #   normalize: true
+    #   normalized_range: [-1.0, 1.0]
+    #   limits:
+    #     - {lower_lim: -2.0, upper_lim: 2.0}    # one entry → applied to x, y, and z
+
+    # --- Joint velocities ---
+    # robot0_joint_vel:
+    #   - joint_1.velocity[:]
+
+    # --- Joint sin/cos (useful for policies trained with trig features) ---
+    # robot0_joint_pos_sin:
+    #   - sin(joint_1.position[:])
+    # robot0_joint_pos_cos:
+    #   - cos(joint_1.position[:])
+
+    # --- Gripper (scalar .data field, duplicated for two channels) ---
+    # robot0_gripper_qpos:
+    #   - gripper_state.data
+    #   - gripper_state.data
+
+    # --- Object TF (position + quaternion) ---
+    # object:
+    #   - tf_object.translation.x
+    #   - tf_object.translation.y
+    #   - tf_object.translation.z
+    #   - tf_object.rotation.x
+    #   - tf_object.rotation.y
+    #   - tf_object.rotation.z
+    #   - tf_object.rotation.w
+
+    # --- Object relative to tool (mix two TF inputs in one observation) ---
+    # object_rel:
+    #   - tf_tool0_object.translation.x
+    #   - tf_tool0_object.translation.y
+    #   - tf_tool0_object.translation.z
+
+    # --- Derived values: arithmetic between two specs ---
+    # Each side is an ordinary scalar spec (optionally sin()/cos()-wrapped) and
+    # the two sides may reference different inputs. The operator (+ - * /) must
+    # have spaces around it. Mixes freely with ordinary specs, and works in the
+    # plain list form (no normalize/limits) as shown here.
+    #
+    # object:
+    #   - tf_object.translation.x
+    #   - tf_object.translation.y
+    #   - tf_object.translation.z
+    #   - tf_object.rotation.x
+    #   - tf_object.rotation.y
+    #   - tf_object.rotation.z
+    #   - tf_object.rotation.w
+    #   - tf_object.translation.x - tf_eef.translation.x   # gripper_to_cube x
+    #   - tf_object.translation.y - tf_eef.translation.y   # gripper_to_cube y
+    #   - tf_object.translation.z - tf_eef.translation.z   # gripper_to_cube z
+    #
+    # Rules and gotchas:
+    #   - One operation per spec: "a.x - b.x - c.x" is rejected at startup.
+    #   - Slices are not allowed as operands: "a.position[:] - b.position[:]".
+    #   - Numeric literals are not supported — use a static input as a constant:
+    #       input:  z_offset: {static: 0.1}
+    #       spec:   tf_object.translation.z - z_offset.data
+    #   - Both operand inputs count towards the sync check for this observation
+    #     (see config.sync above), so an obs that used to depend on one input
+    #     may now sample-and-hold when the two inputs' stamps drift apart.
+    #   - Angle subtraction is plain subtraction — no +/-pi wrap-around handling.
+    #   - sin()/cos() may wrap either operand, e.g. "sin(a.yaw) - sin(b.yaw)",
+    #     or the whole expression, e.g. "sin(a.yaw - b.yaw)".
+
+    # --- Force-torque sensor ---
+    # ft_force:
+    #   - ft_sensor.wrench.force.x
+    #   - ft_sensor.wrench.force.y
+    #   - ft_sensor.wrench.force.z
+    # ft_torque:
+    #   - ft_sensor.wrench.torque.x
+    #   - ft_sensor.wrench.torque.y
+    #   - ft_sensor.wrench.torque.z
+
+    # --- PoseStamped topic (position + orientation) ---
+    # ee_pos_from_topic:
+    #   - ee_pose.pose.position.x
+    #   - ee_pose.pose.position.y
+    #   - ee_pose.pose.position.z
+    # ee_quat_from_topic:
+    #   - ee_pose.pose.orientation.x
+    #   - ee_pose.pose.orientation.y
+    #   - ee_pose.pose.orientation.z
+    #   - ee_pose.pose.orientation.w
+
+    # --- IMU orientation ---
+    # imu_orientation:
+    #   - imu.orientation.x
+    #   - imu.orientation.y
+    #   - imu.orientation.z
+    #   - imu.orientation.w
+
+    # --- TransformStamped published as topic (NOT a TF lookup) ---
+    # tf_topic_pos:
+    #   - tf_pub.transform.translation.x
+    #   - tf_pub.transform.translation.y
+    #   - tf_pub.transform.translation.z
+
+    # --- Binary contact sensor (Bool: True->1.0, False->0.0) ---
+    # contact:
+    #   - gripper_contact.data
+
+    # --- Float64 scalar ---
+    # external_force:
+    #   - force_z.data
+
+    # --- Camera / organized-pointcloud passthrough obs ---
+    # No specs, no normalize/rotation_format — the decoded array is used
+    # exactly as received (uint8 (H,W,3) for rgb, native dtype (H,W) for
+    # depth, float32 (H,W,fields) for an organized pointcloud). `source` must
+    # name an `input:` entry above resolving to sensor_msgs/Image or an
+    # ORGANIZED sensor_msgs/PointCloud2. Mirrors the acquisition-side
+    # bridge-map obs (config_template.yaml's `output: agentview_image:
+    # camera_rgb/images`) that the checkpoint was trained against — the
+    # obs_key here should match that bridge-map key exactly.
+    #
+    # Requires --backend robomimic (see the note at the top of this file).
+    # agentview_image:
+    #   source: camera_rgb
+    # agentview_pointcloud:
+    #   source: camera_pointcloud

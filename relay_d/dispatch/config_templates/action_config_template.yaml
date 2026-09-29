@@ -1,0 +1,663 @@
+# =============================================================================
+# action_config.yaml — Full Reference Template
+# =============================================================================
+# This file documents every supported dispatch method, limit option, and
+# transform type. Copy the parts you need into your working action_config.yaml.
+#
+# Processing pipeline for each action entry:
+#   1. Extract slice:    values = model_output[indices]
+#   2. Denormalize:      map each value from normalized_range → [lower_lim, upper_lim]
+#                        (skipped if denormalize: false)
+#   3. Apply transform:  optional per-entry post-processing
+#   4. Dispatch:         send via command / topic / action
+#
+# DENORMALIZATION:
+#   Symmetric inverse of obs_config.yaml normalization — same limits syntax applies.
+#
+#   Per-index form (one limit per index):
+#     my_action:
+#       indices: [0, 1, 2]
+#       denormalize: true
+#       normalized_range: [-1.0, 1.0]
+#       limits:
+#         - {lower_lim: -2.9, upper_lim: 2.9}   # index 0
+#         - {lower_lim: -2.1, upper_lim: 2.1}   # index 1
+#         - {lower_lim: -2.9, upper_lim: 2.9}   # index 2
+#
+#   Broadcast form (one entry → applied to all indices):
+#     my_action:
+#       indices: [0, 1, 2]
+#       denormalize: true
+#       normalized_range: [-1.0, 1.0]
+#       limits:
+#         - {lower_lim: -0.5, upper_lim: 0.5}   # applied to indices 0, 1, and 2
+#
+#   Backward compat: apply_limits: true/false is still accepted (alias for denormalize).
+# =============================================================================
+#
+# QUICK REFERENCE — every key an action entry can use
+# -----------------------------------------------------------------------------
+#   indices           list[int]      required.  positions to slice from the action array
+#   denormalize       bool           optional.  model range -> real-world (default true; alias: apply_limits)
+#   normalized_range  [min, max]     optional.  model output range (default [-1.0, 1.0])
+#   limits            list[dict]     required if denormalizing. {lower_lim, upper_lim} per index, or 1 entry to broadcast
+#   transform         dict           optional.  one of: scale / threshold / clip / vacuum / magnetic / euler_to_quat
+#                                                (see TRANSFORMS section below)
+#
+#   -- then pick exactly ONE dispatch method --
+#   command                                 METHOD 1.  shell string, {I[0]}, {I[1]}, ... substituted, run via subprocess
+#   topic + msg_type                        METHOD 2.  ROS2 publisher; needs `mapping`
+#   action: true + action_type + topic      METHOD 3.  ROS2 ActionClient; needs `mapping`
+#                                                       (action_type is "pkg/action/Name", topic is the action's name)
+#
+#   mapping           dict           Methods 2/3.  field_path (dot/bracket) -> slice index, or list of indices
+#   goal_init         dict           Methods 2/3.  pre-populate literal/static fields + pre-allocate arrays first
+#   frame_id          str            Methods 2/3.  optional, fills header.frame_id if the message has one
+#   feedback          dict           Methods 2/3 only, opt-in.  Block dispatch() until completion is confirmed
+#                                                  (or timeout) before returning — see MOVE_ARM_JOINT_WAIT_ACK and
+#                                                  ROBOTIQ_GRIPPER examples below. Per-entry opt-in, NOT a global
+#                                                  topic/action setting — every other entry, and every message from
+#                                                  a continuously-streaming policy loop, stays fire-and-forget.
+#
+#     -- common to both methods --
+#     success_field   str            dot-path field on the ack/result/feedback message checked for success.
+#                                                  Method 2 defaults to "reached" (matches ArmCommandStatus);
+#                                                  Method 3 has NO default — required, since Result/Feedback
+#                                                  shapes vary per action type.
+#     success_value   any            value success_field must equal (default: true). Works for bool
+#                                                  (true/false), string ("REACHED"), or int (e.g. stop_mode: 1).
+#     timeout         float          seconds to wait before giving up (default 10.0).
+#     on_timeout      str            "warn" (default: log + let dispatch() proceed) or "raise" (raise
+#                                                  RuntimeError out of dispatch() — propagates through
+#                                                  step()/run() uncaught; use for a hard-stop-on-failure setup).
+#
+#     -- Method 2 (topic) only --
+#     ack_topic       str            required.  topic the driver publishes its ack/status message on
+#     ack_msg_type    str            required.  "pkg/msg/Name" of that ack message
+#     correlation_field str          optional.  field on the ack echoing back the command's header.stamp, so a
+#                                                  stale ack from a previous publish isn't mistaken for this one.
+#                                                  Default: "command_stamp" (matches ArmCommandStatus). Set to
+#                                                  null to disable correlation (accept whatever ack arrives next).
+#
+#     -- Method 3 (action) only --
+#     source          str            "result" (default) — wait for the action's terminal Result via
+#                                                  get_result_async(), the correct completion signal for a
+#                                                  well-behaved action server. "feedback" — instead watch the
+#                                                  continuous Feedback stream and succeed as soon as one Feedback
+#                                                  message matches success_field/success_value (for a server that
+#                                                  only ever signals completion through feedback ticks).
+# =============================================================================
+
+actions:
+
+  # Already working for ibot setup
+  move_eef:
+    indices: [0, 1, 2, 3, 4, 5, 6]        # Pose
+    denormalize: false
+    msg_type: kuka_iiwa_arm_sim_interface/msg/ArmCommand
+    topic: /kuka_iiwa_arm_interface/streaming_command
+    # Native in-process publisher — do NOT switch this back to a shelled-out
+    # `ros2 topic pub` command. A single `ros2 topic pub -1` invocation takes
+    # ~1.5s to spin up rclpy/DDS, publish, and exit; at 20Hz that backlogs
+    # into 7-8+ concurrent competing processes whose publish order is
+    # essentially random OS-scheduling luck, which — combined with
+    # use_delta: true — silently scrambles the order deltas are applied in.
+    goal_init:
+      use_delta: true
+      speed: 12.0
+      acceleration: 0.6
+      blending: 0.0
+      duration: 0.0
+      transforms: 1        # pre-allocate 1 TransformStamped
+      "transforms[0].header.frame_id": "base"
+      "transforms[0].child_frame_id": "robotiq_tcp"
+    mapping:
+      "transforms[0].transform.translation.x": 0
+      "transforms[0].transform.translation.y": 1
+      "transforms[0].transform.translation.z": 2
+      "transforms[0].transform.rotation.x": 3
+      "transforms[0].transform.rotation.y": 4
+      "transforms[0].transform.rotation.z": 5
+      "transforms[0].transform.rotation.w": 6
+
+  move_arm_joint:
+    indices: [0, 1, 2, 3, 4, 5, 6]        # 7 iiwa joint positions (or deltas)
+    denormalize: false                    # set true + add limits if the model
+                                          # outputs normalized joint values instead
+    msg_type: kuka_iiwa_arm_sim_interface/msg/ArmCommand
+    topic: /kuka_iiwa_arm_interface/streaming_command
+    goal_init:
+      use_delta: true                     # false if positions are absolute targets
+      speed: 12.0
+      acceleration: 0.6
+      blending: 0.0
+      duration: 0.0
+      joint_trajectory: 1                 # pre-allocate 1 JointTrajectoryPoint
+    mapping:
+      "joint_trajectory[0].positions": [0, 1, 2, 3, 4, 5, 6]
+
+  # Same as move_arm_joint, but for sending DISCRETE ABSOLUTE waypoints one
+  # at a time and only advancing once the arm has actually settled there —
+  # NOT for a continuously-streaming policy loop (that would turn every tick
+  # into a stop-and-wait step). Requires the kuka_iiwa_arm_interface driver
+  # to support ArmCommand.wait_ack / publish ArmCommandStatus acks.
+  #
+  # move_arm_joint_wait_ack:
+  #   indices: [0, 1, 2, 3, 4, 5, 6]
+  #   denormalize: false
+  #   msg_type: ibot_common/msg/ArmCommand
+  #   topic: /kuka_iiwa_arm_interface/streaming_command
+  #   goal_init:
+  #     use_delta: false                     # absolute joint targets
+  #     speed: 12.0
+  #     acceleration: 0.6
+  #     blending: 0.0
+  #     joint_trajectory: 1                  # pre-allocate 1 JointTrajectoryPoint
+  #     wait_ack: true                       # ask the driver for a real
+  #                                           # settle-detected ack for THIS
+  #                                           # entry's messages only
+  #   mapping:
+  #     "joint_trajectory[0].positions": [0, 1, 2, 3, 4, 5, 6]
+  #   feedback:                              # block dispatch() until that ack
+  #     ack_topic: /kuka_iiwa_arm_interface/streaming_command/status
+  #     ack_msg_type: ibot_common/msg/ArmCommandStatus
+  #     success_field: skill_status          # customized: string match
+  #     success_value: "REACHED"             # instead of the default
+  #                                           # reached: true bool check
+  #     timeout: 15.0
+  #     on_timeout: warn
+
+  robotiq_gripper:
+    indices: [7]
+    denormalize: true
+    normalized_range: [-1.0, 1.0]
+    limits:
+      - {lower_lim: 0.0, upper_lim: 255.0}
+    action: true
+    action_type: robotiq_gripper_skill_msgs/action/RobotiqGripperSkill
+    topic: /RobotiqGripperSkill
+    goal_init:
+      mode: "BASIC"
+      force: 100
+      velocity: 100
+    mapping:
+      position: 7
+
+  # Same as robotiq_gripper, but blocking dispatch() until the gripper skill
+  # itself confirms completion — illustrative; adjust success_field/
+  # success_value to match this action's REAL Result/Feedback fields (field
+  # names below are placeholders, not a guarantee of what
+  # robotiq_gripper_skill_msgs actually defines).
+  #
+  # robotiq_gripper_wait_ack:
+  #   indices: [7]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: 0.0, upper_lim: 255.0}
+  #   action: true
+  #   action_type: robotiq_gripper_skill_msgs/action/RobotiqGripperSkill
+  #   topic: /RobotiqGripperSkill
+  #   goal_init:
+  #     mode: "BASIC"
+  #     force: 100
+  #     velocity: 100
+  #   mapping:
+  #     position: 7
+  #   feedback:
+  #     source: result                       # or "feedback" if this server
+  #                                           # only ever signals completion
+  #                                           # via feedback, never a Result
+  #     success_field: skill_status
+  #     success_value: "REACHED"
+  #     timeout: 10.0
+
+  # ===========================================================================
+  # DISPATCH METHOD 1: command (shell string with {I[n]} placeholders)
+  # ===========================================================================
+  # Simplest method. The processed slice values are substituted into the
+  # command string as {I[0]}, {I[1]}, etc., then executed via shell.
+  # ===========================================================================
+
+  # # --- 7-DOF arm via ros2 topic pub ---
+  # move_arm:
+  #   indices: [0, 1, 2, 3, 4, 5, 6]
+  #   denormalize: false                     # set true to enable denormalization
+  #   normalized_range: [-1.0, 1.0]           # model output range
+  #   limits:
+  #     - {lower_lim: -2.9,  upper_lim:  2.9}   # joint 0 (radians)
+  #     - {lower_lim: -2.1,  upper_lim:  2.1}   # joint 1
+  #     - {lower_lim: -2.9,  upper_lim:  2.9}   # joint 2
+  #     - {lower_lim: -2.1,  upper_lim:  2.1}   # joint 3
+  #     - {lower_lim: -2.9,  upper_lim:  2.9}   # joint 4
+  #     - {lower_lim: -2.1,  upper_lim:  2.1}   # joint 5
+  #     - {lower_lim: -3.0,  upper_lim:  3.0}   # joint 6
+  #   command: >
+  #     ros2 topic pub -1 /arm_interface/command pkg/msg/ArmCommand
+  #     "{joints: [{I[0]}, {I[1]}, {I[2]}, {I[3]}, {I[4]}, {I[5]}, {I[6]}]}"
+
+  # # --- Single-value action (e.g. screwdriver duration) ---
+  # screwdriver:
+  #   indices: [7]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: 0.0, upper_lim: 5.0}    # duration in seconds
+  #   command: >
+  #     ros2 action send_goal /ScrewdriverSkill screwdriver_msgs/action/Screwdriver
+  #     "{duration: {I[0]}}"
+
+
+  # ===========================================================================
+  # DISPATCH METHOD 2: topic (ROS2 publisher with field mapping)
+  # ===========================================================================
+  # Creates a ROS2 publisher and fills message fields from slice indices.
+  # msg_type: full ROS2 type string (e.g. geometry_msgs/msg/Point)
+  # mapping:  field_path (dot-separated, bracket-indexed) -> slice index (0-based)
+  # frame_id: optional, fills header.frame_id if the message has a header
+  # ===========================================================================
+
+  # arm_via_topic:
+  #   indices: [0, 1, 2]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: -0.5, upper_lim: 0.5}
+  #     - {lower_lim: -0.5, upper_lim: 0.5}
+  #     - {lower_lim:  0.0, upper_lim: 0.5}
+  #   topic: /target_position
+  #   msg_type: geometry_msgs/msg/PointStamped
+  #   frame_id: base
+  #   mapping:
+  #     point.x: 0
+  #     point.y: 1
+  #     point.z: 2
+
+  # --- mapping field paths: bracket indexing and list-valued entries ---
+  # A field path is a dot-separated walk through the message; any segment
+  # may carry a [N] index into an array field the same way, e.g.:
+  #   "transforms[0].transform.translation.x": 0
+  #   "points[1].positions[2]":                3
+  # Indices aren't limited to 0 — transforms[1], transforms[2], etc. all
+  # work, as long as the array already has that many elements (see
+  # goal_init's array pre-allocation below — mapping only ever INDEXES INTO
+  # an existing element, it never appends one).
+  #
+  # A mapping value can also be a LIST of slice indices instead of a single
+  # int, to set an entire float64[]-style array field atomically in one shot
+  # rather than element-by-element:
+  #   "joint_trajectory[0].positions": [0, 1, 2, 3, 4, 5, 6]
+  # (equivalent in effect to 7 separate ".positions[k]": idx entries, but
+  # required for fields the ROS message type only lets you assign as a whole
+  # list, e.g. trajectory_msgs/JointTrajectoryPoint.positions)
+
+
+  # ===========================================================================
+  # DISPATCH METHOD 3: action (ROS2 action client)
+  # ===========================================================================
+  # Sends a ROS2 action goal via a persistent ActionClient (goal accept/reject
+  # is logged; see _goal_response_callback). Requires:
+  #   action:      true                          (bool flag selecting this path)
+  #   action_type: pkg/action/Name                (dot-path import string)
+  #   topic:       /ActionServerName               (the actual ROS2 action name)
+  # mapping keys are field paths on the goal message itself — do NOT prefix
+  # them with "goal." (the goal object IS the mapping root, same as topic
+  # dispatch's message root).
+  #
+  # NOTE: for simple one-shot goals, the `command`-based
+  # `ros2 action send_goal ...` form (see DISPATCH METHOD 1 above) is often
+  # simpler and is what this repo's own gripper actions use in practice —
+  # native action: true dispatch is worth it mainly when you need persistent
+  # goal-handle/feedback tracking across ticks.
+  #
+  # Worked example — RobotiqGripperSkill's Goal is {string mode, uint8 force,
+  # uint8 position, uint8 velocity}. `mode`/`force`/`velocity` are fixed
+  # constants every tick, so they belong in goal_init (set AS-IS, no float
+  # coercion); only `position` comes from the model, so it's the one mapping
+  # entry. CAVEAT: mapping always does float(value) before setattr, and
+  # ROS2's generated uint8 setters reject a float outright — the failure is
+  # only logged, not raised, so `position` would silently stay 0. This is
+  # exactly why the ACTIVE robotiq_gripper entry above uses `command:`
+  # instead — prefer that form for any action whose Goal has integer fields.
+  # skill_via_action:
+  #   indices: [7]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: 0.0, upper_lim: 255.0}
+  #   action: true
+  #   action_type: robotiq_gripper_skill_msgs/action/RobotiqGripperSkill
+  #   topic: /RobotiqGripperSkill
+  #   goal_init:
+  #     mode: "BASIC"
+  #     force: 100
+  #     velocity: 100
+  #   mapping:
+  #     position: 0
+
+
+  # ===========================================================================
+  # goal_init (optional, for topic AND action dispatch)
+  # ===========================================================================
+  # Pre-populates STATIC/LITERAL fields on the message/goal before `mapping`
+  # fills in the model-derived ones on top. Use it for anything that is a
+  # fixed constant for every tick — frame_ids, mode flags, speed/acceleration
+  # params, pre-allocating array-typed fields — as opposed to `mapping`, which
+  # is exclusively for "this field comes from index N of the action vector".
+  #
+  # Key differences from `mapping`:
+  #   - goal_init values are set AS-IS (string/bool/int/float/list all work).
+  #   - mapping values are always coerced to float (they come from the model).
+  #
+  # ARRAY PRE-ALLOCATION:
+  #   A bare top-level key (no dots, no brackets) with a plain int value
+  #   pre-allocates that many fresh elements on an empty ROS array field:
+  #     goal_init:
+  #       transforms: 1        # append 1 new element to the `transforms` array
+  #   Only field names registered in ARRAY_TYPES (in _init_goal,
+  #   relay_d/dispatch/action_dispatcher.py) can be pre-allocated this
+  #   way — currently: move_point, points, joint_trajectory, transforms.
+  #   A new array-typed field needs a code change (add it to ARRAY_TYPES),
+  #   not just a YAML edit.
+  #   GOTCHA: because "bare key + int value" is the only signal used to
+  #   detect a pre-allocation request, a genuine literal top-level int field
+  #   would be misread as an array-count request unless its name happens to
+  #   already be in ARRAY_TYPES — there's no escape hatch for that case.
+  #
+  # Once pre-allocated, use the SAME bracket-indexed dot-paths as `mapping`
+  # to set literal subfields on individual elements — not limited to index 0:
+  #     "transforms[0].header.frame_id":     "base"
+  #     "transforms[0].child_frame_id":      "robotiq_tcp"
+  #
+  # ---------------------------------------------------------------------------
+  # Worked example — production pattern (see config/action_config.yaml's real
+  # move_eef entry). Model outputs 7 raw pose deltas that are ALREADY in the
+  # units the robot interface expects, so limits/denormalize are omitted
+  # entirely — they aren't required.
+  # ---------------------------------------------------------------------------
+  # move_eef:
+  #   indices: [0, 1, 2, 3, 4, 5, 6]        # x, y, z, qx, qy, qz, qw deltas
+  #   denormalize: false                    # no limits -> nothing to denormalize
+  #   msg_type: my_arm_interface/msg/ArmCommand
+  #   topic: /arm_interface/streaming_command
+  #   goal_init:
+  #     use_delta: true
+  #     speed: 12.0
+  #     acceleration: 0.6
+  #     blending: 0.0
+  #     duration: 0.0
+  #     transforms: 1                              # pre-allocate 1 TransformStamped
+  #     "transforms[0].header.frame_id": "base"
+  #     "transforms[0].child_frame_id": "robotiq_tcp"
+  #   mapping:
+  #     "transforms[0].transform.translation.x": 0
+  #     "transforms[0].transform.translation.y": 1
+  #     "transforms[0].transform.translation.z": 2
+  #     "transforms[0].transform.rotation.x":    3
+  #     "transforms[0].transform.rotation.y":    4
+  #     "transforms[0].transform.rotation.z":    5
+  #     "transforms[0].transform.rotation.w":    6
+
+  # ---------------------------------------------------------------------------
+  # Alternative to move_eef — JOINT-SPACE control via ArmCommand.joint_trajectory
+  # ---------------------------------------------------------------------------
+  # Same message/topic as move_eef above, for models that output 7 joint
+  # positions (or deltas) directly instead of a Cartesian pose delta.
+  # `transforms` and `joint_trajectory` are mutually exclusive on this
+  # message — leave whichever one you're not using untouched; an array field
+  # that's never referenced in goal_init/mapping is simply left empty, which
+  # is exactly what the message expects for the unused trajectory type.
+  #
+  # FIELD-PATH GOTCHA: joint_trajectory IS the array itself (a
+  # trajectory_msgs/JointTrajectoryPoint[] directly on ArmCommand) — there is
+  # no intermediate JointTrajectory.points[] wrapper. So goal_init pre-
+  # allocates ONE JointTrajectoryPoint the same way `transforms: 1` does
+  # above, and mapping sets all 7 of its `.positions` values in a SINGLE
+  # list-valued entry (see the list-valued mapping note under DISPATCH
+  # METHOD 2) rather than 7 separate bracket-indexed scalar entries.
+  # ---------------------------------------------------------------------------
+  # move_arm_joint:
+  #   indices: [0, 1, 2, 3, 4, 5, 6]        # 7 iiwa joint positions (or deltas)
+  #   denormalize: false                    # set true + add limits if the model
+  #                                          # outputs normalized joint values instead
+  #   msg_type: kuka_iiwa_arm_sim_interface/msg/ArmCommand
+  #   topic: /kuka_iiwa_arm_interface/streaming_command
+  #   goal_init:
+  #     use_delta: true                     # false if positions are absolute targets
+  #     speed: 12.0
+  #     acceleration: 0.6
+  #     blending: 0.0
+  #     duration: 0.0
+  #     joint_trajectory: 1                 # pre-allocate 1 JointTrajectoryPoint
+  #   mapping:
+  #     "joint_trajectory[0].positions": [0, 1, 2, 3, 4, 5, 6]
+
+
+  # ===========================================================================
+  # TRANSFORMS (optional, applied after limits, before dispatch)
+  # ===========================================================================
+  # Only one transform per action entry. Types:
+  #
+  #   scale         — linear remap: [in_min, in_max] -> [out_min, out_max]
+  #   threshold     — binarize: value > threshold -> 1.0, else -> 0.0
+  #   clip          — clamp to [out_min, out_max]
+  #   vacuum        — vacuum gripper: threshold -> channel value + power limit
+  #   magnetic      — magnetic gripper: threshold -> mode + strength scaling
+  #   euler_to_quat — splice: replace 3 Euler angles with 4 quaternion values
+  #                   (see ROTATION CONVERSIONS section below for full examples)
+  # ===========================================================================
+
+  # Example: threshold on a binary gripper command
+  # gripper_binary:
+  #   indices: [7]
+  #   denormalize: false
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: 0.0, upper_lim: 1.0}
+  #   transform:
+  #     type: threshold
+  #     threshold: 0.5
+  #   command: "ros2 topic pub -1 /gripper/cmd std_msgs/msg/Bool \"{data: {I[0]}}\""
+
+  # Example: scale transform
+  # velocity_scaled:
+  #   indices: [0, 1, 2]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: -1.0, upper_lim: 1.0}
+  #     - {lower_lim: -1.0, upper_lim: 1.0}
+  #     - {lower_lim: -1.0, upper_lim: 1.0}
+  #   transform:
+  #     type: scale
+  #     in_min: -1.0
+  #     in_max:  1.0
+  #     out_min: -0.1
+  #     out_max:  0.1
+  #   command: "ros2 topic pub -1 /cmd_vel ... \"{I[0]}, {I[1]}, {I[2]}\""
+
+  # Example: clip transform
+  # safe_velocity:
+  #   indices: [0, 1, 2]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: -0.5, upper_lim: 0.5}
+  #     - {lower_lim: -0.5, upper_lim: 0.5}
+  #     - {lower_lim: -0.5, upper_lim: 0.5}
+  #   transform:
+  #     type: clip
+  #     out_min: -0.3
+  #     out_max:  0.3
+  #   command: "..."
+
+  # Example: vacuum transform (VGC10-style gripper)
+  # Reads only values[0] (the first slice index) as the activation signal;
+  # returns a fixed-shape dict {0: channel, 1: channel, 2: power_limit} meant
+  # for {I[n]} command templating (or numeric-keyed mapping, less common).
+  # vacuum_gripper:
+  #   indices: [7]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: 0.0, upper_lim: 1.0}
+  #   transform:
+  #     type: vacuum
+  #     threshold: 0.5        # optional, default 0.0 — values[0] > threshold -> activate
+  #     max_suction: 255      # optional, default 255 — channel value when active
+  #     power_limit: 400      # optional, default 400
+  #   command: >
+  #     ros2 action send_goal /OnrobotVgc10Skill
+  #     onrobot_vgc10_skill_msgs/action/OnrobotVgc10Skill
+  #     "{a: {I[0]}, b: {I[1]}, ma: {I[2]}}"
+
+  # Example: magnetic transform (MG10-style gripper)
+  # Also reads only values[0]; returns {0: mode, 1: strength}. strength_scale
+  # is optional — omit it to always send strength 0 when active.
+  # magnetic_gripper:
+  #   indices: [7]
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: 0.0, upper_lim: 1.0}
+  #   transform:
+  #     type: magnetic
+  #     threshold: 0.5
+  #     strength_scale:
+  #       in_min: 0.5
+  #       in_max: 1.0
+  #       out_min: 0
+  #       out_max: 100
+  #   command: >
+  #     ros2 action send_goal /OnrobotMg10Skill
+  #     onrobot_mg10_skill_msgs/action/OnrobotMg10Skill
+  #     "{gripper_mode: {I[0]}, magnet_strength: {I[1]}}"
+
+
+  # ===========================================================================
+  # ROTATION CONVERSIONS
+  # ===========================================================================
+  #
+  # EULER -> QUATERNION  (model outputs roll/pitch/yaw, ROS2 expects qx/qy/qz/qw)
+  # ---------------------------------------------------------------------------
+  # Use the euler_to_quat transform.  Convention: ZYX radians (same as ROS/TF).
+  #
+  # The transform is a SPLICE:
+  #   values[euler_start : euler_start+3] = [roll, pitch, yaw]
+  #   → replaced in-place by [qx, qy, qz, qw]
+  #   Any values AFTER the Euler trio are appended unchanged, but their result
+  #   index shifts by +1 (3 Euler values become 4 quat values).
+  #
+  # Array layout example (euler_start: 3):
+  #
+  #   Model output (after denorm):
+  #     index  0    1    2    3     4      5    6
+  #            x    y    z    roll  pitch  yaw  gripper
+  #
+  #   After euler_to_quat:
+  #     index  0    1    2    3   4   5   6    7
+  #            x    y    z    qx  qy  qz  qw   gripper
+  #                            ↑──────────┘ ↑
+  #                            quat (4)     gripper shifted from 6 → 7
+  #
+  # ---------------------------------------------------------------------------
+  # Example A — model outputs [x, y, z, roll, pitch, yaw], no trailing values.
+  #             Result: [x, y, z, qx, qy, qz, qw]  (6 in → 7 out)
+  # ---------------------------------------------------------------------------
+  # eef_pose_euler_to_quat:
+  #   indices: [0, 1, 2, 3, 4, 5]          # x, y, z, roll, pitch, yaw
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: -0.8,    upper_lim:  0.8}     # x (metres)
+  #     - {lower_lim: -0.8,    upper_lim:  0.8}     # y
+  #     - {lower_lim:  0.0,    upper_lim:  0.8}     # z
+  #     - {lower_lim: -3.1416, upper_lim:  3.1416}  # roll  (radians)
+  #     - {lower_lim: -1.5708, upper_lim:  1.5708}  # pitch
+  #     - {lower_lim: -3.1416, upper_lim:  3.1416}  # yaw
+  #   transform:
+  #     type: euler_to_quat
+  #     euler_start: 3      # values[3,4,5] = roll,pitch,yaw → [qx,qy,qz,qw]
+  #   topic: /target_pose
+  #   msg_type: geometry_msgs/msg/PoseStamped
+  #   frame_id: base
+  #   mapping:
+  #     pose.position.x:    0
+  #     pose.position.y:    1
+  #     pose.position.z:    2
+  #     pose.orientation.x: 3
+  #     pose.orientation.y: 4
+  #     pose.orientation.z: 5
+  #     pose.orientation.w: 6
+
+  # ---------------------------------------------------------------------------
+  # Example B — model outputs [x, y, z, roll, pitch, yaw, gripper] (7 values).
+  #             gripper is index 6 in the model but index 7 after the splice.
+  #             Result: [x, y, z, qx, qy, qz, qw, gripper]  (7 in → 8 out)
+  # ---------------------------------------------------------------------------
+  # eef_pose_plus_gripper:
+  #   indices: [0, 1, 2, 3, 4, 5, 6]       # x, y, z, roll, pitch, yaw, gripper
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: -0.8,    upper_lim:  0.8}     # x
+  #     - {lower_lim: -0.8,    upper_lim:  0.8}     # y
+  #     - {lower_lim:  0.0,    upper_lim:  0.8}     # z
+  #     - {lower_lim: -3.1416, upper_lim:  3.1416}  # roll
+  #     - {lower_lim: -1.5708, upper_lim:  1.5708}  # pitch
+  #     - {lower_lim: -3.1416, upper_lim:  3.1416}  # yaw
+  #     - {lower_lim:  0.0,    upper_lim:  0.08}    # gripper (metres)
+  #   transform:
+  #     type: euler_to_quat
+  #     euler_start: 3      # gripper was model-index 6, result-index 7 after splice
+  #   topic: /target_pose
+  #   msg_type: geometry_msgs/msg/PoseStamped
+  #   frame_id: base
+  #   mapping:
+  #     pose.position.x:    0
+  #     pose.position.y:    1
+  #     pose.position.z:    2
+  #     pose.orientation.x: 3
+  #     pose.orientation.y: 4
+  #     pose.orientation.z: 5
+  #     pose.orientation.w: 6
+  #   # dispatch gripper separately in its own action entry using indices: [6]
+
+  # ---------------------------------------------------------------------------
+  # Example C — model outputs only [roll, pitch, yaw] (pure rotation, no position).
+  #             Result: [qx, qy, qz, qw]  (3 in → 4 out)
+  # ---------------------------------------------------------------------------
+  # eef_rotation_only:
+  #   indices: [3, 4, 5]                   # roll, pitch, yaw only
+  #   denormalize: true
+  #   normalized_range: [-1.0, 1.0]
+  #   limits:
+  #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # roll
+  #     - {lower_lim: -1.5708, upper_lim: 1.5708}   # pitch
+  #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # yaw
+  #   transform:
+  #     type: euler_to_quat
+  #     euler_start: 0      # entire slice is the Euler trio → result is [qx,qy,qz,qw]
+  #   topic: /target_orientation
+  #   msg_type: geometry_msgs/msg/QuaternionStamped
+  #   frame_id: base
+  #   mapping:
+  #     quaternion.x: 0
+  #     quaternion.y: 1
+  #     quaternion.z: 2
+  #     quaternion.w: 3
+
+  # ---------------------------------------------------------------------------
+  # QUATERNION -> EULER  (TF/sensor provides quat, model expects roll/pitch/yaw)
+  # ---------------------------------------------------------------------------
+  # This direction happens on the OBSERVATION side, not here.
+  # In obs_config.yaml, use the euler.* field paths on any TF input:
+  #
+  #   robot0_eef_euler:
+  #     - tf_eef.euler.roll
+  #     - tf_eef.euler.pitch
+  #     - tf_eef.euler.yaw
+  #
+  # The system converts the TF quaternion to ZYX Euler radians automatically.
+  # See obs_config_template.yaml → "Quat → Euler" section for normalization examples.
+  # ===========================================================================

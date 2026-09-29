@@ -1,0 +1,259 @@
+format:
+  name: "robomimic"
+  version: "1.0"
+  description: "Robomimic dataset format for imitation learning"
+
+output_structure:
+  type: "hierarchical"
+  root_groups:
+    - name: "data"
+      groups:
+        - name: "demo_{i}"
+          datasets:
+            - name: "states"
+              type: "array"
+              shape: [num_samples, state_dim]
+              dtype: "float32"
+              description: "Environment states"
+            - name: "actions"
+              type: "array"
+              shape: [num_samples, action_dim]
+              dtype: "float32"
+              description: "Action sequences for robot control"
+            - name: "rewards"
+              type: "array"
+              shape: [num_samples]
+              dtype: "float32"
+              description: "Reward signals"
+            - name: "dones"
+              type: "array"
+              shape: [num_samples]
+              dtype: "float32"
+              description: "Episode termination flags"
+          groups:
+            - name: "obs"
+              description: "Observations at current timestep"
+              datasets:
+                - name: "*_image"
+                  type: "array"
+                  shape: [num_samples, height, width, channels]
+                  dtype: "uint8"
+                  description: "Image observations from cameras"
+                - name: "*_joint_pos"
+                  type: "array"
+                  shape: [num_samples, num_joints]
+                  dtype: "float32"
+                  description: "Joint position observations"
+                - name: "*_joint_vel"
+                  type: "array"
+                  shape: [num_samples, num_joints]
+                  dtype: "float32"
+                  description: "Joint velocity observations"
+                - name: "*_eef_pos"
+                  type: "array"
+                  shape: [num_samples, 3]
+                  dtype: "float32"
+                  description: "End effector position"
+                - name: "*_eef_quat"
+                  type: "array"
+                  shape: [num_samples, 4]
+                  dtype: "float32"
+                  description: "End effector orientation quaternion"
+                - name: "*_gripper_qpos"
+                  type: "array"
+                  shape: [num_samples, 2]
+                  dtype: "float32"
+                  description: "Gripper position"
+                - name: "object_pos"
+                  type: "array"
+                  shape: [num_samples, 3]
+                  dtype: "float32"
+                  description: "Object translation"
+                - name: "object_quat"
+                  type: "array"
+                  shape: [num_samples, 4]
+                  dtype: "float32"
+                  description: "Object rotation quaternion"
+            - name: "next_obs"
+              description: "Observations at next timestep"
+              datasets:
+                - name: "*_image"
+                  type: "array"
+                  shape: [num_samples, height, width, channels]
+                  dtype: "uint8"
+                  description: "Image observations from cameras (shifted)"
+                - name: "*_joint_pos"
+                  type: "array"
+                  shape: [num_samples, num_joints]
+                  dtype: "float32"
+                  description: "Joint position observations (shifted)"
+                - name: "*_joint_vel"
+                  type: "array"
+                  shape: [num_samples, num_joints]
+                  dtype: "float32"
+                  description: "Joint velocity observations (shifted)"
+                - name: "*_eef_pos"
+                  type: "array"
+                  shape: [num_samples, 3]
+                  dtype: "float32"
+                  description: "End effector position (shifted)"
+                - name: "*_eef_quat"
+                  type: "array"
+                  shape: [num_samples, 4]
+                  dtype: "float32"
+                  description: "End effector orientation quaternion (shifted)"
+                - name: "*_gripper_qpos"
+                  type: "array"
+                  shape: [num_samples, 2]
+                  dtype: "float32"
+                  description: "Gripper position (shifted)"
+                - name: "object_pos"
+                  type: "array"
+                  shape: [num_samples, 3]
+                  dtype: "float32"
+                  description: "Object translation (shifted)"
+                - name: "object_quat"
+                  type: "array"
+                  shape: [num_samples, 4]
+                  dtype: "float32"
+                  description: "Object rotation quaternion (shifted)"
+          attributes:
+            - name: "num_samples"
+              type: "int"
+              description: "Number of timesteps in trajectory"
+            - name: "model_file"
+              type: "string"
+              description: "Path to MJCF model file (for robosuite)"
+      attributes:
+        - name: "total"
+          type: "int"
+          description: "Total number of demos in dataset"
+        - name: "env_args"
+          type: "json"
+          description: "Environment arguments in JSON format"
+    - name: "mask"
+      description: "Dataset filtering mask"
+      datasets:
+        - name: "valid"
+          type: "array"
+          dtype: "string"
+          description: "List of valid demo names"
+
+conversion_rules:
+  input_structure:
+    - source_group: "data/demo_{i}"
+      target_group: "data/demo_{i}"
+
+  # next_obs_generation:
+  #   method: "shift_forward"
+  #   description: "next_obs is obs shifted forward by 1 timestep"
+
+  # action_generation:
+  #   method: "custom"
+  #   rules:
+  #     - source: "joint_pos"
+  #       target_dim: 6
+  #     - source: "gripper"
+  #       target_dim: 1
+
+  reward_generation:
+    method: "custom"
+    base_reward: 0.1
+    gripper_action_reward: 1.0
+    task_completion_reward: 2.0
+
+  # done_generation:
+  #   method: "terminal_flag"
+  #   description: "All zeros except last element is 1"
+
+environment_metadata:
+  required_fields:
+    - name: "env_name"
+      type: "string"
+      default: "Lift"
+      description: "Name of the environment"
+
+    - name: "env_version"
+      type: "string"
+      default: "1.5.1"
+      description: "Version of the environment"
+
+    - name: "type"
+      type: "int"
+      default: 1
+      description: "Environment type identifier"
+
+    - name: "env_kwargs"
+      type: "dict"
+      description: "Environment kwargs"
+      required_fields:
+        - name: "robots"
+          type: "array"
+          default: ["IIWA"]
+          description: "Robot configurations"
+
+        - name: "control_freq"
+          type: "int"
+          default: 20
+          description: "Control frequency"
+
+        - name: "use_object_obs"
+          type: "boolean"
+          default: true
+          description: "Use object observations"
+
+        - name: "use_camera_obs"
+          type: "boolean"
+          default: false
+          description: "Use camera observations"
+
+        - name: "has_renderer"
+          type: "boolean"
+          default: false
+          description: "Has renderer"
+
+        - name: "has_offscreen_renderer"
+          type: "boolean"
+          default: false
+          description: "Has offscreen renderer"
+
+        - name: "ignore_done"
+          type: "boolean"
+          default: true
+          description: "Ignore done flag"
+
+validation:
+  required_groups:
+    - name: "data"
+      description: "Root data group"
+
+  # required_attributes:
+  #   - group: "data"
+  #     attributes:
+  #       - name: "total"
+  #         type: "int"
+
+  #       - name: "env_args"
+  #         type: "string"
+
+  required_datasets:
+    - group: "data/demo_*"
+      datasets:
+        - name: "states"
+        - name: "actions"
+        - name: "rewards"
+        - name: "dones"
+          dtype: "bool"
+
+    - group: "data/demo_*/obs"
+      min_datasets: 1
+      description: "At least one observation type"
+
+    - group: "data/demo_*/next_obs"
+      min_datasets: 1
+      description: "At least one next_obs type"
+
+  data_consistency:
+    - check: "demo_*/obs/* shape matches demo_*/next_obs/* shape"
+    - check: "actions shape matches first dimension of obs"
+    - check: "rewards, dones, states have same length as actions"

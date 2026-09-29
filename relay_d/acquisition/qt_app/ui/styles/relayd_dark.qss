@@ -1,0 +1,998 @@
+/* ============================================================================
+ * Relay-D — Dark Mode QSS
+ * Learning from Demonstration Platform | INESC TEC
+ *
+ * Palette (no pure black — reduced eye fatigue):
+ *   Background:  #1A1D23 (anthracite)
+ *   Surface:     #22262E
+ *   Elevated:    #2A2F38
+ *   Container:   #2C3340 (floating containers)
+ *   Border:      #333942
+ *   Text:        #FFFFFF (pure white)
+ *   Muted text:  #9CA3AF
+ *   Primary:     #60A5FA (blue)
+ *   Success:     #4ADE80 (green — record)
+ *   Warning:     #FBBF24 (amber — pause)
+ *   Danger:      #F87171 (red — stop)
+ *   Accent:      #818CF8 (indigo — logo/branding)
+ * ============================================================================ */
+
+
+/* ---------------------------------------------------------------------------
+ * 1. GLOBAL DEFAULTS — WHITE TEXT EVERYWHERE
+ * --------------------------------------------------------------------------- */
+
+QMainWindow,
+QMainWindow#MainWindow {
+    background: #1A1D23;
+    color: #FFFFFF;
+    font-family: "Segoe UI", "SF Pro Display", -apple-system, sans-serif;
+    font-size: 13px;
+}
+
+#centralwidget {
+    background: #1A1D23;
+}
+
+QWidget {
+    color: #FFFFFF;
+}
+
+QLabel {
+    color: #FFFFFF;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 2. LEFT SIDEBAR
+ * --------------------------------------------------------------------------- */
+
+#leftMenuContainer {
+    background: transparent;
+}
+
+#leftMenuSubContainer {
+    background: #22262E;
+    border: none;
+    border-right: 1px solid #333942;
+    border-radius: 0px;
+}
+
+
+/* — Logo — */
+
+QLabel#logoLabel {
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                                stop:0 #818CF8,
+                                stop:1 #6366F1);
+    border: none;
+    border-radius: 20px;
+    color: #FFFFFF;
+    font-weight: 700;
+    font-size: 18px;
+    padding: 0px;
+}
+
+QLabel#titleLabel {
+    background: transparent;
+    border: none;
+    color: #FFFFFF;
+    font-size: 20px;
+    font-weight: 700;
+    padding: 0px;
+}
+
+
+/* — Section label — */
+
+QLabel#recordingLabel {
+    background-color: #2A2F38;
+    color: #9CA3AF;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 6px 12px;
+    border: none;
+    border-radius: 6px;
+}
+
+
+/* — Sidebar navigation buttons (generic) — */
+
+#leftMenuSubContainer QPushButton {
+    text-align: left;
+    padding: 10px 16px;
+    border: none;
+    border-radius: 8px;
+    color: #D1D5DB;
+    background-color: transparent;
+    font-weight: 500;
+    font-size: 13px;
+}
+
+#leftMenuSubContainer QPushButton:hover {
+    background-color: #2A2F38;
+    color: #FFFFFF;
+    border: none;
+}
+
+#leftMenuSubContainer QPushButton:pressed {
+    background-color: #333942;
+    color: #FFFFFF;
+}
+
+#leftMenuSubContainer QPushButton:disabled {
+    color: #4B5563;
+    background-color: transparent;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 3. RECORDING CONTROLS — CRITICAL BUTTONS
+ * --------------------------------------------------------------------------- */
+
+/* — Start Record (green) — */
+
+QPushButton#btn_start_record {
+    background-color: rgba(74, 222, 128, 0.10);
+    border: 1px solid rgba(74, 222, 128, 0.25);
+    border-left: 4px solid #4ADE80;
+    color: #86EFAC;
+    font-weight: 600;
+    border-radius: 8px;
+    padding: 10px 16px;
+    text-align: left;
+}
+
+QPushButton#btn_start_record:hover {
+    background-color: rgba(74, 222, 128, 0.18);
+    border-color: rgba(74, 222, 128, 0.40);
+    border-left: 5px solid #22C55E;
+}
+
+QPushButton#btn_start_record:pressed {
+    background-color: rgba(74, 222, 128, 0.25);
+    border-left: 6px solid #16A34A;
+}
+
+
+/* — Pause Record (amber) — */
+
+QPushButton#btn_pause_record {
+    background-color: rgba(251, 191, 36, 0.10);
+    border: 1px solid rgba(251, 191, 36, 0.25);
+    border-left: 4px solid #FBBF24;
+    color: #FDE68A;
+    font-weight: 600;
+    border-radius: 8px;
+    padding: 10px 16px;
+    text-align: left;
+}
+
+QPushButton#btn_pause_record:hover {
+    background-color: rgba(251, 191, 36, 0.18);
+    border-color: rgba(251, 191, 36, 0.40);
+    border-left: 5px solid #F59E0B;
+}
+
+QPushButton#btn_pause_record:pressed {
+    background-color: rgba(251, 191, 36, 0.25);
+    border-left: 6px solid #D97706;
+}
+
+
+/* — Stop Record (red) — */
+
+QPushButton#btn_stop_record {
+    background-color: rgba(248, 113, 113, 0.10);
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    border-left: 4px solid #F87171;
+    color: #FCA5A5;
+    font-weight: 600;
+    border-radius: 8px;
+    padding: 10px 16px;
+    text-align: left;
+}
+
+QPushButton#btn_stop_record:hover {
+    background-color: rgba(248, 113, 113, 0.18);
+    border-color: rgba(248, 113, 113, 0.40);
+    border-left: 5px solid #EF4444;
+}
+
+QPushButton#btn_stop_record:pressed {
+    background-color: rgba(248, 113, 113, 0.25);
+    border-left: 6px solid #DC2626;
+}
+
+QPushButton#btn_stop_record:disabled {
+    background-color: #22262E;
+    color: #4B5563;
+    border: 1px solid #333942;
+    border-left: 4px solid #4B5563;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 4. MAIN CONTENT AREA — STACKED WIDGET & PAGES
+ * --------------------------------------------------------------------------- */
+
+QStackedWidget,
+QStackedWidget#stackedWidget {
+    background: transparent;
+    border: none;
+    border-radius: 0px;
+}
+
+/* Pages background - darker to contrast with containers */
+QStackedWidget > QWidget {
+    background: #151820;
+    border: none;
+    border-radius: 0px;
+    margin: 0px;
+}
+
+/* Start page stays fully transparent */
+QWidget#page_start {
+    background: transparent !important;
+    border: none;
+    margin: 0px;
+}
+
+/* Explicitly set darker background for other pages */
+QWidget#page_data,
+QWidget#page_import,
+QWidget#page_settings {
+    background: #151820 !important;
+}
+
+/* Scroll area for containers - transparent to show page background */
+QScrollArea#container_scroll_area {
+    background: transparent !important;
+    border: none;
+}
+
+QScrollArea#container_scroll_area > QWidget {
+    background: transparent !important;
+}
+
+/* Container widget (holds all containers) - transparent */
+QWidget#container_widget {
+    background: transparent !important;
+    border: none;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 4.1 FLOATING CONTAINERS — THE FIX IS HERE
+ * --------------------------------------------------------------------------- */
+
+/* Containers with elevated background - MUST stand out from page */
+QWidget[container_id] {
+    background-color: #2C3340 !important;
+    border: 1px solid #3D4450 !important;
+    border-radius: 12px;
+}
+
+/* The inner Form widget should be transparent to show container color */
+QWidget[container_id] #Form {
+    background-color: transparent !important;
+    border: none !important;
+}
+
+/* TopicContainer class alternative */
+QWidget.TopicContainer {
+    background-color: #2C3340 !important;
+    border: 1px solid #3D4450 !important;
+    border-radius: 12px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 5. PAGE TITLES & SECTION HEADERS (ORIGINAL STYLED BOXES)
+ * --------------------------------------------------------------------------- */
+
+QLabel#settingsPageTitle {
+    background-color: #2A2F38;
+    border: 1px solid #333942;
+    border-radius: 10px;
+    color: #FFFFFF;
+    padding: 14px;
+    font-size: 22px;
+    font-weight: 700;
+}
+
+QLabel#label_2 {
+    background-color: #2A2F38;
+    border: 1px solid #333942;
+    border-radius: 10px;
+    color: #FFFFFF;
+    padding: 14px;
+    font-size: 22px;
+    font-weight: 700;
+}
+
+QLabel#generalSettingsLabel {
+    background-color: rgba(96, 165, 250, 0.10);
+    border: 1px solid rgba(96, 165, 250, 0.30);
+    border-radius: 8px;
+    color: #93C5FD;
+    padding: 10px;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+QLabel#recordingSettingsLabel {
+    background-color: rgba(74, 222, 128, 0.10);
+    border: 1px solid rgba(74, 222, 128, 0.30);
+    border-radius: 8px;
+    color: #86EFAC;
+    padding: 10px;
+    font-size: 16px;
+    font-weight: 600;
+}
+
+QLabel#inputStructureLabel {
+    background-color: rgba(96, 165, 250, 0.10);
+    border: 1px solid rgba(96, 165, 250, 0.30);
+    border-radius: 8px;
+    color: #93C5FD;
+    padding: 10px;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+QLabel#outputPreviewLabel {
+    background-color: rgba(74, 222, 128, 0.10);
+    border: 1px solid rgba(74, 222, 128, 0.30);
+    border-radius: 8px;
+    color: #86EFAC;
+    padding: 10px;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 6. FORM INPUTS
+ * --------------------------------------------------------------------------- */
+
+QLineEdit,
+QTextEdit,
+QPlainTextEdit {
+    background-color: #22262E;
+    border: 1px solid #333942;
+    border-radius: 6px;
+    color: #FFFFFF;
+    padding: 8px 12px;
+    selection-background-color: #60A5FA;
+    selection-color: #FFFFFF;
+}
+
+QLineEdit:focus,
+QTextEdit:focus,
+QPlainTextEdit:focus {
+    border-color: #60A5FA;
+    background-color: #2A2F38;
+}
+
+QLineEdit:disabled,
+QTextEdit:disabled,
+QPlainTextEdit:disabled {
+    background-color: #1A1D23;
+    color: #6B7280;
+    border-color: #2A2F38;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 7. COMBO BOXES & SPIN BOXES
+ * --------------------------------------------------------------------------- */
+
+QComboBox {
+    background-color: #22262E;
+    border: 1px solid #333942;
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: #FFFFFF;
+    min-height: 20px;
+}
+
+QComboBox:hover {
+    border-color: #4B5563;
+    background-color: #2A2F38;
+}
+
+QComboBox:focus {
+    border-color: #60A5FA;
+}
+
+QComboBox::drop-down {
+    border: none;
+    width: 20px;
+}
+
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #9CA3AF;
+    margin-right: 8px;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #2A2F38;
+    border: 1px solid #4B5563;
+    border-radius: 6px;
+    selection-background-color: #60A5FA;
+    selection-color: #FFFFFF;
+    color: #FFFFFF;
+    padding: 4px;
+}
+
+QSpinBox,
+QDoubleSpinBox {
+    background-color: #22262E;
+    border: 1px solid #333942;
+    border-radius: 6px;
+    padding: 8px 12px;
+    color: #FFFFFF;
+}
+
+QSpinBox:hover,
+QDoubleSpinBox:hover {
+    border-color: #4B5563;
+}
+
+QSpinBox:focus,
+QDoubleSpinBox:focus {
+    border-color: #60A5FA;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 8. CHECKBOXES & RADIO BUTTONS
+ * --------------------------------------------------------------------------- */
+
+QCheckBox {
+    color: #FFFFFF;
+    spacing: 8px;
+}
+
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 4px;
+    border: 2px solid #4B5563;
+    background-color: #22262E;
+}
+
+QCheckBox::indicator:hover {
+    border-color: #60A5FA;
+    background-color: #2A2F38;
+}
+
+QCheckBox::indicator:checked {
+    background-color: #60A5FA;
+    border-color: #60A5FA;
+    image: none;
+}
+
+QRadioButton {
+    color: #FFFFFF;
+    spacing: 8px;
+}
+
+QRadioButton::indicator {
+    width: 18px;
+    height: 18px;
+    border-radius: 9px;
+    border: 2px solid #4B5563;
+    background-color: #22262E;
+}
+
+QRadioButton::indicator:hover {
+    border-color: #60A5FA;
+    background-color: #2A2F38;
+}
+
+QRadioButton::indicator:checked {
+    background-color: #60A5FA;
+    border-color: #60A5FA;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 9. BUTTONS (generic)
+ * --------------------------------------------------------------------------- */
+
+QPushButton {
+    background-color: #2A2F38;
+    border: 1px solid #4B5563;
+    border-radius: 6px;
+    color: #FFFFFF;
+    padding: 8px 16px;
+    font-weight: 500;
+}
+
+QPushButton:hover {
+    background-color: #333942;
+    border-color: #60A5FA;
+}
+
+QPushButton:checked {
+    background-color: #3B82F6;
+    border-color: #60A5FA;
+    color: #FFFFFF;
+}
+
+QPushButton:pressed {
+    background-color: #3D4450;
+}
+
+QPushButton:disabled {
+    background-color: #22262E;
+    color: #6B7280;
+    border-color: #333942;
+}
+
+QPushButton:default {
+    background-color: #60A5FA;
+    border-color: #60A5FA;
+    color: #FFFFFF;
+}
+
+QPushButton:default:hover {
+    background-color: #3B82F6;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 10. SLIDERS
+ * --------------------------------------------------------------------------- */
+
+QSlider::groove:horizontal {
+    height: 6px;
+    background: #333942;
+    border-radius: 3px;
+}
+
+QSlider::handle:horizontal {
+    background: #60A5FA;
+    border: 2px solid #2A2F38;
+    width: 16px;
+    height: 16px;
+    margin: -6px 0;
+    border-radius: 9px;
+}
+
+QSlider::handle:horizontal:hover {
+    background: #93C5FD;
+}
+
+QSlider::sub-page:horizontal {
+    background: #60A5FA;
+    border-radius: 3px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 11. SCROLLBARS
+ * --------------------------------------------------------------------------- */
+
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical {
+    background: #4B5563;
+    min-height: 30px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:vertical:hover {
+    background: #6B7280;
+}
+
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {
+    height: 0px;
+}
+
+QScrollBar:horizontal {
+    background: transparent;
+    height: 10px;
+    margin: 0px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal {
+    background: #4B5563;
+    min-width: 30px;
+    border-radius: 5px;
+}
+
+QScrollBar::handle:horizontal:hover {
+    background: #6B7280;
+}
+
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal {
+    width: 0px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 12. SUB-WIDGET PANELS (imageWidget, jointWidget, poseWidget, actuatorWidget)
+ * --------------------------------------------------------------------------- */
+
+/* Video feed area */
+
+QVideoWidget,
+QVideoWidget#widget_video {
+    background-color: #0F1117;
+    border: 1px solid #333942;
+    border-radius: 8px;
+}
+
+QVideoWidget:hover,
+QVideoWidget#widget_video:hover {
+    border-color: #4B5563;
+}
+
+
+/* Topic name labels */
+
+QLabel#label_topic_name,
+QLabel#text_data_display {
+    background-color: #2A2F38;
+    border: 1px solid #333942;
+    border-radius: 8px;
+    color: #FFFFFF;
+    font-size: 15px;
+    font-weight: 700;
+    padding: 10px 16px;
+}
+
+
+/* Status indicators (frame rate, timestamp) */
+
+QLabel#label_frame_rate {
+    background-color: rgba(74, 222, 128, 0.08);
+    border: none;
+    border-left: 3px solid #4ADE80;
+    border-radius: 6px;
+    color: #86EFAC;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 8px 12px;
+}
+
+QLabel#label_timestamp {
+    background-color: rgba(251, 191, 36, 0.08);
+    border: none;
+    border-left: 3px solid #FBBF24;
+    border-radius: 6px;
+    color: #FDE68A;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 8px 12px;
+}
+
+
+/* Actuator widget */
+
+QLabel#label_actuator_name {
+    background-color: rgba(96, 165, 250, 0.10);
+    border: 1px solid rgba(96, 165, 250, 0.30);
+    border-radius: 10px;
+    color: #93C5FD;
+    font-size: 18px;
+    font-weight: 700;
+    padding: 14px 20px;
+}
+
+QLabel#label_actuator_state {
+    background-color: rgba(74, 222, 128, 0.08);
+    border: none;
+    border-left: 5px solid #4ADE80;
+    border-radius: 8px;
+    color: #86EFAC;
+    font-size: 15px;
+    font-weight: 600;
+    padding: 12px 20px;
+}
+
+
+/* Joint data metrics */
+
+QLabel#positionLabel {
+    background-color: rgba(74, 222, 128, 0.08);
+    border: none;
+    border-left: 3px solid #4ADE80;
+    border-radius: 6px;
+    color: #86EFAC;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 8px 12px;
+}
+
+QLabel#velocityLabel {
+    background-color: rgba(251, 191, 36, 0.08);
+    border: none;
+    border-left: 3px solid #FBBF24;
+    border-radius: 6px;
+    color: #FDE68A;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 8px 12px;
+}
+
+QLabel#torqueLabel {
+    background-color: rgba(248, 113, 113, 0.08);
+    border: none;
+    border-left: 3px solid #F87171;
+    border-radius: 6px;
+    color: #FCA5A5;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 8px 12px;
+}
+
+QLabel#dataVisualizationLabel {
+    background: #1A1D23;
+    border: 2px dashed #4B5563;
+    border-radius: 8px;
+    color: #FFFFFF;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 12px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 13. TOOLTIPS
+ * --------------------------------------------------------------------------- */
+
+QToolTip {
+    background-color: #333942;
+    color: #FFFFFF;
+    border: 1px solid #4B5563;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 14. PAGE TITLES (compact, left-aligned)
+ * --------------------------------------------------------------------------- */
+
+QLabel#dataPageTitle,
+QLabel#importPageTitle,
+QLabel#settingsPageTitle {
+    background: transparent;
+    border: none;
+    color: #FFFFFF;
+    font-size: 20px;
+    font-weight: 700;
+    padding: 0px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 15. SECTION LABELS (settings page)
+ * --------------------------------------------------------------------------- */
+
+QLabel#generalSettingsLabel,
+QLabel#recordingSettingsLabel {
+    background: transparent;
+    border: none;
+    border-radius: 0px;
+    color: #9CA3AF;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    padding: 8px 0px 2px 0px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 16. SEPARATORS
+ * --------------------------------------------------------------------------- */
+
+QFrame#dataSeparator,
+QFrame#importSeparator,
+QFrame#settingsSeparator {
+    color: #333942;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 17. PANEL SUB-LABELS (compact, left-aligned)
+ * --------------------------------------------------------------------------- */
+
+QLabel#inputStructureLabel,
+QLabel#outputPreviewLabel {
+    background: transparent;
+    border: none;
+    border-radius: 0px;
+    color: #9CA3AF;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 2px 0px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 18. HELP PAGE
+ * --------------------------------------------------------------------------- */
+
+QTextBrowser#textBrowser {
+    border: none;
+    border-radius: 0px;
+    padding: 0px;
+    color: #FFFFFF;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 19. METRICS LABELS (config page) — ORIGINAL STYLED BOXES
+ * --------------------------------------------------------------------------- */
+
+QLabel#inputsCountLabel {
+    background-color: rgba(74, 222, 128, 0.15);
+    border: 1px solid rgba(74, 222, 128, 0.35);
+    border-radius: 6px;
+    color: #86EFAC;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 8px 12px;
+}
+
+QLabel#outputsCountLabel {
+    background-color: rgba(248, 113, 113, 0.15);
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    border-radius: 6px;
+    color: #FCA5A5;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 8px 12px;
+}
+
+QLabel#inputTypesLabel {
+    background-color: rgba(96, 165, 250, 0.15);
+    border: 1px solid rgba(96, 165, 250, 0.35);
+    border-radius: 6px;
+    color: #93C5FD;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 8px 12px;
+}
+
+QLabel#outputTypesLabel {
+    background-color: rgba(251, 191, 36, 0.15);
+    border: 1px solid rgba(251, 191, 36, 0.35);
+    border-radius: 6px;
+    color: #FDE68A;
+    font-weight: 600;
+    font-size: 12px;
+    padding: 8px 12px;
+}
+
+QLabel#themeLabel {
+    background: transparent;
+    border: none;
+    color: #FFFFFF;
+    font-weight: 600;
+    font-size: 14px;
+    padding: 4px 0px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 20. LIST WIDGETS & TABLES
+ * --------------------------------------------------------------------------- */
+
+QListWidget {
+    background-color: #22262E;
+    border: 1px solid #333942;
+    border-radius: 8px;
+    color: #FFFFFF;
+    padding: 4px;
+}
+
+QListWidget::item {
+    padding: 8px 12px;
+    border-radius: 4px;
+    color: #FFFFFF;
+}
+
+QListWidget::item:hover {
+    background-color: #2A2F38;
+}
+
+QListWidget::item:selected {
+    background-color: #60A5FA;
+    color: #FFFFFF;
+}
+
+QTableWidget,
+QTableView {
+    background-color: #22262E;
+    border: 1px solid #333942;
+    border-radius: 8px;
+    gridline-color: #333942;
+    color: #FFFFFF;
+}
+
+QTableWidget::item,
+QTableView::item {
+    padding: 4px 8px;
+    color: #FFFFFF;
+}
+
+QTableWidget::item:selected,
+QTableView::item:selected {
+    background-color: #60A5FA;
+    color: #FFFFFF;
+}
+
+QHeaderView::section {
+    background-color: #2A2F38;
+    color: #FFFFFF;
+    padding: 8px 12px;
+    border: none;
+    border-bottom: 1px solid #333942;
+    font-weight: 600;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 21. INDIVIDUAL CONTAINER CUSTOMIZATION (OPTIONAL)
+ * --------------------------------------------------------------------------- */
+
+/* Uncomment to give specific containers different colors or accents */
+
+/*
+QWidget[container_id="camera_top"] {
+    background-color: #2A3442 !important;
+    border-left: 3px solid #60A5FA !important;
+}
+
+QWidget[container_id="camera_front"] {
+    background-color: #2C3340 !important;
+    border-left: 3px solid #818CF8 !important;
+}
+
+QWidget[container_id="joints_data"] {
+    background-color: #2B3540 !important;
+    border-left: 3px solid #4ADE80 !important;
+}
+
+QWidget[container_id="pose_data"] {
+    background-color: #2D3340 !important;
+    border-left: 3px solid #FBBF24 !important;
+}
+*/
+
+/* ---------------------------------------------------------------------------
+ * 22. Message Boxes — using same palette but slightly different styling for emphasis
+ * --------------------------------------------------------------------------- */
+
+/* Message Box */
+QDialog#CustomMessageBox {
+    background-color: #1F2937;
+    border: 1px solid #374151;
+    border-radius: 10px;
+}
+
+QDialog#CustomMessageBox QLabel#msgBodyLabel {
+    color: #9CA3AF;
+    font-size: 12px;
+}

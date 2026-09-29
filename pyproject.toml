@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay-d"
+version = "0.1.0"
+description = "Combined LfD data acquisition (RelayDApp) and policy inference/action-dispatch package"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "GPL-3.0-or-later" }
+authors = [{ name = "INESC TEC" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Robotics",
+]
+dependencies = [
+    # cv_bridge (acquisition side) requires numpy<2; the dispatch side's
+    # original numpy>=2.4.3 pin was not load-bearing (see obs_builder.py
+    # _read_scalar, written to be numpy>=2-SAFE, not to require it).
+    "numpy>=1.24,<2",
+    "pyyaml>=6.0.3",
+    "torch>=2.10.0",
+    "h5py>=3.15.1",
+    "opencv-python-headless>=4.8.0,<4.13",
+    "pyqt5>=5.15.11",
+    "pyqtgraph>=0.13.7",
+    "PyQt5-sip>=12.15",
+    "xmltodict",
+    "scipy>=1.10.0",
+]
+# rclpy, tf2_ros, ROS2 message packages (std_msgs, geometry_msgs,
+# sensor_msgs, tf2_msgs), and cv_bridge are intentionally NOT declared here:
+# they are not pip-installable and must come from a sourced ROS2 (Jazzy)
+# environment, e.g. `sudo apt install ros-jazzy-tf2-ros ros-jazzy-geometry-msgs
+# ros-jazzy-std-msgs ros-jazzy-sensor-msgs ros-jazzy-cv-bridge`.
+
+[project.urls]
+Homepage = "https://github.com/pascd/Relay-D"
+Repository = "https://github.com/pascd/Relay-D"
+Issues = "https://github.com/pascd/Relay-D/issues"
+Changelog = "https://github.com/pascd/Relay-D/blob/master/CHANGELOG.md"
+
+[project.optional-dependencies]
+# PyPI's published `robomimic` only goes up to 0.3.0 and is NOT compatible
+# with checkpoints trained against the ARISE-Initiative source (this
+# dispatcher targets >=0.4, e.g. 0.5.0). Install your robomimic source
+# checkout in editable mode BEFORE installing this extra — see README.md.
+robomimic = ["robomimic>=0.4"]
+
+[dependency-groups]
+dev = [
+    "jurigged>=0.6.1",
+    "watchdog>=6.0.0",
+]
+
+[project.scripts]
+lfd-inference-node = "relay_d.dispatch.inference_node:main"
+RelayDApp = "relay_d.acquisition.qt_app.app:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["relay_d*"]
+
+[tool.setuptools.package-data]
+"relay_d.dispatch" = ["config_templates/*.yaml"]
+"relay_d.acquisition.qt_app" = ["resources/**/*", "resources.qrc"]
+"relay_d.acquisition.qt_app.ui.containers" = ["*.ui"]
+"relay_d.acquisition.qt_app.ui.postprocess.postprocess_configs" = ["*.json", "*.yaml"]
+"relay_d.acquisition.qt_app.ui.review" = ["*.rviz"]
+"relay_d.acquisition.qt_app.ui.styles" = ["*.qss"]

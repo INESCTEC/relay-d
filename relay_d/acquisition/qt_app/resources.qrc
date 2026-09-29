@@ -1,0 +1,24 @@
+<RCC>
+  <qresource prefix="icons">
+    <file>resources/icons/camera.png</file>
+    <file>resources/icons/data.png</file>
+    <file>resources/icons/import.png</file>
+    <file>resources/icons/menu.png</file>
+    <file>resources/icons/play.png</file>
+    <file>resources/icons/question.png</file>
+    <file>resources/icons/setting.png</file>
+    <file>resources/icons/stop-button.png</file>
+    <file>resources/icons/video.png</file>
+    <file>resources/icons/video-pause-button.png</file>
+    <file>resources/icons/data.png</file>
+    <file>resources/icons/import.png</file>
+    <file>resources/icons/menu.png</file>
+    <file>resources/icons/question.png</file>
+    <file>resources/icons/setting.png</file>
+    <file>resources/icons/video.png</file>
+  </qresource>
+  <qresource prefix="img">
+    <file>resources/img/inesctec_logo.png</file>
+    <file>resources/img/relayd_logo_simple.png</file>
+  </qresource>
+</RCC>
