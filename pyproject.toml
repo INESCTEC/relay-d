@@ -23,7 +23,7 @@ dependencies = [
     # cv_bridge (acquisition side) requires numpy<2; the dispatch side's
     # original numpy>=2.4.3 pin was not load-bearing (see obs_builder.py
     # _read_scalar, written to be numpy>=2-SAFE, not to require it).
-    "numpy>=1.24,<2",
+    "numpy>=1.24,<3",
     "pyyaml>=6.0.3",
     "torch>=2.10.0",
     "h5py>=3.15.1",
