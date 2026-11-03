@@ -47,7 +47,7 @@ Changelog = "https://github.com/pascd/Relay-D/blob/main/CHANGELOG.md"
 robomimic = ["robomimic>=0.4"]
 # LeRobotDataset v3.0: convert to it (postprocess/lerobot_writer.py) and open it in the Review tab.
 # pyarrow 21+ needs NumPy 2 at import, and ROS Jazzy's Python ships NumPy 1.26 (pyarrow does not declare it, so pip would not warn).
-lerobot = ["pyarrow>=15.0,<21", "av>=12.0"]
+lerobot = ["pyarrow>=15.0,<27", "av>=12.0"]
 
 [dependency-groups]
 dev = [
