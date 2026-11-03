@@ -12,18 +12,17 @@ or its upstream repository, not guessed from memory.
 |---|---|---|
 | `numpy` | BSD-3-Clause (+ small bundled 0BSD/MIT/Zlib/CC0-1.0 components) | |
 | `pyyaml` | MIT | |
-| `torch` | BSD-3-Clause (+ bundled Apache-2.0/BSD-2-Clause/BSL-1.0/MIT components) | |
 | `h5py` | BSD-3-Clause | |
 | `opencv-python-headless` | Apache-2.0 | Packaging scripts (the `opencv-python` project itself) are MIT; the bundled OpenCV library is Apache-2.0 (OpenCV ≥4.5) |
 | `pyqt5` | **GPL-3.0** (or a paid Riverbank commercial license) | See ⚠️ note below |
 | `pyqtgraph` | MIT | |
-| `xmltodict` | MIT | |
 
 ## Python — optional extra (`pip install ".[robomimic]"`)
 
 | Package | License | Notes |
 |---|---|---|
 | `robomimic` | MIT | This project requires the [ARISE-Initiative source checkout](https://github.com/ARISE-Initiative/robomimic) (`>=0.4`), not the PyPI release (which only goes up to 0.3.0) — both are MIT |
+| `torch` | BSD-3-Clause (+ bundled Apache-2.0/BSD-2-Clause/BSL-1.0/MIT components) | Not installed by Relay-D: comes with robomimic / LeRobot, imported only to run or train a policy |
 
 ## Python — dev only (`[dependency-groups] dev`)
 
@@ -38,7 +37,6 @@ or its upstream repository, not guessed from memory.
 | `tf2_ros`, `tf2_msgs` | BSD-3-Clause | (`ros2/geometry2`) |
 | `std_msgs`, `geometry_msgs`, `sensor_msgs`, `trajectory_msgs`, `builtin_interfaces` | Apache-2.0 | per each package's `package.xml` (`ros2/common_interfaces` and related) |
 | `sensor_msgs_py`, `rosidl_runtime_py` | Apache-2.0 | |
-| `cv_bridge` | Apache-2.0 | (`ros-perception/vision_opencv`) |
 | `xacro` | BSD-3-Clause | (`ros/xacro`) |
 
 ## Other system libraries

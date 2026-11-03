@@ -7,6 +7,7 @@ import datetime
 import math
 
 from relay_d.utils.coloring_logger import logger
+from relay_d.utils.numerics import stamp_to_sec
 from ..settings.config_manager import config
 
 from sensor_msgs.msg import Image, CompressedImage, PointCloud2, JointState
@@ -144,7 +145,7 @@ class ContainerVisualizer:
                 ):
                     ros_time = latest_msg.header.stamp
                     if ros_time:
-                        time_sec = ros_time.sec + ros_time.nanosec * 1e-9
+                        time_sec = stamp_to_sec(ros_time)
                         dt_str = datetime.datetime.fromtimestamp(time_sec).strftime(
                             "%H:%M:%S.%f"
                         )[:-3]

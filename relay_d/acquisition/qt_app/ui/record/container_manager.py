@@ -76,7 +76,6 @@ class ContainerManager:
                     "input_name": input_name,
                     "topic_type_msg": None,  # Will be auto-detected from topic
                     "base_type": base_type,
-                    "output_map": input_item.get("output_map", input_name),
                 }
 
                 # Check if this is a TF lookup configuration
@@ -90,14 +89,11 @@ class ContainerManager:
                     container_data["tf_wait_timeout"] = input_item.get(
                         "tf_wait_timeout"
                     )
-                    container_data["transfer_rate"] = input_item.get(
-                        "transfer_rate", 10
-                    )
                     container_data["topic_path"] = None  # No topic for TF lookup
                     # For TF, use 'pose' or 'tf' as the container type
                     container_topic_type = "pose"
                     logger.info(
-                        f"TF lookup config: {input_name} - {input_item.get('parent_frame')} -> {input_item.get('child_frame')} -> {input_item.get('output_map')}"
+                        f"TF lookup config: {input_name} - {input_item.get('parent_frame')} -> {input_item.get('child_frame')}"
                     )
                 # Add topic path for regular topic subscriptions
                 elif "topic" in input_item:
@@ -117,7 +113,7 @@ class ContainerManager:
                 container_specs.append(container_spec)
 
                 logger.info(
-                    f"Added container spec: {input_name} -> {base_type} -> output_map: {container_data['output_map']}"
+                    f"Added container spec: {input_name} -> {base_type}"
                 )
 
             logger.info(f"Total container specs prepared: {len(container_specs)}")

@@ -31,18 +31,11 @@ def _yaml_parser(config=None):
 # ------------------------------------------------------------------ recorder
 
 
-def test_recorder_uses_the_settings_when_the_yaml_is_silent(recorder_cls, settings):
-    settings({"rec_default_frequency": 12, "rec_default_max_buffer_mb": 128,
-              "rec_default_sync_mode": "strict", "rec_default_sync_tolerance_sec": 0.25})
+def test_recorder_takes_the_buffer_setting_and_the_frequency_only_from_the_yaml(recorder_cls, settings):
+    settings({"rec_default_max_buffer_mb": 128, "rec_default_frequency": 12})  # an old settings file: the key is ignored
     rec = recorder_cls(_yaml_parser({}))
-    assert rec.recording_frequency == 12 and rec.max_buffer_bytes == 128 * 1024**2
-    assert (rec._sync_mode, rec._sync_tolerance) == ("strict", 0.25)
-
-
-def test_recorder_yaml_wins_over_the_settings(recorder_cls, settings):
-    settings({"rec_default_frequency": 12})
-    rec = recorder_cls(_yaml_parser({"recording_frequency": 5}))
-    assert rec.recording_frequency == 5
+    assert rec.max_buffer_bytes == 128 * 1024**2
+    assert rec.recording_frequency is None and (rec._sync_mode, rec._sync_tolerance) == ("soft", None)
 
 
 def test_recorder_sync_tolerance_zero_means_off(recorder_cls, settings):
@@ -92,14 +85,13 @@ def test_log_level_setting_and_environment_override(settings, monkeypatch):
 def test_postprocess_defaults_come_from_settings_and_the_file_wins(settings, tmp_path):
     from relay_d.acquisition.qt_app.ui.postprocess.postprocess_options import PostprocessOptions
 
-    settings({"postprocess_default_training_model": "diffusion_policy", "split_train": 0.6, "split_val": 0.3})
+    settings({"split_train": 0.6, "split_val": 0.3})
     opts = PostprocessOptions()
-    assert opts.training_model() == "diffusion_policy"
-    assert opts.splits() == {"train_frac": 0.6, "val_frac": 0.3, "test_frac": 0.1}
+    assert opts.splits() == {"train_frac": 0.6, "val_frac": 0.3}
     f = tmp_path / "postprocess_config.yaml"
-    f.write_text("postprocess:\n  robomimic:\n    training_model: bc_rnn_gmm\n    splits: {train_frac: 0.5, val_frac: 0.5, test_frac: 0.0}\n")
+    f.write_text("postprocess:\n  robomimic:\n    splits: {train_frac: 0.5, val_frac: 0.5}\n")
     loaded, _ = PostprocessOptions.load(str(f))
-    assert loaded.training_model() == "bc_rnn_gmm" and loaded.splits()["train_frac"] == 0.5
+    assert loaded.splits()["train_frac"] == 0.5
 
 
 def test_lerobot_encoder_settings_reach_the_dataset(settings, tmp_path):

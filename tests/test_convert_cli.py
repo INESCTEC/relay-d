@@ -1,7 +1,6 @@
 """Headless converter (relay_d.acquisition.convert_cli)."""
 
 import json
-import subprocess
 import sys
 
 import h5py
@@ -43,22 +42,22 @@ def test_lerobot_conversion(workspace, capsys):
     info = json.loads((out / "meta/info.json").read_text())
     assert info["total_episodes"] == 1 + len(LENGTHS)
     assert pq.read_table(out / "meta/tasks.parquet")["task"].to_pylist() == ["stack the cubes"]
-    assert (out / "acquisition_config.yaml").exists()
+    assert (tmp / "acquisition_config.yaml").exists()  # above the dataset folder, where the launcher looks
 
 
 def test_robomimic_conversion_with_sibling_options(workspace):
     tmp, cfg = workspace
     (tmp / "postprocess_config.yaml").write_text(yaml.safe_dump({
-        "postprocess": {"robomimic": {"metadata": {"env_name": "CliEnv", "env_version": "1", "type": 1, "env_kwargs": {}}}}
+        "postprocess": {"robomimic": {"splits": {"train_frac": 1.0, "val_frac": 0.0}}}
     }))
     out = tmp / "out" / "dataset.h5"
     assert main(["--config", str(cfg), "--format", "robomimic", "--input", str(tmp / "recordings"),
                  "--output", str(out)]) == 0
     with h5py.File(out, "r") as f:
         assert f["data"].attrs["total"] == 1 + len(LENGTHS)
-        assert json.loads(f["data"].attrs["env_args"])["env_name"] == "CliEnv"
-    assert (tmp / "out" / "dataset_acquisition_config.yaml").exists()
-    assert (tmp / "out" / "dataset_postprocess_config.yaml").exists()
+        assert list(f["mask"].keys()) == ["train"]  # the options file was used
+    assert (tmp / "out" / "acquisition_config.yaml").exists()
+    assert (tmp / "out" / "postprocess_config.yaml").exists()
 
 
 def test_usage_errors_exit_2(workspace, tmp_path, capsys):
@@ -90,15 +89,6 @@ def test_failed_conversion_exits_1_with_reason(workspace, monkeypatch, capsys):
     assert "av" in capsys.readouterr().err
 
 
-def test_script_wrapper_help_runs_without_ros_or_qt(tmp_path):
-    root = __import__("os").path.dirname(__import__("os").path.dirname(__file__))
-    result = subprocess.run(
-        [sys.executable, "scripts/convert_dataset.py", "--help"],
-        cwd=root, env={"PYTHONPATH": root, "PATH": ""}, capture_output=True, text=True,
-    )
-    assert result.returncode == 0 and "--format" in result.stdout
-
-
 def test_robomimic_refuses_to_overwrite(workspace):
     tmp, cfg = workspace
     out = tmp / "out" / "dataset.h5"
@@ -108,3 +98,11 @@ def test_robomimic_refuses_to_overwrite(workspace):
     before = out.read_bytes()
     assert main(args) == 2
     assert out.read_bytes() == before
+
+
+def test_removed_option_exits_2(workspace, capsys):
+    tmp, cfg = workspace
+    (tmp / "postprocess_config.yaml").write_text("postprocess:\n  robomimic:\n    training_model: bc_rnn_gmm\n")
+    assert main(["--config", str(cfg), "--format", "robomimic", "--input", str(tmp / "recordings"),
+                 "--output", str(tmp / "out" / "d.h5")]) == 2
+    assert "robomimic.training_model" in capsys.readouterr().err

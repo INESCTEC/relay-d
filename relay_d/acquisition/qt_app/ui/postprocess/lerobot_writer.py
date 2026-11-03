@@ -73,7 +73,11 @@ class LeRobotWriterError(RuntimeError):
     pass
 
 
-class LeRobotDependencyError(LeRobotWriterError):
+class LeRobotFatalError(LeRobotWriterError):
+    """The whole conversion must stop (the dataset was aborted), never a per-episode skip."""
+
+
+class LeRobotDependencyError(LeRobotFatalError):
     """A required library is missing in the running Python. Fatal for the whole
     conversion (every episode would fail the same way), never a per-episode skip."""
 
@@ -301,6 +305,7 @@ class LeRobotDatasetWriter:
         # per-camera video state: key -> {"chunk", "file", "video": _VideoFile}
         self._videos: Dict[str, Dict] = {}
         self._finalized = False
+        self._aborted = False
 
     # ------------------------------------------------------------------ public
 
@@ -370,9 +375,14 @@ class LeRobotDatasetWriter:
             "tasks": [task],
             "length": n,
         }
-        row.update(self._write_data(cols, n, start))
-        for key, frames in images.items():
-            row.update(self._write_video(key, frames))
+        try:
+            row.update(self._write_data(cols, n, start))
+            for key, frames in images.items():
+                row.update(self._write_video(key, frames))
+        except Exception as e:
+            # rows (and maybe some videos) of this episode are already on disk: the next one would reuse its indices
+            self._abort()
+            raise LeRobotFatalError(f"Writing episode {episode_index} failed, dataset deleted: {e}") from e
         row["meta/episodes/chunk_index"] = 0
         row["meta/episodes/file_index"] = 0
 
@@ -383,6 +393,8 @@ class LeRobotDatasetWriter:
 
     def finalize(self) -> None:
         """Close writers and write metadata. Must be called, or the parquet files are corrupt."""
+        if self._aborted:
+            raise LeRobotWriterError("The dataset was aborted and deleted")
         if self._finalized:
             return
         self._finalized = True
@@ -658,7 +670,7 @@ class LeRobotDatasetWriter:
     def _abort(self) -> None:
         """Release file handles and delete the half-written dataset (the constructor
         checked that the folder was empty, so everything in it is ours)."""
-        self._finalized = True
+        self._finalized = self._aborted = True
         try:
             self._close_data_writer()
         except Exception:

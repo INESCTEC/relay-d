@@ -14,13 +14,13 @@ LeRobotPolicyRunner) and ActionDispatcher — and exposes them as plain method c
         checkpoint="model.pth",              # robomimic .pth, or a LeRobot pretrained_model folder
         obs_config="config/obs_config.yaml",
         action_config="config/action_config.yaml",
-        device="cpu",
+        device="cpu",                        # default: the infer_device setting
     ) as session:
         ok, report = session.validate()
         session.reset()
         action = session.step()          # one tick: obs -> predict -> dispatch
 
-        # or run the full loop, same as the CLI:
+        # or run the full loop, same as the CLI (default rate: the policy's, else the infer_hz setting):
         session.run(hz=20)
 
 The backend is chosen by `backend=` ("robomimic" / "lerobot"), by default from the
@@ -113,15 +113,17 @@ class InferenceSession:
         checkpoint: str,
         obs_config: str,
         action_config: str,
-        device: str = "cpu",
+        device: Optional[str] = None,
         backend: Optional[str] = None,
         state_keys: Optional[List[str]] = None,
         task: Optional[str] = None,
+        dry_run: bool = False,
     ):
-        """``backend``: "robomimic", "lerobot" or "auto" (default: the infer_backend setting, "auto" detects it from
+        """``device``: torch device (default: the infer_device setting). ``backend``: "robomimic", "lerobot" or "auto" (default: the infer_backend setting, "auto" detects it from
         the checkpoint). ``state_keys``: LeRobot only, the observations that form observation.state, in order
         (default: read from the dataset the policy was trained on). ``task``: LeRobot only, the instruction a language-conditioned
-        policy (SmolVLA) follows (default: the training dataset's task)."""
+        policy (SmolVLA) follows (default: the training dataset's task). ``dry_run``: log every command instead of
+        publishing it or sending a goal (the robot does not move)."""
         if _ROS_IMPORT_ERROR is not None:
             raise ImportError(
                 "InferenceSession requires a sourced ROS2 environment "
@@ -129,6 +131,7 @@ class InferenceSession:
                 "available in this Python environment."
             ) from _ROS_IMPORT_ERROR
 
+        device = device or user_settings.get("infer_device")
         backend = backend or user_settings.get("infer_backend")
         if backend == "auto":
             backend = detect_backend(checkpoint)
@@ -149,7 +152,8 @@ class InferenceSession:
                 fallback_state_keys=self.obs_node.low_dim_obs_names, task=task,
             )
 
-        self.dispatcher = ActionDispatcher(self.obs_node, action_config)
+        self.dispatcher = ActionDispatcher(self.obs_node, action_config, dry_run=dry_run)
+        self._check_action_layout()
         self._was_stale = False  # after stale inputs the policy restarts: no queued actions or frames from before the gap
 
         self._executor = MultiThreadedExecutor()
@@ -157,6 +161,24 @@ class InferenceSession:
         self._spin_thread = None
 
         self.obs_node.get_logger().info("=== InferenceSession ready. ===")
+
+    def _check_action_layout(self) -> None:
+        """action_config.yaml indices against the model's action size: an index past it stops startup, a column no
+        entry sends is warned about (a wrong list would drive the wrong joint silently). Skipped if the runner cannot tell."""
+        dim = getattr(self.model, "action_dim", None)
+        if not dim:
+            return
+        used = set()
+        for name, cfg in self.dispatcher._action_configs.items():
+            bad = [i for i in cfg["indices"] if not -dim <= i < dim]
+            if bad:
+                raise ValueError(f"action_config.yaml '{name}': indices {bad} are outside the model's action, "
+                                 f"which has {dim} values (indices 0..{dim - 1}).")
+            used.update(i % dim for i in cfg["indices"])
+        unused = sorted(set(range(dim)) - used)
+        if unused:
+            logger.warning(f"[InferenceSession] action columns {unused} of the model's {dim} are sent by no entry "
+                           "in action_config.yaml: check its indices.")
 
     # -------------------------------------------------------------------
     # Lifecycle
@@ -171,7 +193,6 @@ class InferenceSession:
 
     def close(self) -> None:
         self.dispatcher.send_stop()  # once: nothing is sent if run() already stopped and nothing was dispatched since
-        self.dispatcher.close()
         self._executor.shutdown()
         self.obs_node.destroy_node()
         if rclpy.ok():
@@ -225,16 +246,31 @@ class InferenceSession:
         """One full tick: get latest obs -> predict -> dispatch. Returns the action, or None
         (nothing dispatched) if an input is older than max_obs_age, like run()."""
         max_obs_age = user_settings.get("infer_max_obs_age_s") if max_obs_age is None else max_obs_age
+        self._model_failed = False
         obs = self.get_observation()
+        if logger.isEnabledFor(logging.DEBUG):  # vectors only: never format whole camera frames
+            logger.debug(
+                "[InferenceSession] obs: "
+                + ", ".join(f"{k}={np.round(obs[k], 4)}" for k in self.model.obs_keys if k in obs and obs[k].ndim == 1)
+            )
         stale = self._stale_inputs(max_obs_age)
         if stale:
-            logger.error(f"[InferenceSession] Stale inputs (> {max_obs_age}s), not dispatching: {stale}")
+            self.obs_node.get_logger().error(
+                f"Stale inputs (> {max_obs_age}s without new data), not dispatching: {stale}",
+                throttle_duration_sec=1.0,
+            )
             self.dispatcher.send_stop()  # once per stale period
             self._was_stale = True
             return None
         self._reset_after_stale()
-        action = self.predict(obs)
-        self.dispatch(action)
+        try:
+            self._model_failed = True  # until predict returns: run() ends on a model error, lets dispatch errors through
+            action = self.predict(obs)
+            self._model_failed = False
+            self.dispatch(action)
+        except BaseException:
+            self.dispatcher.send_stop()  # an error must not leave the last command running
+            raise
         return action
 
     def reset(self) -> None:
@@ -249,15 +285,19 @@ class InferenceSession:
     # Full loop (same behavior as the inference_node.py CLI)
     # -------------------------------------------------------------------
 
-    def run(self, hz: float = 0.0, max_steps: Optional[int] = None,
-            validate_timeout: Optional[float] = None, max_obs_age: Optional[float] = None) -> None:
-        # None = the user setting (infer_obs_wait_s, infer_max_obs_age_s). hz stays 0 here: only the
-        # command line takes its default rate from the infer_hz setting.
+    def run(self, hz: Optional[float] = None, max_steps: Optional[int] = None,
+            validate_timeout: Optional[float] = None, max_obs_age: Optional[float] = None) -> bool:
+        """The inference loop until Ctrl+C, max_steps or a model error; always ends with the safe stop.
+        ``hz``: control rate, 0 = as fast as possible (default: the rate the policy was trained at, else the infer_hz
+        setting). None for the others = the user setting (infer_obs_wait_s, infer_max_obs_age_s).
+        Returns False if it ended on a model error, True otherwise."""
+        fps = getattr(self.model, "fps", None)
+        # Each predicted action is one step of the training data: at another rate the robot moves faster or slower than shown.
+        hz = (fps or user_settings.get("infer_hz")) if hz is None else hz
         validate_timeout = user_settings.get("infer_obs_wait_s") if validate_timeout is None else validate_timeout
         max_obs_age = user_settings.get("infer_max_obs_age_s") if max_obs_age is None else max_obs_age
         self.start()
 
-        fps = getattr(self.model, "fps", None)
         if fps and hz != fps:
             pace = ("as fast as the loop runs" if hz <= 0 else
                     f"{fps / hz:.2g}x slower" if hz < fps else f"{hz / fps:.2g}x faster")
@@ -288,46 +328,33 @@ class InferenceSession:
         if not ok:
             raise RuntimeError("[Pre-flight] Validation failed. Fix obs_config.yaml and restart.")
 
-        self.obs_node.get_logger().info("[Pre-flight] All inputs and observations validated. Starting inference.")
+        self.obs_node.get_logger().info("[Pre-flight] All inputs and observations validated. Starting inference "
+                                        f"at {f'{hz} Hz' if hz > 0 else 'unthrottled rate'}.")
 
         # Start a fresh episode right before the rollout begins.
         self.reset()
 
         min_dt = (1.0 / hz) if hz > 0 else 0.0
         step_count = 0
+        model_failed = False
 
         try:
             while rclpy.ok():
                 t0 = time.monotonic()
 
-                obs = self.get_observation()
-                if logger.isEnabledFor(logging.DEBUG):  # vectors only: never format whole camera frames
-                    logger.debug(
-                        "[InferenceSession] obs: "
-                        + ", ".join(f"{k}={np.round(obs[k], 4)}" for k in self.model.obs_keys if k in obs and obs[k].ndim == 1)
-                    )
-
-                stale = self._stale_inputs(max_obs_age)
-                if stale:
-                    self.obs_node.get_logger().error(
-                        f"Stale inputs (> {max_obs_age}s without new data), not dispatching: {stale}",
-                        throttle_duration_sec=1.0,
-                    )
-                    self.dispatcher.send_stop()  # once per stale period
-                    self._was_stale = True
+                try:
+                    action = self.step(max_obs_age)
+                except Exception as e:
+                    if not self._model_failed:
+                        raise
+                    self.obs_node.get_logger().error(f"Model inference failed ({type(e).__name__}): {e}")
+                    model_failed = True
+                    break
+                if action is None:  # stale inputs
                     time.sleep(0.05)
                     continue
-                self._reset_after_stale()
-
-                try:
-                    action = self.predict(obs)
-                except Exception as e:
-                    self.obs_node.get_logger().error(f"Model inference failed ({type(e).__name__}): {e}")
-                    break
 
                 logger.debug(f"[InferenceSession] raw action (full {action.shape[0]}-dim): {action.round(5)}")
-
-                self.dispatch(action)
 
                 step_count += 1
                 if step_count % 100 == 0:
@@ -349,3 +376,4 @@ class InferenceSession:
             self.obs_node.get_logger().info("Shutting down inference session.")
         finally:  # every way out of the loop (model error, on_timeout: raise, Ctrl+C, max_steps) stops the robot
             self.dispatcher.send_stop()
+        return not model_failed

@@ -4,20 +4,15 @@ Both sides must apply the same rule, otherwise the policy sees different numbers
 than it was trained on. Keep them here, not in two copies.
 """
 
+import types
 from typing import Optional
 
 import numpy as np
 
 
-def normalize(x, lower: float, upper: float, norm_min: float = -1.0, norm_max: float = 1.0):
-    """Linearly map ``x`` from [lower, upper] to [norm_min, norm_max].
-
-    A degenerate range (upper <= lower) leaves ``x`` unchanged. ``x`` may be a scalar or an array.
-    """
-    span = upper - lower
-    if span <= 0:
-        return x
-    return (x - lower) / span * (norm_max - norm_min) + norm_min
+def stamp_to_sec(stamp) -> float:
+    """builtin_interfaces/Time (sec, nanosec), e.g. a header.stamp -> float seconds."""
+    return stamp.sec + stamp.nanosec * 1e-9
 
 
 def quat_to_euler(q) -> np.ndarray:
@@ -37,6 +32,22 @@ def quat_to_rot_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
         [    2*(x*y + w*z), 1 - 2*(x*x + z*z),     2*(y*z - w*x)],
         [    2*(x*z - w*y),     2*(y*z + w*x), 1 - 2*(x*x + y*y)],
     ], dtype=np.float32)
+
+
+def enriched_tf(tf_stamped) -> types.SimpleNamespace:
+    """TransformStamped -> object whose ``transform`` also has euler.roll/pitch/yaw, rot6d.i0..i5
+    (first two columns of R, column-major) and rot_matrix.r00..r22, so stream specs such as
+    ``tf.euler.yaw`` read the same values when recording and at inference."""
+    t, r = tf_stamped.transform.translation, tf_stamped.transform.rotation
+    roll, pitch, yaw = (float(v) for v in quat_to_euler([r.x, r.y, r.z, r.w]))
+    R = quat_to_rot_matrix(r.x, r.y, r.z, r.w)
+    return types.SimpleNamespace(transform=types.SimpleNamespace(
+        translation=t,
+        rotation=r,
+        euler=types.SimpleNamespace(roll=roll, pitch=pitch, yaw=yaw),
+        rot_matrix=types.SimpleNamespace(**{f"r{i}{j}": R[i, j] for i in range(3) for j in range(3)}),
+        rot6d=types.SimpleNamespace(**{f"i{i}": float(v) for i, v in enumerate(list(R[:, 0]) + list(R[:, 1]))}),
+    ))
 
 
 def inputs_in_sync(names, timestamps, threshold: Optional[float]) -> bool:

@@ -24,18 +24,8 @@ class YamlParser:
         logger.info("Create YamlParser object.")
 
         self.yaml_data = None
-        self.yaml_config_data = []
-        self.yaml_input_data = []
-        self.yaml_input_data_raw = {}
-        self.yaml_output_data = []
-        self.yaml_streams_data = {}
-        self.yaml_actions_to_extract = []
         self.current_config = {}
-        self.prefix_path = ""
-        self.dataset_name = "demo"
-        self.metadata = {}
-        self.sync_tolerance_sec = None
-        self.sync_mode = "soft"
+        self.clear()
 
     def load_yaml_file(self, file_path):
         try:
@@ -61,22 +51,7 @@ class YamlParser:
         config = self.yaml_data["config"]
         self.dataset_name = config.get("dataset_name", "demo")
 
-        if "data" in config:
-            self.yaml_config_data = [
-                {"name": name, "count": count} for name, count in config["data"].items()
-            ]
-
         if "input" in config:
-            global_transfer_rate = -1
-            if "recording_frequency" in config:
-                global_transfer_rate = config["recording_frequency"]
-            elif "metadata" in config and "transfer_rate" in config["metadata"]:
-                global_transfer_rate = config["metadata"]["transfer_rate"]
-            elif "metadata" in config and "recording_frequency" in config["metadata"]:
-                global_transfer_rate = config["metadata"]["recording_frequency"]
-            else:
-                global_transfer_rate = 30
-
             # Also add a raw for future procesing
             self.yaml_input_data_raw = config["input"]
 
@@ -101,41 +76,16 @@ class YamlParser:
                         "tf_wait_timeout", None
                     )
                     input_data["topic"] = None
-                    input_data["output_map"] = input_config.get("output_map", name)
-                    input_data["transfer_rate"] = input_config.get(
-                        "transfer_rate", global_transfer_rate
-                    )
                     input_data["fill_gaps"] = input_config.get("fill_gaps", False)
-                    input_data["fill_default"] = input_config.get("fill_default", None)
                 elif "topic" in input_config:
                     input_data["topic"] = input_config["topic"]
                     input_data["is_tf"] = False
-                    input_data["output_map"] = input_config.get("output_map", name)
-                    input_data["transfer_rate"] = input_config.get(
-                        "transfer_rate", global_transfer_rate
-                    )
                     input_data["joint_names"] = input_config.get("joint_names", [])
                     input_data["fill_gaps"] = input_config.get("fill_gaps", False)
-                    input_data["fill_default"] = input_config.get("fill_default", None)
                 else:
                     continue
 
                 self.yaml_input_data.append(input_data)
-
-        if "output" in config:
-            for output_name, output_fields in config["output"].items():
-                if output_name == "prefix_path":
-                    self.prefix_path = output_fields
-                    continue
-                if isinstance(output_fields, dict):
-                    for field_name, field_path in output_fields.items():
-                        self.yaml_output_data.append(
-                            {
-                                "name": output_name,
-                                "field": field_name,
-                                "source": field_path,
-                            }
-                        )
 
         if "metadata" in config:
             self.metadata = config["metadata"]
@@ -146,17 +96,9 @@ class YamlParser:
         else:
             self.yaml_streams_data = {}
 
-        self.yaml_actions_to_extract = config.get("actions_to_extract", [])
-        self.sync_tolerance_sec = config.get("sync_tolerance_sec", None)
-        self.sync_mode = config.get("sync_mode", "soft")
-
     def _print_parsed_data(self):
         """Print all parsed data for debugging. Lines with nothing meaningful
         to show are skipped rather than printed blank."""
-        logger.info("\n*** CONFIG DATA ***")
-        for item in self.yaml_config_data:
-            logger.info(f"  {item['name']}: {item['count']}")
-
         logger.info("\n*** INPUT DATA ***")
         for item in self.yaml_input_data:
             if item.get("is_tf"):
@@ -168,13 +110,10 @@ class YamlParser:
                 logger.info(f"  {item['name']}: {item['topic']}")
 
         logger.info("\n*** OUTPUT DATA ***")
-        if self.prefix_path:
-            logger.info(f"  Prefix path: {self.prefix_path}")
-        for item in self.yaml_output_data:
-            if not item.get("source"):
-                continue
-            parent_info = f" (parent: {item['parent']})" if "parent" in item else ""
-            logger.info(f"  {item['name']}.{item['field']}: {item['source']}{parent_info}")
+        for key, path in self.get_output_bridge_map().items():
+            logger.info(f"  {key}: {path}")
+        for name in self.yaml_streams_data:
+            logger.info(f"  stream {name}")
 
 
     # ------------------------------------------------------------------
@@ -324,34 +263,20 @@ class YamlParser:
     def clear(self):
         """Reset the parsed lists. ``yaml_data`` and ``current_config`` are kept: this also
         runs at the start of every load. To unload a config, reset those two as well."""
-        self.yaml_config_data = []
         self.yaml_input_data = []
         self.yaml_input_data_raw = {}
-        self.yaml_output_data = []
         self.yaml_streams_data = {}
-        self.yaml_actions_to_extract = []
-        self.prefix_path = ""
         self.dataset_name = "demo"
         self.metadata = {}
-        self.sync_tolerance_sec = None
-        self.sync_mode = "soft"
 
     def get_current_config_path(self):
         return self.current_config
-
-    def get_raw_yaml(self):
-        if self.yaml_data:
-            return yaml.dump(self.yaml_data, default_flow_style=False)
-        return ""
 
     def get_input_data(self):
         return self.yaml_input_data
 
     def get_input_data_raw(self):
         return self.yaml_input_data_raw
-
-    def get_output_data(self):
-        return self.yaml_output_data
 
     def get_dataset_name(self):
         return self.dataset_name
@@ -365,14 +290,8 @@ class YamlParser:
     def get_output_bridge_map(self) -> dict:
         """Flat {logical_key: recorded_path} bridge-map entries from
         `config.output` — top-level keys other than `streams`/`prefix_path`,
-        e.g. `agentview_image: camera_rgb/images`.
-
-        NOTE: this is distinct from get_output_data()/yaml_output_data, which
-        parses an older, incompatible two-level nested convention
-        (`output: <group>: {<field>: <path>}`) for UI display only and is
-        never consulted by the actual conversion engine
-        (yaml_driven_converter.DataTransformEngine._build_bridge_map, which
-        this method mirrors exactly) or by dispatch's get_obs_config() below.
+        e.g. `agentview_image: camera_rgb/images`. Mirrors the converter's
+        (yaml_driven_converter.DataTransformEngine._build_bridge_map).
         """
         if not self.yaml_data:
             return {}
@@ -383,25 +302,11 @@ class YamlParser:
             if key not in ("streams", "prefix_path") and isinstance(value, str)
         }
 
-    def get_train_model_name(self, options=None):
-        """Robomimic training-config model, default bc_rnn_gmm.
-
-        Read from the postprocess options (`robomimic.training_model`) when given, else
-        from the legacy `config.training_model` key. Matches the
-        `robomimic_<model>_config.json` files shipped in postprocess_configs/.
-        """
-        from ..postprocess.postprocess_options import PostprocessOptions
-
-        config = (self.yaml_data or {}).get("config") or {}
-        return (options or PostprocessOptions()).training_model(config)
-
-    # This is for the action dispatcher
     def get_obs_config(self):
         # Bridge-map entries (camera/organized-pointcloud obs, e.g.
         # `agentview_image: camera_rgb/images`) become passthrough obs in
-        # obs_config.yaml — ObsBuilder only needs the source input name, not
-        # the recorded dataset name (it decodes live from the topic, not
-        # from an HDF5 path), so keep only the part before the first '/'.
+        # obs_config.yaml. The recorded group is always the input name, so the
+        # part before the first '/' is the input ObsBuilder decodes live.
         bridge_obs = {
             key: {"source": path.split("/")[0]}
             for key, path in self.get_output_bridge_map().items()

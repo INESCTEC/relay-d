@@ -170,6 +170,8 @@ class LeRobotPolicyRunner:
             raise ValueError(f"[LeRobotPolicyRunner] unsupported policy inputs {unsupported}: only {STATE} and {IMAGE_PREFIX}* are fed")
         self._state_dim = int(features[STATE].shape[0]) if STATE in features else 0
         self._images = {k[len(IMAGE_PREFIX):]: (k, tuple(f.shape)) for k, f in features.items() if k.startswith(IMAGE_PREFIX)}
+        action = (getattr(cfg, "output_features", None) or {}).get("action")
+        self.action_dim: Optional[int] = int(action.shape[0]) if action is not None else None
 
         info = dataset_info(folder)
         if fine_tuned(folder):
@@ -180,6 +182,8 @@ class LeRobotPolicyRunner:
                     "training dataset (train_config.json -> dataset.root), which was not found: put it back at that path."
                 )
             self._state_dim, self._images = dataset_inputs(info)
+            action = (info.get("features") or {}).get("action") or {}
+            self.action_dim = int(action["shape"][0]) if action.get("shape") else None
         # The control rate the policy learned: each predicted action is one step at the dataset's fps.
         self.fps: Optional[float] = (info or {}).get("fps")
         self.state_keys = self._resolve_state_keys(info, state_keys, fallback_state_keys)

@@ -23,7 +23,6 @@ import h5py
 
 from relay_d.utils import user_settings
 from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_options import PostprocessOptions
 from relay_d.acquisition.qt_app.ui.postprocess.robomimic_config_handler import (
     RobomimicConfigHandler,
     classify_observations,
@@ -90,7 +89,7 @@ class DatasetInfo:
 class TrainJob:
     dataset: DatasetInfo
     python: str = sys.executable
-    policy: Optional[str] = None  # robomimic: None = the folder's robomimic_config.json / postprocess options
+    policy: Optional[str] = None  # robomimic: None = the folder's saved robomimic_config.json, else the first template
     params: Dict[str, Any] = field(default_factory=dict)  # only the keys the user changed
     extra_args: str = ""
 
@@ -170,7 +169,7 @@ def _set_path(cfg: dict, dotted: str, value) -> None:
 
 
 def _config_file(dataset: "DatasetInfo", name: str) -> Optional[Path]:
-    """``name`` (e.g. ``postprocess_config.yaml``) that belongs to ``dataset``, next to it.
+    """``name`` (e.g. ``acquisition_config.yaml``) that belongs to ``dataset``, next to it.
 
     ``relay-d-convert`` writes ``<output name>_<name>``, so a folder can hold several pairs: take the one named after
     this dataset, else the plain file the GUI writes, else any ``*<name>``.
@@ -182,17 +181,10 @@ def _config_file(dataset: "DatasetInfo", name: str) -> Optional[Path]:
 
 
 def _robomimic_policy(dataset: DatasetInfo, policy: Optional[str]) -> str:
-    """The template name to use: explicit, else the folder's postprocess options, else the default."""
-    if policy:
-        if policy not in ROBOMIMIC_POLICIES:
-            raise TrainingError(f"unknown robomimic policy '{policy}' (choose from {ROBOMIMIC_POLICIES})")
-        return policy
-    options_file = _config_file(dataset, "postprocess_config.yaml")
-    if options_file is not None:
-        options, _ = PostprocessOptions.load(str(options_file))
-        if options is not None:
-            return options.training_model()
-    return PostprocessOptions().training_model()
+    """The template name to use: explicit (the Train tab's Policy box / --policy), else the first one."""
+    if policy and policy not in ROBOMIMIC_POLICIES:
+        raise TrainingError(f"unknown robomimic policy '{policy}' (choose from {ROBOMIMIC_POLICIES})")
+    return policy or ROBOMIMIC_POLICIES[0]
 
 
 def _robomimic_modalities(dataset: DatasetInfo) -> Dict[str, list]:

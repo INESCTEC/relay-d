@@ -40,7 +40,7 @@ def test_suggested_names_use_the_prefix_the_record_page_needs():
 def _good():
     d = ConfigDraft(recording_frequency=30)
     d.add_input(InputDraft(name="joint_a", topic="/js", joint_names=["j1", "j2"]))
-    d.streams["q"] = StreamDraft(name="q", specs=["joint_a.position[:]"], normalize=True, limits=[{"lower_lim": -1, "upper_lim": 1}] * 2)
+    d.streams["q"] = StreamDraft(name="q", specs=["joint_a.position[:]"], explicit_dict=True)
     d.actions = ["q"]
     return d.to_config()
 
@@ -58,11 +58,57 @@ def test_validator_rules():
         return _messages(cfg, ERROR)
 
     assert any("not defined" in m for m in bad(lambda c: c["input"].pop("joint_a")))
-    assert any("limits for 2 values" in m for m in bad(lambda c: c["output"]["streams"]["q"].update(limits=[{"lower_lim": 0, "upper_lim": 1}] * 3)))
-    assert any("lower_lim must be smaller" in m for m in bad(lambda c: c["output"]["streams"]["q"].update(limits=[{"lower_lim": 1, "upper_lim": 1}] * 2)))
     assert any("actions_to_extract" in m for m in bad(lambda c: c.update(actions_to_extract=["nope"])))
     assert any("delta_actions" in m for m in bad(lambda c: c.update(delta_actions=["other"])))
-    assert any("is normalized" in m for m in bad(lambda c: c.update(delta_actions=["q"])))  # q is normalized
+    for key in ("normalize", "normalized_range", "limits"):  # Relay-D no longer normalizes: old keys must not be ignored
+        msgs = bad(lambda c: c["output"]["streams"]["q"].update({key: True}))
+        assert any("Relay-D no longer normalizes" in m and "'q'" in m for m in msgs), key
     assert any("positive" in m for m in bad(lambda c: c.update(recording_frequency=0)))
     assert any("rpy needs exactly 4" in m for m in bad(lambda c: c["output"]["streams"]["q"].update(rotation_format="rpy")))
-    assert any("both recorded into" in m for m in bad(lambda c: c["input"].update(joint_b={"topic": "/x", "output_map": "joint_a"})))
+    assert any("'streams'" in m for m in bad(lambda c: c["input"].update(streams={"topic": "/x"})))
+    assert any("recording_frequency is required" in m for m in bad(lambda c: c.pop("recording_frequency")))
+    # actions are streams only (a camera entry is an observation, the converter cannot use it as an action)
+    assert any("not a stream" in m for m in bad(lambda c: (c["output"].update(cam="joint_a/images"), c.update(actions_to_extract=["cam"]))))
+
+
+def test_removed_keys_are_errors_that_say_what_to_do():
+    """Every removed key fails loudly (never silently ignored) and names what to do."""
+    def bad(mutate):
+        cfg = _good()
+        mutate(cfg["config"])
+        return _messages(cfg, ERROR)
+
+    cases = {
+        "output_map": lambda c: c["input"]["joint_a"].update(output_map="g"),
+        "fill_default": lambda c: c["input"]["joint_a"].update(fill_gaps=True, fill_default=0),
+        "transfer_rate": lambda c: c["input"]["joint_a"].update(transfer_rate=10),
+        "prefix_path": lambda c: c["output"].update(prefix_path="x"),
+        "data": lambda c: c.update(data={"a": 1}),
+        "metadata.recording_frequency": lambda c: c.update(metadata={"recording_frequency": 30}),
+        "metadata.transfer_rate": lambda c: c.update(metadata={"transfer_rate": 30}),
+    }
+    for key, mutate in cases.items():
+        assert any(f"'{key}' was removed" in m and "elete" in m for m in bad(mutate)), key
+
+
+def test_stream_width_counts_zero_n_as_n_values():
+    assert stream_width(["zero:3", "a.x"], {}) == 4
+
+
+def test_camera_obs_for_dispatch_names_an_existing_input():
+    from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser
+
+    cfg = _good()
+    cfg["config"]["input"]["image_cam"] = {"topic": "/img"}
+    cfg["config"]["output"]["agentview_image"] = "image_cam/images"
+    parser = YamlParser()
+    assert parser.load_from_yaml_string(yaml.safe_dump(cfg))
+    obs = parser.get_obs_config()["config"]
+    assert obs["observations"]["agentview_image"] == {"source": "image_cam"}
+    assert obs["observations"]["agentview_image"]["source"] in obs["input"]
+
+
+def test_shipped_acquisition_template_passes_the_check():
+    # "Generate Defaults" hands this file to users: it must load without errors and turn into an obs_config inference accepts.
+    path = Path(__file__).parents[1] / "relay_d/acquisition/qt_app/ui/config/templates/config_template.yaml"
+    assert [str(p) for p in check_config(yaml.safe_load(path.read_text())) if p.level == ERROR] == []

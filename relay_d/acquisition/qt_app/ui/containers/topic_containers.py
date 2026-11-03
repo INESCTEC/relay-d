@@ -62,17 +62,9 @@ class TopicContainers:
             # Set basic properties for identification
             container.topic_type = topic_type
 
-            # Use output_map from container_data if available, otherwise use input_name
-            output_map = None
-            input_name = None
-            if container_data:
-                output_map = container_data.get("output_map")
-                input_name = container_data.get("input_name")
-
-            # Use output_map as container_id (this is the name used in HDF5 output)
-            if output_map:
-                container.container_id = output_map
-            elif input_name:
+            # The input name is the container id (and the HDF5 group it is recorded into)
+            input_name = container_data.get("input_name") if container_data else None
+            if input_name:
                 container.container_id = input_name
             else:
                 container.container_id = f"container_{self.container_count}_{topic_type}"

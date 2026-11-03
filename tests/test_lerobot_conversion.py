@@ -21,9 +21,7 @@ from helpers import DATA_CONFIG, FPS, LENGTHS, write_recording  # noqa: E402
 
 @pytest.fixture
 def converter():
-    loader = PostprocessConfigLoader()
-    assert "lerobot" in loader.get_all_format_names()
-    return YAMLDrivenConverter(loader, data_config=json.loads(json.dumps(DATA_CONFIG)))
+    return YAMLDrivenConverter(PostprocessConfigLoader(), data_config=json.loads(json.dumps(DATA_CONFIG)))
 
 
 def test_convert_to_lerobot(tmp_path, converter):
@@ -63,7 +61,9 @@ def test_convert_to_lerobot(tmp_path, converter):
 def test_config_overrides(tmp_path, converter):
     rec = tmp_path / "recording_0.h5"
     write_recording(rec, [6])
-    converter.data_config["lerobot"] = {"task": "pick up the red cube", "state_streams": ["eef_translation"]}
+    from relay_d.acquisition.qt_app.ui.postprocess.postprocess_options import PostprocessOptions
+
+    converter.options = PostprocessOptions({"lerobot": {"task": "pick up the red cube", "state_streams": ["eef_translation"]}})
     out = tmp_path / "ds"
     assert converter.convert_multiple_files("lerobot", [str(rec)], str(out))
     info = json.loads((out / "meta/info.json").read_text())
@@ -86,7 +86,7 @@ def test_robomimic_path_still_works(tmp_path, converter):
     assert converter.convert_multiple_files("robomimic", [str(rec)], str(out))
     with h5py.File(out, "r") as f:
         assert f["data"].attrs["total"] == len(LENGTHS)
-        assert set(f["data/demo_0"].keys()) >= {"actions", "obs", "next_obs", "rewards", "dones", "states"}
+        assert set(f["data/demo_0"].keys()) == {"actions", "obs", "rewards", "dones"}
         assert f["data/demo_0/actions"].shape == (LENGTHS[0], 4)
         assert "agentview_image" in f["data/demo_0/obs"]
 
@@ -146,16 +146,6 @@ def test_recording_without_images_needs_no_pyav(tmp_path, converter, monkeypatch
     assert info["total_frames"] == 13
     assert not (out / "videos").exists()
     assert not any(k.startswith("observation.images") for k in info["features"])
-
-
-def test_get_train_model_name_default_and_explicit(tmp_path):
-    from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser
-
-    p = YamlParser()
-    p.yaml_data = {"config": {}}
-    assert p.get_train_model_name() == "bc_rnn_gmm"
-    p.yaml_data = {"config": {"training_model": "diffusion_policy"}}
-    assert p.get_train_model_name() == "diffusion_policy"
 
 
 def test_missing_pyarrow_fails_clearly_without_output(tmp_path, converter, monkeypatch):

@@ -136,6 +136,7 @@ def test_runner_feeds_lerobot_and_returns_a_flat_float32_action(tmp_path, monkey
     cfg = types.SimpleNamespace(
         type="act", device="cpu",
         input_features={STATE: feature((3,)), "observation.images.cam": feature((3, 4, 6))},
+        output_features={"action": feature((3,))},
     )
     _lerobot_folder(tmp_path / "pretrained_model")
     ck = tmp_path / "pretrained_model"
@@ -162,6 +163,7 @@ def test_runner_feeds_lerobot_and_returns_a_flat_float32_action(tmp_path, monkey
     with pytest.raises(FileNotFoundError, match="not a LeRobot checkpoint"):
         lr.LeRobotPolicyRunner(str(tmp_path / "nowhere"))
     assert runner.fps is None  # no training dataset to read the rate from
+    assert runner.action_dim == 3  # checked against action_config.yaml indices at startup
 
     root = tmp_path / "ds"
     (root / "meta").mkdir(parents=True)
@@ -184,11 +186,11 @@ def test_runner_feeds_lerobot_and_returns_a_flat_float32_action(tmp_path, monkey
     # real inputs are the dataset's, fed under the dataset's camera name (the preprocessor renames it to camera1)
     cfg.input_features = {STATE: feature((6,)), "observation.images.camera1": feature((3, 256, 256))}
     (root / "meta" / "info.json").write_text(json.dumps({"fps": 15, "features": {
-        STATE: {"names": ["x", "y.0", "y.1"], "shape": [3]},
+        STATE: {"names": ["x", "y.0", "y.1"], "shape": [3]}, "action": {"shape": [2]},
         "observation.images.cam": {"dtype": "video", "shape": [4, 6, 3]}}}))
     (ck / "train_config.json").write_text(json.dumps({"dataset": {"root": str(root)}, "policy": {"pretrained_path": "lerobot/smolvla_base"}}))
     runner = lr.LeRobotPolicyRunner(str(ck), device="cpu", task="stack the cubes")
-    assert runner.obs_keys == ["x", "y", "cam"]
+    assert runner.obs_keys == ["x", "y", "cam"] and runner.action_dim == 2  # the dataset's action, not the base model's
     runner.get_action({"x": np.array([1.0]), "y": np.array([2.0, 3.0]), "cam": _frame(4, 6)})
     assert seen["batch"][STATE].shape == (1, 3) and seen["batch"]["observation.images.cam"].shape == (1, 3, 4, 6)
     (ck / "train_config.json").write_text(json.dumps({"dataset": {"root": str(tmp_path / "gone")}, "policy": {"pretrained_path": "x"}}))
@@ -201,3 +203,35 @@ def test_old_custom_backend_setting_falls_back_to_auto(settings_file):
 
     settings_file.write_text(json.dumps({"infer_backend": "custom"}))
     assert us.reload()["infer_backend"] == "auto"
+
+
+def _robomimic_runner_module(monkeypatch, ckpt):
+    """relay_d.dispatch.robomimic_runner loaded against stand-in robomimic modules (robomimic is not installed here)."""
+    import importlib.util
+    import sys
+
+    policy = types.SimpleNamespace(policy=None, start_episode=lambda: None)
+    file_utils = types.ModuleType("robomimic.utils.file_utils")
+    file_utils.policy_from_checkpoint = lambda ckpt_path, device: (policy, ckpt)
+    torch_utils = types.ModuleType("robomimic.utils.torch_utils")
+    torch_utils.get_torch_device = lambda try_to_use_cuda: "cpu"
+    utils = types.ModuleType("robomimic.utils")
+    utils.file_utils, utils.torch_utils = file_utils, torch_utils
+    robomimic = types.ModuleType("robomimic")
+    robomimic.utils = utils
+    for module in (robomimic, utils, file_utils, torch_utils):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    spec = importlib.util.find_spec("relay_d.dispatch.robomimic_runner")
+    module = importlib.util.module_from_spec(spec)  # not put in sys.modules: other tests never see the stand-ins
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_robomimic_runner_reads_the_rate_and_action_size_from_the_checkpoint(monkeypatch):
+    ckpt = {"shape_metadata": {"all_obs_keys": ["q"], "ac_dim": 7},
+            "env_metadata": {"env_name": "relay_d", "type": 1, "env_kwargs": {"control_freq": 30.0}}}
+    rr = _robomimic_runner_module(monkeypatch, ckpt)
+    runner = rr.RobomimicPolicyRunner("model.pth")
+    assert runner.fps == 30.0 and runner.action_dim == 7  # the rate the data was recorded at, as for LeRobot
+    assert rr.checkpoint_fps({"env_metadata": {"env_name": "relay_d", "type": 1, "env_kwargs": {}}}) is None  # older checkpoint
+    assert rr.checkpoint_fps({}) is None and rr.checkpoint_fps({"env_metadata": [ckpt["env_metadata"]] * 2}) is None

@@ -1,12 +1,13 @@
 """Checks of an acquisition config dict, shared by the Config builder, the Config page and the offline loader (no Qt, no ROS).
 
-The builder treats ``error`` problems as blocking. The load paths (Config page insert / save, ``load_offline_config``) show them
-all as warnings: hand-written configs that worked before must keep loading.
+The builder treats ``error`` problems as blocking. The Config page shows them all as a warning when a file loads; the recorder
+refuses the removed keys that changed the recorded data (``RECORDING_CHANGING``).
 """
 
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -31,7 +32,9 @@ def stream_width(specs: List[str], inputs: Dict[str, dict]) -> Optional[int]:
     """Number of values one stream row has, or None if it cannot be known from the config (a ``[:]`` slice without joint_names)."""
     width = 0
     for spec in specs:
-        if spec.rstrip().endswith("[:]"):
+        if re.fullmatch(r"zero:\d+", spec.strip()):  # zero:N is N zeros
+            width += int(spec.strip()[5:])
+        elif re.sub(r"^(sin|cos)\((.*)\)$", r"\2", spec.strip()).endswith("[:]"):  # sin(a.position[:]) is as wide as its slice
             names = (inputs.get(next(iter(spec_inputs(spec)), ""), {}) or {}).get("joint_names")
             if not names:
                 return None
@@ -52,9 +55,11 @@ def check_config(data: Dict[str, Any]) -> List[Problem]:
     if not isinstance(config, dict):
         return [Problem(ERROR, "the file has no 'config:' section")]
 
+    for key, why in removed_keys(config):
+        add(ERROR, why)
     freq = config.get("recording_frequency")
     if freq is None:
-        add(WARNING, "recording_frequency is not set (30 Hz is used; LeRobot conversion needs a frequency in the config)")
+        add(ERROR, "recording_frequency is required (the rate in Hz every input is sampled at)")
     elif not _numbers(freq) or freq <= 0:
         add(ERROR, f"recording_frequency must be a positive number, got {freq!r}")
     if config.get("sync_mode") not in (None, "soft", "strict"):
@@ -62,21 +67,14 @@ def check_config(data: Dict[str, Any]) -> List[Problem]:
 
     # ---- inputs
     inputs = {n: v for n, v in (config.get("input") or {}).items() if isinstance(v, dict)}
-    groups: Dict[str, str] = {}
     for name, raw in inputs.items():
         is_tf = "parent_frame" in raw and "child_frame" in raw
         if not is_tf and not raw.get("topic"):
             add(WARNING, f"input '{name}' has neither a topic nor parent_frame + child_frame: it is ignored")
-        if str(raw.get("modality") or "rgb").split()[0] not in _MODALITIES:
+        if str(raw.get("modality") or "rgb") not in _MODALITIES:
             add(WARNING, f"input '{name}': modality '{raw.get('modality')}' is not one of {_MODALITIES}")
-        group = raw.get("output_map") or name
-        if group in groups:
-            add(ERROR, f"inputs '{groups[group]}' and '{name}' are both recorded into the group '{group}': give one an output_map")
-        groups[group] = name
-        if group == "streams":
-            add(ERROR, f"input '{name}' would be recorded into the group 'streams', which holds the output.streams data")
-        if raw.get("fill_default") is not None and not raw.get("fill_gaps"):
-            add(WARNING, f"input '{name}': fill_default has no effect without fill_gaps: true")
+        if name == "streams":
+            add(ERROR, "an input named 'streams' would be recorded into the group that holds the output.streams data: rename it")
 
     # ---- streams
     output = config.get("output") or {}
@@ -89,25 +87,13 @@ def check_config(data: Dict[str, Any]) -> List[Problem]:
             continue
         for inp in sorted({i for s in specs for i in spec_inputs(s)} - set(inputs)):
             add(ERROR, f"stream '{name}' uses the input '{inp}', which is not defined under input:")
-        width = stream_width(specs, inputs)
         fmt = value_dict.get("rotation_format", "quat")
         if fmt not in ("quat", "rpy"):
             add(ERROR, f"stream '{name}': rotation_format must be 'quat' or 'rpy', got {fmt!r}")
         elif fmt == "rpy" and (len(specs) != 4 or any(s.rstrip().endswith("[:]") for s in specs)):
             add(ERROR, f"stream '{name}': rotation_format rpy needs exactly 4 scalar quaternion specs (x, y, z, w), has {len(specs)}")
-        if value_dict.get("normalize"):
-            limits = value_dict.get("limits")
-            columns = 3 if fmt == "rpy" else width
-            if not limits:
-                add(ERROR, f"stream '{name}': normalize is on but there are no limits")
-                continue
-            bad = [lim for lim in limits if not (isinstance(lim, dict) and _numbers(lim.get("lower_lim")) and _numbers(lim.get("upper_lim")))]
-            if bad:
-                add(ERROR, f"stream '{name}': every limit needs numeric lower_lim and upper_lim (found {bad[0]!r})")
-            elif any(lim["lower_lim"] >= lim["upper_lim"] for lim in limits):
-                add(ERROR, f"stream '{name}': lower_lim must be smaller than upper_lim")
-            elif columns is not None and len(limits) not in (1, columns):
-                add(ERROR, f"stream '{name}': {len(limits)} limits for {columns} values (use one per value, or one for all)")
+        if msg := normalization_error(name, value):
+            add(ERROR, msg)
 
     # ---- camera / point cloud entries
     for key, value in output.items():
@@ -117,24 +103,59 @@ def check_config(data: Dict[str, Any]) -> List[Problem]:
             add(WARNING, f"output entry '{key}' should look like '<input>/images' or '<input>/points'")
             continue
         group = value.split("/", 1)[0]
-        if group not in groups:
-            if group in inputs:
-                add(ERROR, f"output '{key}' points at '{group}', but that input is recorded as '{inputs[group].get('output_map')}' (its output_map)")
-            else:
-                add(WARNING, f"output '{key}' points at '{group}', which is not an input")
+        if group not in inputs:
+            add(WARNING, f"output '{key}' points at '{group}', which is not an input")
 
     # ---- actions
-    known = set(streams) | {k for k in output if k not in ("streams", "prefix_path")}
     actions = config.get("actions_to_extract") or []
+    if not actions:
+        add(ERROR, "actions_to_extract is empty: name the stream(s) the policy outputs as its action")
     for name in actions:
-        if name not in known:
-            add(ERROR, f"actions_to_extract: '{name}' is not a stream or output entry")
+        if name not in streams:
+            add(ERROR, f"actions_to_extract: '{name}' is not a stream under output.streams")
     for name in config.get("delta_actions") or []:
         if name not in actions:
             add(ERROR, f"delta_actions: '{name}' is not listed in actions_to_extract")
-        elif isinstance(streams.get(name), dict) and streams[name].get("normalize"):
-            add(ERROR, f"delta_actions: '{name}' is normalized; the dispatcher cannot undo a normalized delta (use a raw stream for the action)")
     return problems
+
+
+_DEAD = "it was never used"
+# (section, key) -> why it was removed and what to do. An old config that still has one gets an error, never silent ignoring.
+_REMOVED = {
+    ("input", "output_map"): "inputs are always recorded under their own name (output_map made recording, conversion and "
+                             "dispatch disagree). Delete it and rename the input to the group name you want",
+    ("input", "fill_default"): "it wrote a made-up value before the first real message. Delete it: with fill_gaps the "
+                               "first real message fills the leading samples",
+    ("input", "transfer_rate"): f"{_DEAD}. Delete it: recording_frequency sets the rate of every input",
+    ("output", "prefix_path"): f"{_DEAD}. Delete it",
+    ("config", "data"): f"{_DEAD}. Delete it",
+    ("metadata", "recording_frequency"): "the rate has one place. Delete it and set config.recording_frequency instead",
+    ("metadata", "transfer_rate"): f"{_DEAD}. Delete it: config.recording_frequency sets the rate",
+}
+RECORDING_CHANGING = ("output_map", "fill_default")  # the recorder refuses these (they changed the recorded data)
+
+
+def removed_keys(config: Dict[str, Any]) -> List[tuple]:
+    """``(key, message)`` for every removed key still in ``config`` (the ``config:`` section)."""
+    sections = {"config": config, "output": config.get("output"), "metadata": config.get("metadata")}
+    found = []
+    for (section, key), why in _REMOVED.items():
+        if section == "input":
+            for name, raw in (config.get("input") or {}).items():
+                if isinstance(raw, dict) and key in raw:
+                    found.append((key, f"input '{name}': '{key}' was removed: {why}."))
+        elif isinstance(sections[section], dict) and key in sections[section]:
+            label = key if section in ("config", "output") else f"{section}.{key}"
+            found.append((key, f"'{label}' was removed: {why}."))
+    return found
+
+
+def normalization_error(name: str, value: Any) -> Optional[str]:
+    """The error for a stream that still has the removed ``normalize`` / ``normalized_range`` / ``limits`` keys, else None."""
+    if isinstance(value, dict) and any(k in value for k in ("normalize", "normalized_range", "limits")):
+        return (f"Relay-D no longer normalizes: robomimic and LeRobot normalize with the dataset's stats. "
+                f"Remove normalize / normalized_range / limits from stream '{name}'.")
+    return None
 
 
 def stream_build_errors(data: Dict[str, Any]) -> List[str]:
@@ -150,8 +171,3 @@ def stream_build_errors(data: Dict[str, Any]) -> List[str]:
 
 def has_errors(problems: List[Problem]) -> bool:
     return any(p.level == ERROR for p in problems)
-
-
-def as_warnings(problems: List[Problem]) -> List[str]:
-    """For the load paths: every problem as a ``warning: ...`` line (they never reject a file that loaded before)."""
-    return [f"warning: {p.message}" for p in problems]

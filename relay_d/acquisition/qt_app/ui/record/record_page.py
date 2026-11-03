@@ -38,6 +38,7 @@ class RecordPage:
         # Initialize the TopicSubscribers
         # with the main ROS node
         self.topic_subscribers = TopicSubscribers()
+        self.topic_subscribers.start_spinning()  # its own thread, not the app's 10 ms Qt timer; closeEvent stops it
 
         # Initialize visualization and recording
         self.container_visualizer = ContainerVisualizer()
@@ -50,7 +51,7 @@ class RecordPage:
             self.container_visualizer,
         )
 
-        # Recording lifecycle: start/pause/resume/stop, session demos, record buttons
+        # Recording lifecycle: start/stop, session demos, record buttons
         self.recording = RecordingController(
             ui_instance,
             yaml_parser,
@@ -91,8 +92,18 @@ class RecordPage:
         config_signal_manager.config_cleared.connect(self._on_config_cleared)
         config_signal_manager.config_saved.connect(self._on_config_saved)
 
+    def _refuse_while_recording(self, what):
+        """True (and a warning) while a demo is recording or saving: swapping the subscribers now would
+        repeat the last frame and save the demo under the wrong names."""
+        if self.recording.is_recording:
+            logger.warning(f"Config {what} ignored: a recording is in progress. Stop it first, then reload the config.")
+            return True
+        return False
+
     def _on_config_saved(self, file_path):
         """Handle config saved signal - reload containers"""
+        if self._refuse_while_recording("save"):
+            return
         logger.info(f"Config saved, reloading containers from: {file_path}")
 
         # Reload the config file
@@ -103,6 +114,8 @@ class RecordPage:
 
     def _on_config_loaded(self, file_path):
         """Handle config loaded signal"""
+        if self._refuse_while_recording("load"):
+            return
         logger.info(f"Config loaded from: {file_path}")
         if self.label_no_config is not None:
             self.label_no_config.hide()
@@ -110,17 +123,11 @@ class RecordPage:
         # Load config first
         self.yaml_parser.load_yaml_file(file_path)
 
-        # Register the topic_subscribers node with the UI for spinning
-        if hasattr(self.ui, "register_ros_node"):
-            self.ui.register_ros_node(self.topic_subscribers)
-            self.ui.register_ros_node(self.data_recorder)
-            logger.info("Registered topic_subscribers and data_recorder nodes with UI")
-
         # Create the containers with visualization
         self._create_containers()
 
         # Start TF update timer at recording_frequency (not hardcoded 10 Hz)
-        freq = self.data_recorder.recording_frequency if self.data_recorder else 20
+        freq = ((self.yaml_parser.yaml_data or {}).get("config") or {}).get("recording_frequency") or 20  # the recorder reads it only at Start
         interval_ms = max(50, int(1000 / freq))   # floor at 50 ms (20 Hz max for UI)
         self.tf_update_timer.start(interval_ms)
         logger.info(f"TF update timer started at {freq} Hz ({interval_ms} ms)")
@@ -128,21 +135,12 @@ class RecordPage:
         # Start becomes available once a config is loaded
         self.recording.set_config_loaded(True)
 
-        ## Set grippers keys for state modification
-        self.gripper_key_map = {}
-        input_data = self.yaml_parser.get_input_data()
-
-        for entry in input_data:
-            if entry["name"].startswith("gripper") and "topic" in entry:
-                logger.info(f"Found gripper entry: {entry['name']}")
-                # For gripper, we now use key events - open/close keys should be defined separately
-                # or handled through the GUI
-
-        logger.info(f"Total gripper mappings: {len(self.gripper_key_map)}")
 
 
     def _on_config_cleared(self):
         """Handle config cleared signal"""
+        if self._refuse_while_recording("clear"):
+            return
         logger.info("Config cleared")
         if self.label_no_config is not None:
             self.label_no_config.show()
@@ -175,14 +173,6 @@ class RecordPage:
     def start_recording(self):
         """Start recording process"""
         return self.recording.start_recording()
-
-    def pause_recording(self):
-        """Pause recording process"""
-        return self.recording.pause_recording()
-
-    def resume_recording(self):
-        """Resume recording process"""
-        return self.recording.resume_recording()
 
     def stop_recording(self):
         """Stop recording process"""

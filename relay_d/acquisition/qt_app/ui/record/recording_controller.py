@@ -6,18 +6,17 @@ from relay_d.utils.coloring_logger import logger
 from relay_d.utils.tf_topic import TfTopicSubscriptionError
 
 from ..review.demo_validator import CheckStatus
+from .data_recorder import start_demo
 from ...utils.background import run_in_background
 from ...utils.custom_message_box import CustomMessageBox
 
 
 class RecordingController:
-    """Recording lifecycle for the record page: start / pause / resume / stop.
+    """Recording lifecycle for the record page: start / stop.
 
-    Owns the recording state (``is_recording``, ``is_paused``), the demos recorded in this
-    session and the Start/Pause/Stop buttons. The Pause button is connected once to
-    ``toggle_pause``; its text and enabled state follow the state via ``update_buttons``
-    (no reconnecting of slots). ``RecordPage`` delegates to this class and keeps its public
-    method names.
+    Owns the recording state (``is_recording``), the demos recorded in this session and the
+    Start/Stop buttons, whose enabled state follows the state via ``update_buttons``.
+    ``RecordPage`` delegates to this class and keeps its public method names.
     """
 
     def __init__(
@@ -38,8 +37,7 @@ class RecordingController:
         self.container_manager = container_manager
         self._demo_validator = demo_validator
 
-        self.is_recording = False  # stays True while paused, and while the demo is being saved
-        self.is_paused = False
+        self.is_recording = False  # stays True while the demo is being saved
         self.is_saving = False  # Stop was pressed; the save runs in a background thread
         self.recording_start_time = None
         self.config_loaded = False
@@ -58,17 +56,14 @@ class RecordingController:
     # ------------------------------------------------------------------
 
     def connect_buttons(self):
-        """Connect Start/Pause/Stop once and set their initial state."""
+        """Connect Start/Stop once and set their initial state."""
         self.ui.btn_start_record.clicked.connect(self.start_recording)
-        self.ui.btn_pause_record.clicked.connect(self.toggle_pause)
         self.ui.btn_stop_record.clicked.connect(self.stop_recording)
         self.update_buttons()
 
     def update_buttons(self):
-        """Enable/label the buttons from the current state."""
+        """Enable the buttons from the current state."""
         self.ui.btn_start_record.setEnabled(self.config_loaded and not self.is_recording)
-        self.ui.btn_pause_record.setEnabled(self.is_recording and not self.is_saving)
-        self.ui.btn_pause_record.setText("Resume" if self.is_paused else "Pause")
         self.ui.btn_stop_record.setEnabled(self.is_recording and not self.is_saving)
 
     def set_config_loaded(self, loaded: bool):
@@ -77,7 +72,7 @@ class RecordingController:
         self.update_buttons()
 
     def _check_buffer_full(self):
-        """Tell the operator once when the recorder stopped sampling because its buffer is full."""
+        """Tell the operator once when the recorder stopped sampling (buffer full, or its loop failed)."""
         if self.data_recorder.buffer_full is True:
             self._buffer_timer.stop()
             CustomMessageBox.warning(
@@ -85,12 +80,13 @@ class RecordingController:
                 "Press Stop to save what was recorded.",
                 title="Recording Buffer Full",
             )
-
-    def toggle_pause(self):
-        """Pause button slot: pause while recording, resume while paused."""
-        if self.is_paused:
-            return self.resume_recording()
-        return self.pause_recording()
+        elif self.data_recorder.loop_failed is True:
+            self._buffer_timer.stop()
+            CustomMessageBox.error(
+                "The recording loop kept failing and has stopped sampling (see the log). "
+                "Press Stop to save what was recorded.",
+                title="Recording Stopped",
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -108,22 +104,11 @@ class RecordingController:
                 CustomMessageBox.warning("Load a config first: recording needs one (Configuration page).", title="No config loaded")
                 return False
 
-            # Create subscribers now (at recording start, not at config load)
-            logger.info("Creating ROS subscribers for recording...")
-            subscriber_results = self.topic_subscribers.create_subscribers_for_containers(
-                self.topic_containers.containers
+            demo_name = start_demo(  # same steps as AppAPI.start_recording
+                self.data_recorder, self.topic_subscribers, self.topic_containers.containers,
+                self.yaml_parser.get_dataset_name(),
             )
-            successful = sum(subscriber_results.values())
-            logger.info(
-                f"Subscribers created: {successful}/{len(self.topic_containers.containers)}"
-            )
-
-            # Start recording with DataRecorder
-            dataset_name = self.yaml_parser.get_dataset_name()
-            demo_name = f"{dataset_name}_{time.time_ns() // 1_000_000}"  # ms: two Starts in one second must not clash ("w-")
-            success = self.data_recorder.start_recording(
-                self.topic_subscribers, demo_name
-            )
+            success = demo_name is not None
             if self.data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
                 self.session_h5_files.append(self.data_recorder.retried_file)
 
@@ -134,7 +119,6 @@ class RecordingController:
                 )
 
                 self.is_recording = True
-                self.is_paused = False
                 self.recording_start_time = time.time()
                 self._buffer_timer.start()
 
@@ -172,50 +156,6 @@ class RecordingController:
             logger.error(f"Error starting recording: {e}")
             return False
 
-    def pause_recording(self):
-        """Pause recording process"""
-        try:
-            if not self.is_recording:
-                logger.warning("No recording in progress to pause")
-                return False
-
-            success = self.data_recorder.pause_recording()
-
-            if success:
-                self.is_paused = True
-                self.container_manager.set_status_for_all("Paused")
-                logger.info("Recording paused")
-                self.update_buttons()
-                return True
-            else:
-                logger.error("Failed to pause recording")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error pausing recording: {e}")
-            return False
-
-    def resume_recording(self):
-        """Resume recording process"""
-        try:
-            success = self.data_recorder.resume_recording()
-
-            if success:
-                self.is_paused = False
-                self.container_manager.set_statuses_by_data(
-                    "Recording (Data Available)", "Recording (Waiting for Data)"
-                )
-                logger.info("Recording resumed")
-                self.update_buttons()
-                return True
-            else:
-                logger.error("Failed to resume recording")
-                return False
-
-        except Exception as e:
-            logger.error(f"Error resuming recording: {e}")
-            return False
-
     def stop_recording(self):
         """Stop button: start saving the demo. True if the save was started.
 
@@ -242,7 +182,6 @@ class RecordingController:
         try:
             if success:
                 self.is_recording = False
-                self.is_paused = False
                 recording_duration = (
                     time.time() - self.recording_start_time
                     if self.recording_start_time
@@ -284,7 +223,6 @@ class RecordingController:
                     # and retries the save on the next Start. Leave the UI in the "stopped" state so
                     # Start is available again instead of stuck on "Recording".
                     self.is_recording = False
-                    self.is_paused = False
                     self.topic_subscribers.clear_all_subscribers()
                     self.container_manager.set_statuses_by_data(
                         "Stopped (Data Available)", "Stopped (No Data)"

@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`relay_d.dispatch.DispatcherHelpers` is gone:** use `save_dispatch_templates(output_dir)`.
 - **`lfd-inference-node --hz`** defaults to the rate the LeRobot policy was trained at (its dataset fps), no longer the `infer_hz` setting (10 Hz). robomimic checkpoints still use the setting: pass `--hz <recording_frequency>`.
 - **Action configs copied from the template:** the `robotiq_gripper` entry must map `position: 0`, not `7` (see *Fixed*).
+- **Relay-D no longer normalizes** (robomimic and LeRobot already normalize and un-normalize with the dataset's stats). Remove
+  `normalize` / `normalized_range` / `limits` from acquisition streams and `obs_config.yaml`, and `denormalize` / `normalized_range` /
+  `apply_limits` from `action_config.yaml`; configs that still have them are refused. `limits` on an action entry now only **clamps**
+  the real value: an old action config with `limits` and no `denormalize` key (it defaulted to true) used to rescale [-1, 1] and now
+  clamps, so it is only right for a policy retrained on this release.
+- **Removed config keys now stop with "'<key>' was removed: ...; <what to do>"** instead of being ignored. Acquisition config:
+  `output_map` and `fill_default` (also refused at Start: they changed the recorded data), `transfer_rate`, `output.prefix_path`,
+  `config.data`, `metadata.*`, and the old post-process keys (`training_model`, `*_frac`, `lerobot`). `postprocess_config.yaml`:
+  `robomimic.metadata`, `robomimic.training_model`, `splits.test_frac`. `action_config.yaml`: `command:` entries, `dedupe`, and the
+  `scale` / `clip` / `vacuum` / `magnetic` transforms. `obs_config.yaml`: `static` inputs. `recording_frequency` is required in the
+  acquisition YAML, and the `rec_default_frequency` / `rec_default_sync_*` settings are gone (the YAML is the only source).
+- **Acquisition template:** the streams that read inputs which are only commented examples (`tf_object`, `ee_pose`, ...) are
+  commented out too; before, a "Generate Defaults" config failed its own check and inference refused its obs_config.
+- **Action template:** only `move_arm_joint` and `robotiq_gripper` are live (`move_eef` became a commented example); before, a copied
+  template commanded the arm twice per tick, as a pose and as joint deltas.
 - **New folder names:** recording sessions end in `_Recording`, Post-process outputs in `_Robomimic` / `_Lerobot`. Existing folders keep their names.
 
 ### Added
@@ -23,8 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the state size and cameras are taken from the training dataset, because the checkpoint config keeps the pretrained model's ones.
 - **Safe stop:** a command or topic entry of `action_config.yaml` can set `stop: [...]` (e.g. `[0, 0, 0]` for a velocity), sent once when inference stops sending: inputs go stale, the model fails, `on_timeout: raise`, Ctrl+C, the end of
   `run()`, or `close()`. Before, the node just went quiet and a controller without a watchdog kept the last command. A broken `stop` (wrong length, a mapping that does not fit, set on an `action: true` entry) stops startup.
-- **Recorded-rate check:** a demo recorded more than 10% off `recording_frequency` (a PC that could not keep up) fails the after-recording check and is left out of LeRobot datasets, whose fps time base would make the policy move
-  faster than shown.
+- **Recorded-rate check:** a demo recorded more than 10% off `recording_frequency` (a PC that could not keep up) fails the after-recording check and is left out of robomimic and LeRobot datasets: the policy runs at that frequency, so
+  it would move faster than shown.
 - **CI runs the ROS-dependent tests** in a `ros:jazzy` container job (dispatcher, recorder, `AppAPI`, inference session). `pytest` also runs locally with ROS sourced (`pyproject.toml` disables the ROS pytest plugins).
 - Verified end to end against LeRobot 0.6.1: `LeRobotDataset` loads a Relay-D dataset (frames, RGB video, `action[t] = state[t+1]`, ACT-style action chunks via `delta_timestamps`), `lerobot_train` trains on it with the Train tab's
   command (ACT and SmolVLA), and `LeRobotPolicyRunner` runs the checkpoint, with state and action normalized by the dataset's own stats.
@@ -60,6 +75,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 - `relay_d.dispatch.DispatcherHelpers` (replaced by `save_dispatch_templates`).
 - The converter's field-scan fallback (`_scan_for_field`) and the resampling of datasets of the wrong length (`_resize_data`): both hid broken data (see *Fixed*).
+
+### Changed (Post-process)
+- **Pre-check before converting** (`YAMLDrivenConverter.precheck`, `relay-d-convert --check`, the Post-process page): per demo the
+  samples, recorded rate, the config it was recorded with (from the recording's metadata) and whether it converts or why not, plus the
+  layout that will be written, computed by the converter's own rules, so the page and the conversion cannot disagree. Conversion and
+  pre-check use one set of per-demo checks.
+- **Wrong config named plainly:** a demo whose metadata shows another `recording_frequency` says "recorded at 20 Hz with
+  config_peter.yaml; the loaded config says 30 Hz" instead of "this PC could not keep up"; a configured stream that is in none of the
+  selected recordings stops the conversion and lists the streams they do have (before, it was zero-filled with a warning).
+- **Post-process page:** the raw HDF5 tree is replaced by the pre-check table and an output preview built from the real config and
+  recordings (the earlier preview came from hand-written description files that had drifted from what conversion writes); recordings
+  can be added by file or by folder and dropped again with Remove selected / Delete (the files stay on disk); Convert says how many demos it will convert and why it is disabled.
+
+### Fixed (GUI = API)
+The GUI, `AppAPI`, `relay-d-convert` and `lfd-inference-node` / `InferenceSession` now run the same code at every step.
+- **Recording through the GUI was about 100 ms stale:** its Qt timer ran one ROS callback per node every 10 ms, so with 4 topics at
+  100 Hz it handled ~78 of 400 messages a second. `TopicSubscribers` now drains its callbacks in its own thread, in the GUI and in
+  `AppAPI` alike (measured: 400 msg/s, 5 ms median age); inference was already fresh, so training and run time now see the same data.
+- **Recording start/stop is one function** (`start_demo`): `AppAPI` subscribes every input at each start and clears them at stop as the
+  GUI does, refuses an unavailable topic / TF or an unparsable stream spec at `initialize` (as the Config page), names demos
+  `{dataset_name}_{ms}`, and logs the after-recording check.
+- **One writer for the files next to a dataset** (`write_dataset_files`): the CLI and `AppAPI` now also write
+  `acquisition_config.yaml`, `postprocess_config.yaml` and `action_dispatcher/` (before, only the Post-process page did, so their
+  datasets could not be run from the Run tab and lost `modality:` for training). The CLI writes them with plain names, and for LeRobot
+  beside the dataset folder, where the Train launcher looks. A broken options file stops the conversion everywhere; the GUI resets
+  the options at each config load; `AppAPI` writes a new `<date>_<Format>` folder instead of overwriting `combined_dataset_*`, and
+  `shutdown()` uses the default-format setting. Converted robomimic files given as inputs are skipped; inputs sort by full path. A
+  three-way check converting the same recordings gave identical files and dataset contents.
+- **Inference:** SIGTERM now sends the safe stop (it killed the node without it); the stop also cancels action goals still running;
+  `InferenceSession` uses the `infer_device` setting and the policy's rate by default (it ran unthrottled on the CPU); a model error
+  exits 1 (the Run tab showed "Stopped"); the Run tab's node runs in its own process group, so a terminal Ctrl+C reaches it once.
+
+### Added (checkpoint to robot)
+- **Run tab:** start a policy from the GUI (checkpoint + the dataset's `action_dispatcher/` folder, device, Hz, Dry run on by default),
+  follow its log, and stop it with a red **STOP** that sends Ctrl+C, so the node sends each entry's `stop:`; if the node does not
+  exit within 5 s it is killed and the log says the stop may not have been sent. Closing Relay-D stops a running policy first.
+- **`lfd-inference-node --dry-run`** (and `InferenceSession(dry_run=True)`): the whole loop runs on live sensors, but no publisher or
+  action client is created and every command and stop is logged instead of sent; config errors still stop startup.
+- **Action layout check:** an `action_config.yaml` index past the model's action size stops startup; action columns no entry sends
+  are listed in a warning.
+
+### Fixed (checkpoint to robot)
+- **robomimic policies run at their recording rate:** conversion stores `recording_frequency` in the dataset's `env_args`
+  (`env_kwargs.control_freq`), robomimic keeps it in the checkpoint, and `--hz` defaults to it as for LeRobot. Before, robomimic ran at the
+  `infer_hz` setting (10 Hz) whatever the demos were recorded at. Checkpoints trained on older conversions still need `--hz`.
+- The recorded-rate check (more than 10% off `recording_frequency`) now also leaves such demos out of robomimic datasets.
+
+### Removed (pipeline cleanup)
+One path from collection to inference; nothing kept that the trainers ignore or that could make the data mean two things.
+- **Recording:** Pause / Resume (a resume made the action at that row a jump; stop and start a new demo instead), `output_map` (a
+  second name for an input's group; it also broke inference for a camera, whose obs `source` became the group name), `fill_default`
+  (made-up values before the first message; leading samples are back-filled with the first real one), the dead `transfer_rate`,
+  `prefix_path`, `config.data` keys, the old nested `output:` parsing, and `AppAPI.pause_recording` / `resume_recording` /
+  `get_recording_status`. Stale data is now flushed at every Start (the GUI did not, the API did).
+- **Conversion:** the path for recordings without `streams/` (its datasets could not run at inference), `next_obs` and `states` in the
+  robomimic file (robomimic does not load them with the shipped configs; about half the size with cameras), robosuite env metadata
+  (`env_args` is a fixed stub, rollout is off), the test split (`mask/eval`, read by nothing), `robomimic_config.json` written at
+  Post-process (the Train launcher builds it) and the output-structure preview, `scripts/convert_dataset.py` (use `relay-d-convert`).
+  Every stream is now length-checked against the demo instead of being cut.
+- **Training:** the robomimic policy is chosen only on the Train tab / `--policy` (no "From the folder's config"); an older folder's saved
+  `robomimic_config.json` is still used when no policy is given.
+- **Review:** the LeRobot dataset viewer (LeRobot has its own); Review shows recorded demos.
+- **Inference:** `command:` entries that shelled out (`ros2 topic pub`, about 1.5 s per call), `dedupe`, the `scale` / `clip` /
+  `vacuum` / `magnetic` transforms (`threshold` gains `on_value` / `off_value`; `limits` clamps), `static` obs inputs (the recorder
+  never produced them, so no model was trained on them).
+- Settings `review_plot_max_points` and `postprocess_default_training_model`; unused entries in `LICENSE` / `THIRD_PARTY_LICENSES.md`
+  (xmltodict, scipy, jurigged, watchdog, cv_bridge; torch is listed as optional); the re-exports of `relay_d.training`.
+
+### Removed (normalization)
+- Relay-D's own min/max normalization: the converter, `ObsBuilder`, the dispatcher's `denormalize`, the Config builder's
+  "Normalize" checkbox with its limits table and URDF fill, and `numerics.normalize`. Every supported trainer (robomimic with the
+  shipped configs, LeRobot ACT / Diffusion / SmolVLA) already normalizes with the dataset's stats and un-normalizes at inference; the
+  second layer only added a way to get it wrong (`action_config.yaml` limits were never checked against the conversion limits, so a
+  normalized arm action could reach the robot as [-1, 1]). `limits` in `action_config.yaml` remains, as a clamp in real units, and
+  `scripts/extract_joint_limits.py` prints such blocks from a URDF.
+
+### Fixed (audit 3)
+- **Robot safety:** a non-finite action, or an error in `InferenceSession.step()`, now sends the configured `stop` (it went quiet and the last
+  command kept running). Command values are written as plain decimals (`0.00005`, not `5e-05`, which `ros2 topic pub` read as text). A command
+  entry with the wrong number of `limits` now stops startup, like topic entries. The exported `inference_script.py` uses the configs next to it,
+  not the ones in the current folder.
+- **Recording:** loading, saving or removing a config while recording is refused (it corrupted the demo); a demo whose file fails to close is
+  kept for the retry; `recording_frequency <= 0` is refused at Start, and a recording loop that dies is reported like a full buffer; `fill_default`
+  seeds no longer split a stream in two; cameras whose encoding has no `bgr8` conversion (`16UC1`, `32FC1`, `mono16`, ...) are recorded as decoded
+  instead of failing every frame; `AppAPI` honours an input's `tf_topic` / `tf_static_topic`. Stream specs (`sin(a - b)`, `zero:N`, `euler.*`,
+  `rot6d.*`) are parsed the same way when recording and at inference.
+- **Conversion:** a demo missing an action stream or a camera is skipped (it got all-zero actions or black frames); a config without
+  `actions_to_extract` fails (and the config check reports it) instead of writing zero actions; `modality: depth` is found through the output
+  key; a LeRobot episode that fails halfway aborts the dataset instead of leaving mis-indexed rows; the success message says how many demos were
+  skipped; robomimic image `next_obs` is written straight to the file (half the peak RAM).
+- Removed: the unused `scripts` (`xmltodict`) extra, `_stop_procs`, `fill_none_gaps`, `gripper_key_map`, and duplicate helpers (now
+  `numerics.stamp_to_sec` / `numerics.enriched_tf`, `review.demo_validator.first_demo`, `robomimic_config_handler.explicit_modalities`).
 
 ### Fixed (audit)
 - **Action dispatcher:** a `mapping` that does not fit its message (a wrong field name or index) now stops startup; before, the first tick sent the other entries (the arm) and skipped that one (the gripper). An output that is not finite

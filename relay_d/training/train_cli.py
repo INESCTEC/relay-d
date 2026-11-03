@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="relay-d-train", description="Start imitation-learning training on a dataset.")
     ap.add_argument("--folder", required=True, help="Post-process output folder, or the dataset itself")
     ap.add_argument("--format", choices=["auto", "robomimic", "lerobot"], default="auto")
-    ap.add_argument("--policy", help=f"robomimic: {launcher.ROBOMIMIC_POLICIES} (default: the folder's config); "
+    ap.add_argument("--policy", help=f"robomimic: {launcher.ROBOMIMIC_POLICIES} (default: the folder's saved robomimic_config.json, else {launcher.ROBOMIMIC_POLICIES[0]}); "
                                      f"lerobot: {launcher.LEROBOT_POLICIES} (default: act)")
     ap.add_argument("--python", help="interpreter with robomimic / lerobot installed (default: the python_<format> setting, else this one)")
     ap.add_argument("--epochs", type=int, help="robomimic: number of epochs")

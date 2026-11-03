@@ -33,11 +33,11 @@ def test_every_setting_has_an_editor_and_shows_its_value(page):
 def test_save_writes_the_file_emits_and_notes_restart_only_changes(page):
     seen = []
     config.settings_changed.connect(seen.append)
-    page.widgets["rec_default_frequency"][2](45)
+    page.widgets["rec_default_max_buffer_mb"][2](450)
     page.widgets["theme"][2]("dark")
     page.widgets["ros_domain_id"][2](7)
     assert page.save_settings_from_ui() is True
-    assert json.loads(page.path.read_text())["rec_default_frequency"] == 45
+    assert json.loads(page.path.read_text())["rec_default_max_buffer_mb"] == 450
     assert us.get("theme") == "dark" and config.get("theme") == "dark"
     assert seen and seen[-1]["theme"] == "dark"
     assert "Restart" in page.label_status.text() and "ROS domain" in page.label_status.text()
@@ -51,11 +51,11 @@ def test_live_only_changes_do_not_ask_for_a_restart(page):
 
 
 def test_reset_one_tab_only_resets_that_tab(page):
-    page.widgets["rec_default_frequency"][2](99)
+    page.widgets["rec_default_max_buffer_mb"][2](990)
     page.widgets["infer_hz"][2](33.0)
     page.save_settings_from_ui()
     page.reset_to_default("Recording")
-    assert us.get("rec_default_frequency") == 30 and us.get("infer_hz") == 33.0
+    assert us.get("rec_default_max_buffer_mb") == 4096 and us.get("infer_hz") == 33.0
     page.reset_to_default(None)
     assert us.get("infer_hz") == 10.0
 
@@ -73,16 +73,16 @@ def test_load_settings_shows_saved_values_and_notifies(page):
 def test_saving_unchanged_settings_keeps_the_file_free_of_defaults(page):
     page.save_settings_from_ui()
     assert not page.path.exists() or json.loads(page.path.read_text()) == {}
-    page.widgets["rec_default_frequency"][2](45)
+    page.widgets["rec_default_max_buffer_mb"][2](450)
     page.save_settings_from_ui()
-    assert json.loads(page.path.read_text()) == {"rec_default_frequency": 45}
+    assert json.loads(page.path.read_text()) == {"rec_default_max_buffer_mb": 450}
 
 
 def test_resetting_one_tab_neither_saves_nor_discards_edits_on_other_tabs(page):
-    page.widgets["rec_default_frequency"][2](60)  # an edit on the Recording tab, not saved yet
+    page.widgets["rec_default_max_buffer_mb"][2](600)  # an edit on the Recording tab, not saved yet
     page.widgets["infer_hz"][2](33.0)
     page.save_settings_from_ui(keys=["infer_hz"])
     page.reset_to_default("Inference")
     assert us.get("infer_hz") == 10.0
-    assert us.get("rec_default_frequency") == 30  # was saved by the old reset
-    assert page.widgets["rec_default_frequency"][1]() == 60  # and the edit is still on screen
+    assert us.get("rec_default_max_buffer_mb") == 4096  # was saved by the old reset
+    assert page.widgets["rec_default_max_buffer_mb"][1]() == 600  # and the edit is still on screen

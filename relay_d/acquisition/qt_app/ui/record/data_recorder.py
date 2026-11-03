@@ -6,7 +6,9 @@ import rclpy.time
 from rclpy.node import Node
 from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
-from ...utils.stream_builder import StreamBuilder, fill_none_gaps
+from ...utils.stream_builder import StreamBuilder
+from relay_d.utils.numerics import inputs_in_sync, stamp_to_sec
+from ..config.builder.config_check import RECORDING_CHANGING, removed_keys
 import time
 import json
 from threading import Lock, Thread
@@ -17,6 +19,18 @@ from .message_encoding import encode_message
 def _sample_nbytes(sample: dict) -> int:
     """RAM held by one recorded sample: every array in it (image `data`, point cloud `points`, ...)."""
     return sum(v.nbytes for v in sample.values() if isinstance(v, np.ndarray))
+
+
+def start_demo(recorder, topic_subscribers, containers, dataset_name, demo_name=None):
+    """The per-Start steps the GUI and AppAPI share: subscribe every input again (re-detects the message type and QoS,
+    resets custom TF buffers; a broken custom TF topic raises TfTopicSubscriptionError), then start the recorder (it
+    flushes the data from before Start and first retries an unsaved demo, see ``recorder.retried_file``).
+    Returns the demo name, or None if the recording did not start. An input that could not be subscribed only logs:
+    the recorder holds it empty until data arrives (as the GUI always did)."""
+    results = topic_subscribers.create_subscribers_for_containers(containers)
+    logger.info(f"Subscribers created: {sum(results.values())}/{len(results)}")
+    demo_name = demo_name or f"{dataset_name}_{time.time_ns() // 1_000_000}"  # ms: two Starts in one second must not clash ("w-")
+    return demo_name if recorder.start_recording(topic_subscribers, demo_name) else None
 
 
 def _write_stacked(group, name: str, frames: list):
@@ -46,18 +60,17 @@ class DataRecorder(Node):
         self.current_demo_number = 0
         self.retried_file = None  # path of the demo saved by the last retry_save()
 
-        self._apply_setting_defaults()  # the config file's values win (below, and again at each start_recording)
-
-        # Update from yaml_parser if available
-        if self.yaml_parser and self.yaml_parser.is_loaded():
-            config = self.yaml_parser.yaml_data.get("config", {})
-            self.recording_frequency = config.get("recording_frequency", self.recording_frequency)
+        self.recording_frequency = None  # read from the config at each start_recording
+        self.max_buffer_bytes = int(user_settings.get("rec_default_max_buffer_mb")) * 1024**2
+        self._sync_tolerance = None
+        self._sync_mode = "soft"
         # shortcut: samples live in RAM until Stop, so a crash loses the demo being recorded; upgrade to a journal or
         # chunked HDF5 writes if demos get long enough for that to hurt. Past this many bytes of frames the loop stops
         # sampling (Stop still saves what is buffered) instead of running the PC out of memory.
         self._buffered_bytes = 0
         self._unsaved = False  # a save failed and the samples are still only in memory
         self.buffer_full = False  # the loop stopped sampling because max_buffer_bytes was reached
+        self.loop_failed = False  # the loop stopped sampling because of repeated errors
 
         self.output_directory = None
         self.recorded_data_dir = None
@@ -69,8 +82,8 @@ class DataRecorder(Node):
 
         self._stream_builder = StreamBuilder(self.yaml_parser)
         self._fill_gaps_containers = set()
-        self._fill_defaults = {}
         self._fill_count_summary = {}
+        self._held_counts = defaultdict(int)  # per input: ticks recorded without a fresh sample
         self._modalities = {}
 
         self.topic_subscribers = None
@@ -80,59 +93,13 @@ class DataRecorder(Node):
         self.recording_sample_count = 0
 
         self.is_recording = False
-        self.is_paused = False
         self.recording_lock = Lock()
 
         self._clock = self.get_clock()
 
         logger.info("DataRecorder initialized")
 
-    def pause_recording(self):
-        try:
-            with self.recording_lock:
-                if not self.is_recording:
-                    logger.warning("No recording in progress to pause")
-                    return False
-
-                if self.is_paused:
-                    logger.warning("Recording is already paused")
-                    return False
-
-                self.is_paused = True
-                logger.info("Recording paused")
-                return True
-
-        except Exception as e:
-            logger.error(f"Failed to pause recording: {e}")
-            return False
-
-    def resume_recording(self):
-        try:
-            with self.recording_lock:
-                if not self.is_recording:
-                    logger.warning("No recording in progress to resume")
-                    return False
-
-                if not self.is_paused:
-                    logger.warning("Recording is not paused")
-                    return False
-
-                self.is_paused = False
-                logger.info("Recording resumed")
-                return True
-
-        except Exception as e:
-            logger.error(f"Failed to resume recording: {e}")
-            return False
-
-    def _apply_setting_defaults(self):
-        """The ``rec_default_*`` settings as they are now (a change in Settings applies to the next recording)."""
-        self.recording_frequency = user_settings.get("rec_default_frequency")
-        self.max_buffer_bytes = int(user_settings.get("rec_default_max_buffer_mb")) * 1024**2
-        self._sync_tolerance = user_settings.get("rec_default_sync_tolerance_sec") or None  # 0 = off
-        self._sync_mode = user_settings.get("rec_default_sync_mode")
-
-    def start_recording(self, topic_subscribers, demo_name=None, flush_stale_data=False):
+    def start_recording(self, topic_subscribers, demo_name=None):
         try:
             with self.recording_lock:
                 if self.is_recording:
@@ -150,7 +117,7 @@ class DataRecorder(Node):
                         return False
 
                 self.topic_subscribers = topic_subscribers
-                self._apply_setting_defaults()
+                self.recording_frequency = None  # only the loaded config sets it: no config, no recording
 
                 if demo_name is None:
                     demo_name = f"demo_{self.current_demo_number}"
@@ -173,23 +140,19 @@ class DataRecorder(Node):
                         logger.info(
                             f"Loaded metadata from config: {list(metadata_dict.keys())}"
                         )
-                    # Always re-read recording_frequency so it matches the loaded config,
-                    # not the stale value from __init__ (which ran before config was loaded).
                     config = self.yaml_parser.yaml_data.get("config", {})
-                    # YAML first, then the user setting (so a config without the key does not inherit the last one)
-                    self.recording_frequency = config.get(
-                        "recording_frequency", user_settings.get("rec_default_frequency")
-                    )
+                    blocking = [msg for key, msg in removed_keys(config) if key in RECORDING_CHANGING]
+                    if blocking:
+                        logger.error("Cannot start: " + " ".join(blocking))
+                        return False
+                    self.recording_frequency = config.get("recording_frequency")
                     self.max_buffer_bytes = int(
                         float(config.get("max_buffer_mb") or user_settings.get("rec_default_max_buffer_mb")) * 1024**2
                     )
                     self.recording_metadata["recording_frequency"] = self.recording_frequency
                     logger.info(f"Recording frequency: {self.recording_frequency} Hz")
-                    # 0 means off, in the YAML as in the setting
-                    self._sync_tolerance = config.get(
-                        "sync_tolerance_sec", user_settings.get("rec_default_sync_tolerance_sec")
-                    ) or None
-                    self._sync_mode = config.get("sync_mode", user_settings.get("rec_default_sync_mode"))
+                    self._sync_tolerance = config.get("sync_tolerance_sec") or None  # missing or 0 = off
+                    self._sync_mode = config.get("sync_mode", "soft")
                     self.recording_metadata["sync_tolerance_sec"] = self._sync_tolerance
                     if self._sync_tolerance is not None:
                         logger.info(
@@ -197,9 +160,15 @@ class DataRecorder(Node):
                             f"mode={self._sync_mode}"
                         )
 
+                if not self.recording_frequency or self.recording_frequency <= 0:
+                    logger.error(f"Cannot start: recording_frequency must be > 0 Hz, got {self.recording_frequency!r}")
+                    return False
+
                 self.recorded_data.clear()
+                self._held_counts.clear()
                 self._buffered_bytes = 0
                 self.buffer_full = False
+                self.loop_failed = False
                 self.timestamps.clear()
                 self.timestamp_spreads = []
                 self._last_valid_raw = {}
@@ -209,37 +178,24 @@ class DataRecorder(Node):
                 if self._fill_gaps_containers:
                     logger.info(f"Gap-fill (hold) enabled for: {sorted(self._fill_gaps_containers)}")
 
-                if flush_stale_data:
-                    self.topic_subscribers.flush_latest_data()
-                    logger.info("Flushed stale data before recording start")
+                self.topic_subscribers.flush_latest_data()  # samples from before Start are not part of the demo
+                logger.info("Flushed stale data before recording start")
 
                 self._create_h5_file(demo_name)
 
-                return self._start_standard_recording(demo_name)
+                self.is_recording = True
+                self.stop_recording_flag = False
+                self.recording_thread = Thread(
+                    target=self._standard_recording_loop,
+                    args=(self.topic_subscribers,),
+                    daemon=True,
+                )
+                self.recording_thread.start()
+                logger.info(f"Started recording session: {demo_name}")
+                return True
 
         except Exception as e:
             logger.error(f"Failed to start recording: {e}")
-            return False
-
-    def _start_standard_recording(self, demo_name):
-        try:
-            logger.info("Starting standard (non-synchronized) recording")
-
-            self.is_recording = True
-            self.stop_recording_flag = False
-
-            self.recording_thread = Thread(
-                target=self._standard_recording_loop,
-                args=(self.topic_subscribers,),
-                daemon=True,
-            )
-            self.recording_thread.start()
-
-            logger.info(f"Started standard recording session: {demo_name}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Failed to start standard recording: {e}")
             return False
 
     def _standard_recording_loop(self, topic_subscribers):
@@ -273,24 +229,6 @@ class DataRecorder(Node):
             else:
                 logger.info("Warmup complete — all inputs have initial data")
 
-            # Seed hold defaults for inputs with fill_gaps: true and a fill_default
-            # value configured. Without seeding, leading Nones accumulate until the
-            # first message arrives (which defeats gap-fill for the leading period).
-            for _cid in list(topic_subscribers.subscribers.keys()):
-                if _cid in self._fill_gaps_containers and _cid not in self._last_valid_raw:
-                    _default = self._fill_defaults.get(_cid)
-                    if _default is None:
-                        continue  # no default configured — skip seeding
-                    _status = (topic_subscribers.subscriber_status or {}).get(_cid, {})
-                    _topic = _status.get("topic", "")
-                    _cls = topic_subscribers.message_type_cache.get(_topic) if _topic else None
-                    if _cls is not None:
-                        _type_name = _cls.__name__.lower()
-                        self._last_valid_raw[_cid] = {"type": _type_name, "data": _default}
-                        logger.info(
-                            f"Seeded hold default ({_default!r}) for '{_cid}' ({_type_name})"
-                        )
-
             self.recording_sample_count = 0
 
             interval = 1.0 / self.recording_frequency
@@ -301,22 +239,8 @@ class DataRecorder(Node):
             consecutive_errors = 0
             while not self.stop_recording_flag:
                 try:
-                    if self.is_paused:
-                        time.sleep(0.01)
-                        next_tick = time.monotonic()  # don't try to catch up after a pause
-                        continue
-
-                    # Flush any TF messages queued in DDS since the last external
-                    # spin. Non-blocking: skip if the Qt timer or API spin thread
-                    # already holds the lock.
-                    if topic_subscribers._spin_lock.acquire(blocking=False):
-                        try:
-                            rclpy.spin_once(topic_subscribers, timeout_sec=0.0)
-                        except Exception:
-                            pass
-                        finally:
-                            topic_subscribers._spin_lock.release()
-
+                    # No spin_once here: TopicSubscribers' own spin thread drains the callbacks, and spinning the
+                    # node on the global executor would take it out of that thread's executor.
                     # Refresh all TF transforms before snapshotting data so that
                     # every input (topics and TF alike) reflects the same moment.
                     topic_subscribers.update_tf_lookups()
@@ -358,8 +282,7 @@ class DataRecorder(Node):
                     for tf_cid in topic_subscribers.tf_lookup_containers:
                         tf_val = all_data.get(tf_cid)
                         if tf_val is not None and hasattr(tf_val, "header"):
-                            s = tf_val.header.stamp
-                            snap_timestamps[tf_cid] = s.sec + s.nanosec * 1e-9
+                            snap_timestamps[tf_cid] = stamp_to_sec(tf_val.header.stamp)
 
                     # Timestamp sync check — compares ROS message timestamps across
                     # all inputs that are not fill_gaps. Soft mode logs a warning;
@@ -374,7 +297,7 @@ class DataRecorder(Node):
                         if len(sync_cids) >= 2:
                             ts_vals = [snap_timestamps[cid] for cid in sync_cids]
                             spread = max(ts_vals) - min(ts_vals)
-                            if spread > self._sync_tolerance:
+                            if not inputs_in_sync(sync_cids, snap_timestamps, self._sync_tolerance):
                                 ref_ts = max(ts_vals)
                                 sorted_cids = sorted(
                                     sync_cids, key=lambda c: snap_timestamps[c], reverse=True
@@ -425,6 +348,8 @@ class DataRecorder(Node):
                             self._last_valid_raw[container_id] = processed_data
                             self._buffered_bytes += _sample_nbytes(processed_data)
                             data_processed += 1
+                        else:
+                            self._held_counts[container_id] += 1  # held (or None until the first sample)
                         self.recorded_data[container_id].append(
                             processed_data or self._last_valid_raw.get(container_id)
                         )
@@ -464,6 +389,7 @@ class DataRecorder(Node):
                     consecutive_errors += 1
                     if consecutive_errors >= 50:
                         logger.error("Recording loop failed 50 times in a row; sampling stopped.")
+                        self.loop_failed = True
                         break
                     time.sleep(interval)
 
@@ -475,6 +401,7 @@ class DataRecorder(Node):
             )
 
         except Exception as e:
+            self.loop_failed = True
             logger.error(f"Fatal error in standard recording loop: {e}")
 
     def stop_recording(self):
@@ -491,7 +418,6 @@ class DataRecorder(Node):
 
                 self.stop_recording_flag = True
                 self.is_recording = False
-                self.is_paused = False
 
                 if self.recording_thread and self.recording_thread.is_alive():
                     # The loop checks the stop flag every tick; wait long enough that it is really done
@@ -514,6 +440,7 @@ class DataRecorder(Node):
                 )
                 self.recording_metadata["total_samples"] = len(self.timestamps)
 
+                self._unsaved = True  # until the file is saved AND closed: a failed close must not lose the demo at the next Start
                 saved = self._save_recorded_data()
 
                 if self._fill_count_summary:
@@ -528,13 +455,15 @@ class DataRecorder(Node):
                     )
 
                 if self.h5_file:
-                    self.h5_file.close()
-                    self.h5_file = None
+                    try:
+                        self.h5_file.close()
+                    finally:
+                        self.h5_file = None
 
                 if not saved:
-                    self._unsaved = True
                     logger.error(f"Recording NOT saved to {self.h5_file_path}; data is still in memory")
                     return False
+                self._unsaved = False
 
                 logger.info(
                     f"Recording stopped. Saved {len(self.timestamps)} samples in {self.h5_file_path}"
@@ -555,12 +484,16 @@ class DataRecorder(Node):
         try:
             self._create_h5_file(self.recording_metadata["demo_name"], mode="w")  # replaces its own partial file
             saved = self._save_recorded_data()
+            self.h5_file.close()  # saved only once closed
         except Exception as e:
             logger.error(f"Retry save failed: {e}")
             saved = False
-        if self.h5_file:
-            self.h5_file.close()
-            self.h5_file = None
+            try:
+                if self.h5_file:
+                    self.h5_file.close()
+            except Exception:
+                pass
+        self.h5_file = None
         if saved:
             self._unsaved = False
             self.retried_file = self.h5_file_path  # the caller adds it to its session list
@@ -608,21 +541,6 @@ class DataRecorder(Node):
             logger.error(f"Error processing {type(msg).__name__} for recording ({container_id}): {e}")
             return None
 
-    def _build_output_map_lookup(self) -> dict:
-        """
-        Build container_id -> output_map lookup from the yaml config input section.
-        If output_map is not set for a container, falls back to the container_id itself.
-        """
-        lookup = {}
-        if self.yaml_parser and self.yaml_parser.is_loaded():
-            input_section = (
-                self.yaml_parser.yaml_data.get("config", {}).get("input", {})
-            )
-            for container_id, spec in input_section.items():
-                output_map = spec.get("output_map")
-                lookup[container_id] = output_map if output_map else container_id
-        return lookup
-
     def _build_modality_lookup(self) -> dict:
         """
         Build container_id -> "rgb"|"depth"|"scan" from the yaml config input
@@ -638,19 +556,13 @@ class DataRecorder(Node):
         return lookup
 
     def _build_fill_gaps_set(self) -> set:
-        """Return the set of container IDs that have fill_gaps: true in the config.
-        Also populates self._fill_defaults with any configured fill_default values.
-        """
+        """Return the set of container IDs that have fill_gaps: true in the config."""
         fill_set = set()
-        self._fill_defaults = {}
         if self.yaml_parser and self.yaml_parser.is_loaded():
             input_section = self.yaml_parser.yaml_data.get("config", {}).get("input", {})
             for container_id, spec in input_section.items():
                 if isinstance(spec, dict) and spec.get("fill_gaps", False):
                     fill_set.add(container_id)
-                    default_val = spec.get("fill_default", None)
-                    if default_val is not None:
-                        self._fill_defaults[container_id] = default_val
         return fill_set
 
     def _save_recorded_data(self):
@@ -662,7 +574,6 @@ class DataRecorder(Node):
             demo_name = self.recording_metadata["demo_name"]
             demo_group = self.h5_file.create_group(f"data/{demo_name}")
 
-            output_map_lookup = self._build_output_map_lookup()
             self._fill_count_summary = {}
 
             if self.timestamps:
@@ -687,27 +598,20 @@ class DataRecorder(Node):
                 if not data_list:
                     continue
 
-                non_null_raw = sum(1 for d in data_list if d is not None)
-
-                if container_id in self._fill_gaps_containers:
-                    filled_list = fill_none_gaps(data_list)
-                    fill_count = sum(
-                        1 for a, b in zip(data_list, filled_list)
-                        if a is None and b is not None
-                    )
-                    if fill_count > 0:
-                        self._fill_count_summary[container_id] = fill_count
-                else:
-                    filled_list = data_list
-                    fill_count = 0
+                # The loop already held the last sample over gaps; held ticks are not real samples.
+                fill_count = self._held_counts.get(container_id, 0)
+                non_null_raw = len(data_list) - fill_count
+                if fill_count > 0 and container_id in self._fill_gaps_containers:
+                    self._fill_count_summary[container_id] = fill_count
 
                 # Samples taken before the first message arrived are None. Dropping them would
                 # leave this container shorter than `timestamps` and shift it against the rest.
-                first_valid = next((d for d in filled_list if d is not None), None)
+                first_valid = next((d for d in data_list if d is not None), None)
                 if first_valid is None:
                     logger.error(f"{container_id}: no data received during the whole recording")
+                    filled_list = data_list
                 else:
-                    filled_list = [first_valid if d is None else d for d in filled_list]
+                    filled_list = [first_valid if d is None else d for d in data_list]
 
                 fill_suffix = f", {fill_count} gap-filled by hold" if fill_count > 0 else ""
                 logger.info(
@@ -715,11 +619,7 @@ class DataRecorder(Node):
                     f"({non_null_raw} real{fill_suffix})"
                 )
 
-                # Use output_map name so the raw HDF5 matches what data_config.yaml expects
-                group_name = output_map_lookup.get(container_id, container_id)
-                if group_name != container_id:
-                    logger.info(f"Saving '{container_id}' as '{group_name}' (output_map)")
-                container_group = demo_group.create_group(group_name)
+                container_group = demo_group.create_group(container_id)
 
                 data_by_type = defaultdict(list)
                 for data_item in filled_list:

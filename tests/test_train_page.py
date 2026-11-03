@@ -12,7 +12,7 @@ pytest.importorskip("PyQt5")
 from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from relay_d.acquisition.qt_app.ui.train import train_page as tp  # noqa: E402
-from relay_d.training import runs  # noqa: E402
+from relay_d.training import launcher, runs  # noqa: E402
 
 
 def _settle(page, seconds=10):
@@ -48,7 +48,7 @@ def page(qapp, tmp_path, monkeypatch):
 
 def test_loading_a_folder_fills_policy_and_parameters(page):
     page.load_folder(str(page.folder_path))
-    assert page.combo_policy.itemText(0) == tp._FROM_FOLDER
+    assert [page.combo_policy.itemText(i) for i in range(page.combo_policy.count())] == launcher.ROBOMIMIC_POLICIES
     assert {"epochs", "batch_size", "learning_rate", "device"} <= set(page._param_widgets)
     assert page.btn_start.isEnabled() and "1 episodes" in page.label_summary.text()
     page.combo_policy.setCurrentText("diffusion_policy")  # another template: the form is rebuilt

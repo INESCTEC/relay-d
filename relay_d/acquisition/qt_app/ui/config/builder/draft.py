@@ -2,7 +2,7 @@
 
 ``ConfigDraft`` holds what the Config builder edits and writes the same ``{"config": {...}}`` dict a hand-written
 ``acquisition_config.yaml`` has. ``from_config`` reads such a dict back, so an existing file can be edited in the builder;
-keys the builder does not know (``metadata``, ``prefix_path``, ...) are kept and written back unchanged.
+keys the builder does not know (``metadata``, ...) are kept and written back unchanged.
 """
 
 from __future__ import annotations
@@ -20,10 +20,9 @@ _PREFIXES = {
 }
 _KNOWN_TOP = ("dataset_name", "recording_frequency", "max_buffer_mb", "sync_tolerance_sec", "sync_mode",
               "input", "output", "actions_to_extract", "delta_actions")
-_KNOWN_TOPIC_INPUT = ("topic", "output_map", "modality", "joint_names", "fill_gaps", "fill_default", "transfer_rate")
-_KNOWN_TF_INPUT = ("parent_frame", "child_frame", "tf_topic", "tf_static_topic", "tf_wait_timeout",
-                   "output_map", "fill_gaps", "fill_default", "transfer_rate")
-_STREAM_DICT_KEYS = ("specs", "normalize", "normalized_range", "limits", "rotation_format")
+_KNOWN_TOPIC_INPUT = ("topic", "modality", "joint_names", "fill_gaps")
+_KNOWN_TF_INPUT = ("parent_frame", "child_frame", "tf_topic", "tf_static_topic", "tf_wait_timeout", "fill_gaps")
+_STREAM_DICT_KEYS = ("specs", "rotation_format")  # anything else (e.g. the removed normalize keys) goes to extra
 
 
 @dataclass
@@ -32,23 +31,15 @@ class InputDraft:
     kind: str = "topic"  # "topic" | "tf"
     topic: str = ""
     msg_type: str = ""  # only to remember what the live graph said; not written to the file
-    output_map: str = ""  # "" = the input name
     modality: str = ""  # "" = not written (rgb is the default); "depth" | "scan"
     joint_names: List[str] = field(default_factory=list)
     fill_gaps: bool = False
-    fill_default: Any = None
-    transfer_rate: Optional[float] = None
     parent_frame: str = ""
     child_frame: str = ""
     tf_topic: str = ""  # "" = /tf
     tf_static_topic: str = ""  # "" = /tf_static
     tf_wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def group(self) -> str:
-        """Name of the HDF5 group this input is recorded into."""
-        return self.output_map or self.name
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -65,14 +56,8 @@ class InputDraft:
                 out["modality"] = self.modality
             if self.joint_names:
                 out["joint_names"] = list(self.joint_names)
-        if self.output_map:
-            out["output_map"] = self.output_map
-        if self.transfer_rate is not None:
-            out["transfer_rate"] = self.transfer_rate
         if self.fill_gaps:
             out["fill_gaps"] = True
-            if self.fill_default is not None:
-                out["fill_default"] = self.fill_default
         out.update(self.extra)
         return out
 
@@ -82,9 +67,8 @@ class InputDraft:
         known = _KNOWN_TF_INPUT if is_tf else _KNOWN_TOPIC_INPUT
         return cls(
             name=name, kind="tf" if is_tf else "topic", topic=raw.get("topic", ""),
-            output_map=raw.get("output_map", ""), modality=raw.get("modality", ""),
+            modality=raw.get("modality", ""),
             joint_names=list(raw.get("joint_names") or []), fill_gaps=bool(raw.get("fill_gaps", False)),
-            fill_default=raw.get("fill_default"), transfer_rate=raw.get("transfer_rate"),
             parent_frame=raw.get("parent_frame", ""), child_frame=raw.get("child_frame", ""),
             tf_topic=raw.get("tf_topic", ""), tf_static_topic=raw.get("tf_static_topic", ""),
             tf_wait_timeout=raw.get("tf_wait_timeout"),
@@ -98,21 +82,14 @@ class StreamDraft:
 
     name: str
     specs: List[str] = field(default_factory=list)
-    normalize: bool = False
-    normalized_range: List[float] = field(default_factory=lambda: [-1.0, 1.0])
-    limits: List[Dict[str, float]] = field(default_factory=list)
     rotation_format: str = "quat"  # "rpy": 4 quaternion specs become roll, pitch, yaw
     explicit_dict: bool = False  # written as a dict even if nothing needs it (keeps a loaded file's shape)
     extra: Dict[str, Any] = field(default_factory=dict)
 
     def to_value(self) -> Any:
-        if not (self.normalize or self.rotation_format != "quat" or self.explicit_dict or self.extra):
+        if not (self.rotation_format != "quat" or self.explicit_dict or self.extra):
             return list(self.specs)
         out: Dict[str, Any] = {"specs": list(self.specs)}
-        if self.normalize:
-            out["normalize"] = True
-            out["normalized_range"] = list(self.normalized_range)
-            out["limits"] = [dict(lim) for lim in self.limits]
         if self.rotation_format != "quat":
             out["rotation_format"] = self.rotation_format
         out.update(self.extra)
@@ -123,9 +100,7 @@ class StreamDraft:
         if not isinstance(value, dict):
             return cls(name=name, specs=[str(s) for s in (value or [])])
         return cls(
-            name=name, specs=[str(s) for s in value.get("specs", [])], normalize=bool(value.get("normalize", False)),
-            normalized_range=list(value.get("normalized_range", [-1.0, 1.0])),
-            limits=[dict(lim) for lim in (value.get("limits") or []) if isinstance(lim, dict)],
+            name=name, specs=[str(s) for s in value.get("specs", [])],
             rotation_format=str(value.get("rotation_format", "quat")), explicit_dict=True,
             extra={k: v for k, v in value.items() if k not in _STREAM_DICT_KEYS},
         )
@@ -144,7 +119,6 @@ class ConfigDraft:
     actions: List[str] = field(default_factory=list)  # actions_to_extract: stream names, in order
     delta_actions: List[str] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)  # unknown keys of `config`
-    output_extra: Dict[str, Any] = field(default_factory=dict)  # unknown keys of `config.output` (e.g. prefix_path)
     raw_bridges: Dict[str, Any] = field(default_factory=dict)  # bridge entries that point at no known input: kept as they were
 
     # ------------------------------------------------------------------ editing helpers
@@ -186,11 +160,9 @@ class ConfigDraft:
         config["input"] = {name: inp.to_dict() for name, inp in self.inputs.items()}
         output: Dict[str, Any] = dict(self.raw_bridges)
         for key, (inp_name, dataset) in self.cameras.items():
-            inp = self.inputs.get(inp_name)
-            output[key] = f"{inp.group if inp else inp_name}/{dataset}"
+            output[key] = f"{inp_name}/{dataset}"
         if self.streams:
             output["streams"] = {name: s.to_value() for name, s in self.streams.items()}
-        output.update(self.output_extra)
         config["output"] = output
         if self.actions:
             config["actions_to_extract"] = list(self.actions)
@@ -218,15 +190,12 @@ class ConfigDraft:
         for name, raw in (config.get("input") or {}).items():
             if isinstance(raw, dict):
                 draft.inputs[name] = InputDraft.from_dict(name, raw)
-        by_group = {inp.group: inp.name for inp in draft.inputs.values()}
         for key, value in (config.get("output") or {}).items():
             if key == "streams":
                 draft.streams = {n: StreamDraft.from_value(n, v) for n, v in (value or {}).items()}
-            elif isinstance(value, str) and "/" in value and value.split("/", 1)[0] in by_group \
+            elif isinstance(value, str) and "/" in value and value.split("/", 1)[0] in draft.inputs \
                     and value.split("/", 1)[1] in ("images", "points"):
-                draft.cameras[key] = (by_group[value.split("/", 1)[0]], value.split("/", 1)[1])
-            elif key == "prefix_path":
-                draft.output_extra[key] = value
+                draft.cameras[key] = tuple(value.split("/", 1))
             else:
                 draft.raw_bridges[key] = value
         return draft

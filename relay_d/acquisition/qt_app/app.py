@@ -44,9 +44,10 @@ try:
     from .ui.settings.settings_page import SettingsPage
     from .ui.review.review_page import ReviewPage
     from .ui.train.train_page import TrainPage
+    from .ui.run.run_page import RunPage
 except ImportError as e:
     logger.error(f"Failed to import one or more UI pages: {e}")
-    ConfigPage = RecordPage = PostProcessPage = SettingsPage = ReviewPage = TrainPage = None
+    ConfigPage = RecordPage = PostProcessPage = SettingsPage = ReviewPage = TrainPage = RunPage = None
 
 
 class UI(QMainWindow):
@@ -76,6 +77,7 @@ class UI(QMainWindow):
             "btn_settings",
             "btn_review",
             "btn_train",
+            "btn_run",
         ])
 
         # After setup_menu_buttons(self, menu_buttons)
@@ -138,6 +140,8 @@ class UI(QMainWindow):
                 self.page_train_ui = TrainPage(
                     self, settings_page=getattr(self, "page_settings_ui", None)
                 )
+            if RunPage is not None:
+                self.page_run_ui = RunPage(self)
             if hasattr(self, "page_record") and hasattr(self, "page_config"):
                 self.page_record.connect_to_config_signals(
                     self.page_config.signal_manager
@@ -195,12 +199,7 @@ class UI(QMainWindow):
         """Spin all ROS nodes to process callbacks"""
         for node in self.ros_nodes:
             try:
-                lock = getattr(node, "_spin_lock", None)
-                if lock is not None:
-                    with lock:
-                        rclpy.spin_once(node, timeout_sec=0)
-                else:
-                    rclpy.spin_once(node, timeout_sec=0)
+                rclpy.spin_once(node, timeout_sec=0)
             except Exception as e:
                 logger.debug(f"Error spinning ROS node: {e}")
 
@@ -224,6 +223,7 @@ class UI(QMainWindow):
             "btn_help": self.page_help,
             "btn_review": self.page_review,
             "btn_train": self.page_train,
+            "btn_run": self.page_run,
         }
         if btn_name in page_mapping:
             try:
@@ -321,6 +321,9 @@ class UI(QMainWindow):
             event.ignore()
             return
         try:
+            if getattr(self, "page_run_ui", None) is not None:  # a policy driving the robot stops first
+                self.page_run_ui.shutdown()
+
             if hasattr(self, "page_record") and self.page_record is not None:
                 # Stop TF update timerexit_code
                 if hasattr(self.page_record, "tf_update_timer"):

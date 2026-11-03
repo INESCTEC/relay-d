@@ -1,4 +1,4 @@
-"""RecordingController (start/pause/resume/stop + buttons) and ContainerManager's non-blocking wait.
+"""RecordingController (start/stop + buttons) and ContainerManager's non-blocking wait.
 
 Qt runs offscreen; the ROS-facing objects are mocks. Skipped when PyQt5 is not installed.
 """
@@ -36,7 +36,6 @@ from relay_d.utils.tf_topic import TfTopicSubscriptionError  # noqa: E402
 def env(qapp, monkeypatch):
     ui = SimpleNamespace(
         btn_start_record=QPushButton("Start"),
-        btn_pause_record=QPushButton("Pause"),
         btn_stop_record=QPushButton("Stop"),
     )
     yaml_parser = MagicMock()
@@ -44,8 +43,6 @@ def env(qapp, monkeypatch):
     yaml_parser.get_dataset_name.return_value = "my_demo"
     recorder = MagicMock()
     recorder.start_recording.return_value = True
-    recorder.pause_recording.return_value = True
-    recorder.resume_recording.return_value = True
     recorder.stop_recording.return_value = True
     recorder.h5_file_path = "/data/my_demo_1.h5"
     recorder.retried_file = None
@@ -78,46 +75,32 @@ def _run_now(parent, work, on_done, busy=None):
 def _states(ui):
     return (
         ui.btn_start_record.isEnabled(),
-        ui.btn_pause_record.isEnabled(), ui.btn_pause_record.text(),
         ui.btn_stop_record.isEnabled(),
     )
 
 
 def test_initial_and_config_loaded_button_states(env):
-    assert _states(env.ui) == (False, False, "Pause", False)
+    assert _states(env.ui) == (False, False)
     env.ctrl.set_config_loaded(True)
-    assert _states(env.ui) == (True, False, "Pause", False)
+    assert _states(env.ui) == (True, False)
     env.ctrl.set_config_loaded(False)
-    assert _states(env.ui) == (False, False, "Pause", False)
+    assert _states(env.ui) == (False, False)
 
 
 def test_full_cycle_through_button_clicks(env):
     env.ctrl.set_config_loaded(True)
     env.ui.btn_start_record.click()
-    assert env.ctrl.is_recording and not env.ctrl.is_paused
+    assert env.ctrl.is_recording
     assert env.recorder.start_recording.call_args[0][1].startswith("my_demo_")
-    assert _states(env.ui) == (False, True, "Pause", True)
+    assert _states(env.ui) == (False, True)
 
-    env.ui.btn_pause_record.click()
-    assert env.ctrl.is_paused and env.ctrl.is_recording
-    env.recorder.pause_recording.assert_called_once()
-    env.manager.set_status_for_all.assert_called_with("Paused")
-    assert _states(env.ui) == (False, True, "Resume", True)
-
-    env.ui.btn_pause_record.click()  # same slot, now resumes
-    assert not env.ctrl.is_paused
-    env.recorder.resume_recording.assert_called_once()
-    env.recorder.pause_recording.assert_called_once()  # not called a second time
-    assert _states(env.ui) == (False, True, "Pause", True)
-
-    env.ui.btn_pause_record.click()
-    env.ui.btn_stop_record.click()  # stop while paused resets the label
-    assert not env.ctrl.is_recording and not env.ctrl.is_paused
+    env.ui.btn_stop_record.click()
+    assert not env.ctrl.is_recording
     env.recorder.stop_recording.assert_called_once()
     env.subscribers.clear_all_subscribers.assert_called_once()
     env.validator.validate.assert_called_once_with("/data/my_demo_1.h5")
     assert env.ctrl.session_h5_files == ["/data/my_demo_1.h5"]
-    assert _states(env.ui) == (True, False, "Pause", False)
+    assert _states(env.ui) == (True, False)
 
     env.ui.btn_start_record.click()  # a second take works
     assert env.ctrl.is_recording
@@ -126,7 +109,6 @@ def test_full_cycle_through_button_clicks(env):
 
 def test_guards(env):
     assert env.ctrl.stop_recording() is False  # nothing to stop
-    assert env.ctrl.pause_recording() is False
     env.yaml_parser.is_loaded.return_value = False
     assert env.ctrl.start_recording() is False
     env.recorder.start_recording.assert_not_called()
@@ -183,12 +165,12 @@ def test_save_runs_in_the_background_with_the_buttons_locked(env, monkeypatch):
     env.ctrl.set_config_loaded(True)
     env.ctrl.start_recording()
     assert env.ctrl.stop_recording() is True
-    assert _states(env.ui) == (False, False, "Pause", False)  # nothing to click while the demo is written
+    assert _states(env.ui) == (False, False)  # nothing to click while the demo is written
     assert env.ctrl.stop_recording() is False  # a second Stop does not start a second save
     work, on_done = pending.pop()
     on_done(work(), None)  # the thread finished
     assert not env.ctrl.is_recording and env.ctrl.session_h5_files == ["/data/my_demo_1.h5"]
-    assert _states(env.ui) == (True, False, "Pause", False)
+    assert _states(env.ui) == (True, False)
 
 
 def test_a_crash_in_the_save_thread_is_a_failed_stop(env):
@@ -229,3 +211,14 @@ def test_demo_saved_by_a_retry_at_start_joins_the_session(env):
     env.ui.btn_start_record.click()
     env.ui.btn_stop_record.click()
     assert env.ctrl.session_h5_files == ["/data/my_demo_0.h5", "/data/my_demo_1.h5"]
+
+
+def test_a_failed_recording_loop_is_reported_like_a_full_buffer(env):
+    env.recorder.buffer_full, env.recorder.loop_failed = False, False
+    env.ctrl._check_buffer_full()
+    env.box.error.assert_not_called()
+    env.recorder.loop_failed = True  # the sampling thread gave up after repeated errors
+    env.ctrl._buffer_timer.start()
+    env.ctrl._check_buffer_full()
+    assert "Press Stop" in env.box.error.call_args.args[0]
+    assert not env.ctrl._buffer_timer.isActive()  # told once

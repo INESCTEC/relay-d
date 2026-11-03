@@ -9,9 +9,6 @@ from relay_d.acquisition.qt_app.ui.config.builder import builder_page as bp  # n
 from relay_d.acquisition.qt_app.ui.postprocess.offline_config import load_offline_config  # noqa: E402
 from test_ros_catalog import MESSAGES, _Buffer, _Node  # noqa: E402
 
-URDF = '<robot name="r"><joint name="j1" type="revolute"><limit lower="-1" upper="1" velocity="2" effort="3"/></joint>' \
-       '<joint name="j2" type="revolute"><limit lower="-2" upper="2" velocity="2" effort="3"/></joint></robot>'
-
 
 @pytest.fixture
 def page(qapp, monkeypatch):
@@ -44,10 +41,6 @@ def test_build_save_and_load_like_a_handwritten_config(page, tmp_path, monkeypat
     _tick(page, "position")
     assert page._specs() == ["joint_1.position[:]"]
     page.edit_stream_name.setText("robot_joint_pos")
-    page.check_normalize.setChecked(True)
-    assert page.table_limits.rowCount() == 2  # one row per joint
-    page._fill_limits(URDF)  # what "Fill limits from URDF" does with the file's text
-    assert page._limits() == [{"lower_lim": -1.0, "upper_lim": 1.0}, {"lower_lim": -2.0, "upper_lim": 2.0}]
     page.add_stream()
 
     page.combo_obs_input.setCurrentText("tf_eef")

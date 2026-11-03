@@ -6,6 +6,16 @@ driven entirely by action_config.yaml.
 
   action: false (or omitted) -> node.create_publisher  -> publish()
   action: true               -> ActionClient           -> send_goal_async()
+
+The model already outputs real units (robomimic/LeRobot un-normalize with the
+checkpoint's stats). An entry's `limits` only clamps each value to
+[lower_lim, upper_lim] before its transform; there is no de-normalization.
+
+dry_run=True: no publisher or action client is created; every message and goal
+is still built and checked, then logged ("[DRY RUN] ...") instead of sent.
+
+send_stop() (inference stops) publishes each topic entry's `stop:` values and
+cancels every goal it sent that is still active.
 """
 
 import re
@@ -13,9 +23,8 @@ import threading
 import time
 
 import numpy as np
-import subprocess
-import shlex
 
+from action_msgs.msg import GoalStatus
 from rclpy.node import Node
 from rclpy.action import ActionClient
 from typing import Dict, Any
@@ -23,6 +32,20 @@ from typing import Dict, Any
 from rosidl_runtime_py.utilities import get_message
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils.config_loader import load_yaml_config
+
+_GOAL_DONE = (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_ABORTED)
+
+# Removed config: an old action_config that still has one fails at startup instead of being ignored.
+_REMOVED_KEYS = {
+    "command": "shell commands are no longer run; use a topic entry (topic + msg_type + mapping) or an action entry (action: true)",
+    "dedupe": "topic entries publish every tick; delete the key",
+}
+_REMOVED_TRANSFORMS = {
+    "scale": "use limits for clamping, or record the action in the units the robot takes",
+    "clip": "use limits for clamping",
+    "vacuum": "use a threshold transform with on_value / off_value and a topic or action entry",
+    "magnetic": "use a threshold transform with on_value / off_value and a topic or action entry",
+}
 
 def get_action(action_type_str: str):
     """
@@ -176,8 +199,11 @@ def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node) -> bool
 
 class ActionDispatcher:
 
-    def __init__(self, node: Node, action_config_path: str):
+    def __init__(self, node: Node, action_config_path: str, dry_run: bool = False):
         self._node = node
+        self._dry_run = dry_run
+        if dry_run:
+            logger.warning("[ActionDispatcher] DRY RUN: nothing is published or sent to the robot, commands are only logged.")
 
         config = load_yaml_config(action_config_path)
 
@@ -187,25 +213,29 @@ class ActionDispatcher:
         self._goal_classes: Dict[str, Any] = {}
         self._msg_classes: Dict[str, Any] = {}
         self._last_sent: Dict[str, str] = {}
-        self._procs: Dict[str, subprocess.Popen] = {}
-        self._stop_procs: list = []  # stop commands: close() must not terminate them
         self._stopped = True  # nothing commanded yet, so there is nothing to stop (see send_stop)
+        self._goals = []  # (name, accepted goal handle; None in a dry run) since the last stop: send_stop cancels them
+        self._goals_lock = threading.Lock()  # goals are accepted on the executor thread
 
         # feedback: -- opt-in ack-wait for topic entries (see _wait_for_ack)
         self._ack_latest: Dict[str, Any] = {}
         self._ack_events: Dict[str, threading.Event] = {}
 
         for name, cfg in self._action_configs.items():
-            self._check_transform(name, cfg.get("transform"))
-            is_action = cfg.get("action", False)
-            is_command = "command" in cfg
-
-            if is_command:
-                logger.info(
-                    f"[ActionDispatcher] '{name}' -> COMMAND '{cfg['command'][:50]}...'"
-                )
-
-            elif is_action:
+            for key, why in _REMOVED_KEYS.items():
+                if key in cfg:
+                    raise ValueError(f"[ActionDispatcher] '{name}': '{key}' was removed: {why}.")
+            removed = (cfg.get("transform") or {}).get("type")
+            if removed in _REMOVED_TRANSFORMS:
+                raise ValueError(f"[ActionDispatcher] '{name}': transform '{removed}' was removed: "
+                                 f"{_REMOVED_TRANSFORMS[removed]}.")
+            if cfg.get("denormalize") or cfg.get("apply_limits") or "normalized_range" in cfg:
+                raise ValueError(f"[ActionDispatcher] '{name}': the model already outputs real units; remove "
+                                 f"denormalize / normalized_range (limits now only clamp).")
+            if "limits" in cfg and len(cfg["limits"]) not in (1, len(cfg["indices"])):
+                raise ValueError(f"[ActionDispatcher] '{name}': 'limits' needs 1 entry or one per index "
+                                 f"({len(cfg['indices'])}), got {len(cfg['limits'])}.")
+            if cfg.get("action", False):
                 if "action_type" not in cfg:
                     raise ValueError(
                         f"[ActionDispatcher] '{name}' has action: true "
@@ -221,9 +251,10 @@ class ActionDispatcher:
                 action_class = get_action(cfg["action_type"])
                 self._check_mapping(name, cfg, action_class.Goal)
                 self._goal_classes[name] = action_class.Goal
-                self._action_clients[name] = ActionClient(
-                    node, action_class, cfg["topic"]
-                )
+                if not dry_run:
+                    self._action_clients[name] = ActionClient(
+                        node, action_class, cfg["topic"]
+                    )
                 logger.info(
                     f"[ActionDispatcher] '{name}' -> ACTION {cfg['topic']} "
                     f"({cfg['action_type']})"
@@ -244,9 +275,10 @@ class ActionDispatcher:
                 msg_class = get_message(cfg["msg_type"])
                 self._check_mapping(name, cfg, msg_class)
                 self._msg_classes[name] = msg_class
-                self._publishers[name] = node.create_publisher(
-                    msg_class, cfg["topic"], 10
-                )
+                if not dry_run:
+                    self._publishers[name] = node.create_publisher(
+                        msg_class, cfg["topic"], 10
+                    )
                 logger.info(
                     f"[ActionDispatcher] '{name}' -> TOPIC {cfg['topic']} "
                     f"({cfg['msg_type']})"
@@ -283,6 +315,7 @@ class ActionDispatcher:
     def dispatch(self, action: np.ndarray) -> None:
         if not np.isfinite(action).all():
             logger.error(f"[ActionDispatcher] Non-finite action, not dispatching: {action}")
+            self.send_stop()
             return
 
         # Phase 1: compute every output. If one config entry is broken (bad slice, unknown transform)
@@ -291,42 +324,26 @@ class ActionDispatcher:
         for name, cfg in self._action_configs.items():
             slice_values = action[cfg["indices"]]
 
-            # 1. Per-index denormalization: model output range -> real-world range
-            if "limits" in cfg and cfg.get("denormalize", cfg.get("apply_limits", True)):
-                slice_values = self._apply_limits(
-                    slice_values,
-                    cfg["limits"],
-                    cfg.get("normalized_range", [-1.0, 1.0]),
-                )
+            # 1. Safety clamp to [lower_lim, upper_lim], in real units
+            if "limits" in cfg:
+                slice_values = self._apply_limits(slice_values, cfg["limits"])
 
-            # 2. Optional further transform (vacuum, magnetic, scale, etc.)
+            # 2. Optional further transform (threshold, euler_to_quat)
             if "transform" in cfg:
                 transformed = self._apply_transform(slice_values, cfg["transform"])
             else:
                 transformed = slice_values
-            values = list(transformed.values()) if isinstance(transformed, dict) else transformed
-            if not np.isfinite(values).all():  # e.g. a `scale` transform with in_min == in_max
+            if not np.isfinite(transformed).all():  # e.g. a NaN in `limits`
                 logger.error(f"[ActionDispatcher] '{name}' output is not finite after its transform, not dispatching: {transformed}")
+                self.send_stop()
                 return
             outputs.append((name, cfg, transformed))
 
         # Phase 2: send.
         self._stopped = False
         for name, cfg, transformed in outputs:
-            # Command template path — simplest, just shell out
-            if "command" in cfg:
-                cmd = self._render_command(cfg["command"], transformed)
-                if self._last_sent.get(name) == cmd:
-                    continue
-                proc = self._procs.get(name)
-                if proc is not None and proc.poll() is None:
-                    continue  # previous command still running: retry next tick, don't pile up
-                # Remember it only once it was started, so a failed start is retried.
-                if self._dispatch_command(name, cfg, cmd):
-                    self._last_sent[name] = cmd
-
             # ROS2 action client path
-            elif cfg.get("action", False):
+            if cfg.get("action", False):
                 key = str(transformed)
                 if self._last_sent.get(name) == key:
                     continue
@@ -336,14 +353,9 @@ class ActionDispatcher:
                 if not self._dispatch_action(name, cfg, transformed):
                     self._last_sent.pop(name, None)
 
-            # Publisher path: sent every tick (controllers with a watchdog need a stream);
-            # set `dedupe: true` on the entry to skip repeats.
+            # Publisher path: sent every tick (controllers with a watchdog need a stream).
             else:
-                key = str(transformed)
-                if cfg.get("dedupe", False) and self._last_sent.get(name) == key:
-                    continue
-                if self._dispatch_topic(name, cfg, transformed):
-                    self._last_sent[name] = key
+                self._dispatch_topic(name, cfg, transformed)
 
     def send_stop(self) -> None:
         """Send each entry's ``stop:`` values once, e.g. a zero velocity: called when inference stops sending (inputs
@@ -353,47 +365,50 @@ class ActionDispatcher:
         """
         if self._stopped:
             return
-        self._stopped = True
+        with self._goals_lock:
+            self._stopped = True
+            goals, self._goals = self._goals, []
+        for name, goal_handle in goals:
+            self._cancel_goal(name, goal_handle)
         for name, cfg in self._action_configs.items():
             if "stop" not in cfg:
                 continue
-            # The first command after the stop must go out even if it equals the one before (commands are deduped).
-            self._last_sent.pop(name, None)
             try:
-                values = np.asarray(cfg["stop"], dtype=np.float64)
-                if "command" in cfg:
-                    running = self._procs.pop(name, None)
-                    if running is not None and running.poll() is None:
-                        running.terminate()  # an older motion command must not keep running after its stop
-                    self._stop_procs.append(subprocess.Popen(
-                        shlex.split(self._render_command(cfg["command"], values)),
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    ))
-                else:
-                    msg = self._stop_message(name, cfg, values)
-                    if msg is None:
-                        raise ValueError("a mapped field could not be set")
-                    self._publishers[name].publish(msg)
+                msg = self._stop_message(name, cfg, np.asarray(cfg["stop"], dtype=np.float64))
+                if msg is None:
+                    raise ValueError("a mapped field could not be set")
+                if self._dry_run:
+                    logger.warning(f"[DRY RUN] '{name}' stop {cfg['stop']} -> {msg}")
+                    continue
+                self._publishers[name].publish(msg)
                 logger.warning(f"[ActionDispatcher] '{name}': sent stop {cfg['stop']}")
             except Exception as e:
                 logger.error(f"[ActionDispatcher] '{name}': stop could not be sent: {e}")
-
-    def close(self) -> None:
-        """Stop the shell commands this dispatcher started and is still running (stop commands are left to finish)."""
-        for proc in self._procs.values():
-            if proc.poll() is None:
-                proc.terminate()
 
     # -------------------------------------------------------------------------
     # Private
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _check_transform(name: str, transform: Any) -> None:
-        """A scale with in_min == in_max divides by zero. Found at startup, not the first time the gripper switches on."""
-        for scale in (transform or {}, (transform or {}).get("strength_scale") or {}):
-            if "in_min" in scale and "in_max" in scale and float(scale["in_min"]) == float(scale["in_max"]):
-                raise ValueError(f"[ActionDispatcher] '{name}': transform needs in_min != in_max, both are {scale['in_min']}.")
+    def _track_goal(self, name: str, goal_handle: Any) -> None:
+        """Remember a sent goal for send_stop; one accepted after the stop is cancelled at once."""
+        with self._goals_lock:
+            if not self._stopped:
+                self._goals = [g for g in self._goals if g[1] is None or g[1].status not in _GOAL_DONE]
+                if goal_handle is not None or not any(n == name and h is None for n, h in self._goals):
+                    self._goals.append((name, goal_handle))
+                return
+        self._cancel_goal(name, goal_handle)
+
+    def _cancel_goal(self, name: str, goal_handle: Any) -> None:
+        """Ask the server to cancel the goal if still active. Not awaited: the stop path must not block. Never raises."""
+        try:
+            if goal_handle is None:
+                logger.warning(f"[DRY RUN] '{name}' cancel the sent goal")
+            elif goal_handle.status not in _GOAL_DONE:
+                goal_handle.cancel_goal_async()
+                logger.warning(f"[ActionDispatcher] '{name}': cancelling the active goal")
+        except Exception as e:
+            logger.error(f"[ActionDispatcher] '{name}': goal could not be cancelled: {e}")
 
     def _stop_message(self, name: str, cfg: dict, values: np.ndarray) -> Any:
         """The topic message carrying ``stop:`` values (no limits, no transform), or None if the mapping does not fit."""
@@ -405,57 +420,28 @@ class ActionDispatcher:
     def _check_stop(self, name: str, cfg: dict) -> None:
         """A broken ``stop:`` must stop startup: it is only needed at the moment something already went wrong."""
         stop = cfg["stop"]
-        if cfg.get("action", False) and "command" not in cfg:
-            raise ValueError(f"[ActionDispatcher] '{name}': 'stop' is for topic and command entries; "
-                             f"an action goal is stopped by cancelling it on the action server.")
+        if cfg.get("action", False):
+            raise ValueError(f"[ActionDispatcher] '{name}': 'stop' is for topic entries; "
+                             f"an action entry's still-active goal is cancelled when inference stops.")
         if not isinstance(stop, list) or not stop or not all(
                 isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) for v in stop):
             raise ValueError(f"[ActionDispatcher] '{name}': 'stop' must be a list of numbers, got {stop!r}.")
-        values = np.asarray(stop, dtype=np.float64)
-        if "command" in cfg:
-            if re.search(r'\{I\[\d+\]\}', self._render_command(cfg["command"], values)):
-                raise ValueError(f"[ActionDispatcher] '{name}': 'stop' has {len(stop)} values, too few for the command's {{I[n]}}.")
-        elif self._stop_message(name, cfg, values) is None:
+        if self._stop_message(name, cfg, np.asarray(stop, dtype=np.float64)) is None:
             raise ValueError(f"[ActionDispatcher] '{name}': 'stop' does not fit 'mapping' (see the warnings above).")
 
     def _check_mapping(self, name: str, cfg: dict, msg_class: Any) -> None:
         """Fill one message of ``msg_class`` with dummy values, so a broken ``mapping`` / ``goal_init``
         stops startup. Found at the first tick it would send the other entries (the arm) without this one."""
         values = np.zeros(len(cfg["indices"]), dtype=np.float32)
-        if "limits" in cfg and len(cfg["limits"]) not in (1, len(cfg["indices"])):
-            raise ValueError(f"[ActionDispatcher] '{name}': 'limits' needs 1 entry or one per index "
-                             f"({len(cfg['indices'])}), got {len(cfg['limits'])}.")
-        if "limits" in cfg and cfg.get("denormalize", cfg.get("apply_limits", True)):
-            values = self._apply_limits(values, cfg["limits"], cfg.get("normalized_range", [-1.0, 1.0]))
+        if "limits" in cfg:
+            values = self._apply_limits(values, cfg["limits"])
         if "transform" in cfg:
-            with np.errstate(all="ignore"):
-                values = self._apply_transform(values, cfg["transform"])
-            if isinstance(values, np.ndarray):
-                values = np.nan_to_num(values)  # only the field names and indices are checked here
+            values = self._apply_transform(values, cfg["transform"])
         msg = msg_class()
         if "goal_init" in cfg:
             self._init_goal(msg, cfg["goal_init"], name)
         if not _fill_msg(msg, cfg, values, self._node):
             raise ValueError(f"[ActionDispatcher] '{name}': 'mapping' does not fit {msg_class.__name__} (see the warnings above).")
-
-    def _dispatch_command(
-        self, name: str, cfg: dict, cmd: str
-    ) -> bool:
-        logger.debug(
-            f"[ActionDispatcher] Running command for '{name}':\n  {cmd}"
-        )
-        try:
-            self._procs[name] = subprocess.Popen(
-                shlex.split(cmd),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        except Exception as e:
-            logger.warning(
-                f"[ActionDispatcher] Command failed for '{name}': {e}\n  cmd: {cmd}"
-            )
-            return False
 
     def _dispatch_topic(self, name: str, cfg: dict, slice_values: np.ndarray) -> bool:
         msg = self._msg_classes[name]()
@@ -464,6 +450,9 @@ class ActionDispatcher:
         if not _fill_msg(msg, cfg, slice_values, self._node):
             logger.error(f"[ActionDispatcher] '{name}' not published: a mapped field could not be set.")
             return False
+        if self._dry_run:  # nothing published, so no ack to wait for
+            logger.info(f"[DRY RUN] '{name}' -> {msg}")
+            return True
         logger.debug(
             f"[ActionDispatcher] Publishing '{name}' -> {cfg['topic']}:\n  {msg}"
         )
@@ -526,9 +515,9 @@ class ActionDispatcher:
     def _handle_timeout(self, name: str, fb_cfg: dict, timeout: float) -> None:
         """
         Shared timeout policy for both topic-ack and action feedback/result
-        waits. `on_timeout: raise` propagates a RuntimeError out of
-        dispatch() (uncaught by step()/run() today) for a hard-stop-on-
-        failure setup; the default "warn" logs and lets dispatch() proceed.
+        waits. `on_timeout: raise` raises a RuntimeError out of dispatch():
+        step() sends the stop and re-raises, run() lets it through and ends.
+        The default "warn" logs and lets dispatch() proceed.
         """
         msg = (
             f"[ActionDispatcher] '{name}' timed out waiting for feedback "
@@ -539,13 +528,13 @@ class ActionDispatcher:
         logger.warning(msg + "; proceeding anyway.")
 
     def _dispatch_action(self, name: str, cfg: dict, slice_values: np.ndarray) -> bool:
-        client = self._action_clients[name]
-
-        if not client.server_is_ready():
-            logger.warning(
-                f"[ActionDispatcher] Action server '{cfg['topic']}' not ready, skipping."
-            )
-            return False
+        if not self._dry_run:
+            client = self._action_clients[name]
+            if not client.server_is_ready():
+                logger.warning(
+                    f"[ActionDispatcher] Action server '{cfg['topic']}' not ready, skipping."
+                )
+                return False
 
         goal = self._goal_classes[name]()
 
@@ -557,6 +546,10 @@ class ActionDispatcher:
         if not _fill_msg(goal, cfg, slice_values, self._node):
             logger.error(f"[ActionDispatcher] '{name}' goal not sent: a mapped field could not be set.")
             return False
+        if self._dry_run:  # no goal sent, so no result or feedback to wait for
+            logger.info(f"[DRY RUN] '{name}' -> {goal}")
+            self._track_goal(name, None)
+            return True
 
         logger.debug(
             f"[ActionDispatcher] Sending goal for '{name}':\n{goal}"
@@ -612,6 +605,7 @@ class ActionDispatcher:
                 holder["rejected"] = True
                 ev.set()
                 return
+            self._track_goal(name, goal_handle)
             if source == "result":
                 result_future = goal_handle.get_result_async()
 
@@ -682,101 +676,27 @@ class ActionDispatcher:
                 # Raise, never skip: a message missing a goal_init field (e.g. use_delta) moves the robot wrongly.
                 raise ValueError(f"[ActionDispatcher] goal_init failed for '{name}.{field_path}': {e}") from e
 
-    def _render_command(self, template: str, values) -> str:
+    @staticmethod
+    def _apply_limits(slice_values: np.ndarray, limits: list) -> np.ndarray:
+        """Clamp each value to its [lower_lim, upper_lim] (real units).
+
+        limits: list of {lower_lim, upper_lim} dicts, one per index, or one entry broadcast to all.
+        A null entry leaves that index unchanged.
         """
-        Replace {I[0]}, {I[1]}, ... in a command template with actual values.
-        values can be np.ndarray or dict.
-        """
-        result = template
-        for idx, val in (values.items() if isinstance(values, dict) else enumerate(values)):
-            # Format ints as ints, floats as floats
-            formatted = str(int(val)) if float(val).is_integer() else str(round(float(val), 6))
-            result = result.replace(f"{{I[{idx}]}}", formatted)
-
-        if re.search(r'\{I\[\d+\]\}', result):
-            logger.warning(
-                f"[ActionDispatcher] Command template has unreplaced placeholders "
-                f"(action slice has {len(values)} values): {result!r}"
-            )
-        return result
-
-    def _apply_limits(
-        self,
-        slice_values: np.ndarray,
-        limits: list,
-        normalized_range: list,
-    ) -> np.ndarray:
-        """
-        Per-index linear denormalization.
-
-        Maps each element of slice_values from normalized_range to the
-        [lower_lim, upper_lim] defined in limits.
-
-        Broadcast: a single limits entry is applied to all indices.
-        Use null for a specific entry to leave that index unchanged.
-
-        normalized_range: [model_min, model_max]  (typically [-1.0, 1.0])
-        limits: list of {lower_lim, upper_lim} dicts — one per index OR one entry → broadcast.
-        """
-        model_min, model_max = float(normalized_range[0]), float(normalized_range[1])
-        span = model_max - model_min
-        result = slice_values.copy().astype(np.float32)
-
-        if span == 0.0:
-            logger.warning(
-                f"[ActionDispatcher] normalized_range has zero span "
-                f"({model_min} == {model_max}); skipping denormalization."
-            )
-            return result
-
+        result = slice_values.astype(np.float32)
         for i in range(len(result)):
             lim = limits[min(i, len(limits) - 1)]
-            if lim is None:
-                continue
-            lower = float(lim["lower_lim"])
-            upper = float(lim["upper_lim"])
-            norm = np.clip((result[i] - model_min) / span, 0.0, 1.0)
-            result[i] = lower + norm * (upper - lower)
-
+            if lim is not None:
+                result[i] = np.clip(result[i], float(lim["lower_lim"]), float(lim["upper_lim"]))
         return result
 
     def _apply_transform(self, slice_values: np.ndarray, transform_cfg: dict):
         values = slice_values.copy()
         t = transform_cfg["type"]
 
-        if t == "scale":
-            in_min  = transform_cfg["in_min"]
-            in_max  = transform_cfg["in_max"]
-            out_min = transform_cfg["out_min"]
-            out_max = transform_cfg["out_max"]
-            values  = (values - in_min) / (in_max - in_min)
-            values  = values * (out_max - out_min) + out_min
-            values  = np.clip(values, out_min, out_max)
-            return values
-
-        elif t == "threshold":
-            return (values > transform_cfg.get("threshold", 0.0)).astype(np.float32)
-
-        elif t == "clip":
-            return np.clip(values, transform_cfg["out_min"], transform_cfg["out_max"])
-
-        elif t == "vacuum":
-            activate      = float(values[0]) > transform_cfg.get("threshold", 0.0)
-            max_suction   = transform_cfg.get("max_suction", 255)
-            power_limit   = transform_cfg.get("power_limit", 400)
-            channel_value = max_suction if activate else 0
-            return {0: float(channel_value), 1: float(channel_value), 2: float(power_limit)}
-
-        elif t == "magnetic":
-            activate = float(values[0]) > transform_cfg.get("threshold", 0.0)
-            mode     = 1 if activate else 0
-            strength = 0
-            if activate and "strength_scale" in transform_cfg:
-                sc       = transform_cfg["strength_scale"]
-                norm     = (float(values[0]) - sc["in_min"]) / (sc["in_max"] - sc["in_min"])
-                strength = int(np.clip(norm * (sc["out_max"] - sc["out_min"]) + sc["out_min"],
-                                    sc["out_min"], sc["out_max"]))
-            return {0: float(mode), 1: float(strength)}
+        if t == "threshold":
+            on = values > transform_cfg.get("threshold", 0.0)
+            return np.where(on, transform_cfg.get("on_value", 1.0), transform_cfg.get("off_value", 0.0)).astype(np.float32)
 
         elif t == "euler_to_quat":
             start = int(transform_cfg.get("euler_start", 3))
@@ -794,3 +714,5 @@ class ActionDispatcher:
                 f"[ActionDispatcher] Goal rejected by '{name}'"
             )
             self._last_sent.pop(name, None)  # not sent after all: retry it next tick
+            return
+        self._track_goal(name, goal_handle)

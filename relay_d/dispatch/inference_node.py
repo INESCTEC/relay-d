@@ -22,12 +22,19 @@ Usage (after `pip install -e .`):
 """
 
 import argparse
+import signal
 import sys
 
 from relay_d.utils import user_settings
 
 from .api import InferenceSession, detect_backend
 from .reexec import reexec_if_needed
+
+
+def sigterm_runs_the_safe_stop():
+    """SIGTERM (kill, systemd, a supervisor) raises KeyboardInterrupt like Ctrl+C, so the safe stop is sent: rclpy's
+    own handler ends the process without running ``finally``. Call it after rclpy.init(), which installs that handler."""
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
 
 
 def main():
@@ -40,7 +47,7 @@ def main():
     parser.add_argument("--device",        default=user_settings.get("infer_device"),  help="Torch device: cpu | cuda (default: the infer_device setting)")
     parser.add_argument("--hz",            type=float, default=None,
                         help="Control rate in Hz (0 = as fast as possible). Default: the rate the policy was trained at "
-                             "(a LeRobot dataset's fps), else the infer_hz setting")
+                             "(the recording_frequency, stored in the checkpoint / LeRobot dataset), else the infer_hz setting")
     parser.add_argument("--max-obs-age",   type=float, default=user_settings.get("infer_max_obs_age_s"),
                         help="Skip dispatching while any input is older than this many seconds (default: the infer_max_obs_age_s setting)")
     parser.add_argument("--obs-wait",      type=float, default=user_settings.get("infer_obs_wait_s"),
@@ -54,6 +61,8 @@ def main():
     parser.add_argument("--task",          default=None,
                         help="lerobot only: the instruction a language-conditioned policy (SmolVLA) follows. "
                              "Default: the task of the dataset the policy was trained on")
+    parser.add_argument("--dry-run",       action="store_true",
+                        help="Run the full loop but publish nothing and send no goals: every command is logged instead")
     args = parser.parse_args()
 
     try:  # the package of the backend may live in another environment (the one built by the Train tab)
@@ -72,13 +81,15 @@ def main():
         backend=args.backend,
         state_keys=state_keys,
         task=args.task,
+        dry_run=args.dry_run,
     )
-    # Each predicted action is one step of the training data: at another rate the robot moves faster or slower than shown.
-    hz = args.hz if args.hz is not None else (getattr(session.model, "fps", None) or user_settings.get("infer_hz"))
     try:
-        session.run(hz=hz, validate_timeout=args.obs_wait, max_obs_age=args.max_obs_age)
+        sigterm_runs_the_safe_stop()
+        ok = session.run(hz=args.hz, validate_timeout=args.obs_wait, max_obs_age=args.max_obs_age)
     finally:
         session.close()
+    if not ok:  # a model error: the Run tab shows Failed, not Stopped
+        sys.exit(1)
 
 
 if __name__ == "__main__":

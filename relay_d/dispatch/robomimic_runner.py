@@ -6,9 +6,8 @@ RolloutPolicy (FileUtils.policy_from_checkpoint). Same interface as
 LeRobotPolicyRunner: get_action(obs_dict) -> np.ndarray, reset(), and an
 .obs_keys list.
 
-- RolloutPolicy wants raw observations and normalizes internally with the
-  statistics in the checkpoint: do not set `normalize: true` in obs_config.yaml
-  for keys this backend uses, or they are normalized twice.
+- robomimic normalizes observations and un-normalizes actions with the
+  checkpoint's stats; obs_config has no normalization.
 - Camera / organized point cloud observations (`source:` entries) reach the
   policy unchanged: RolloutPolicy runs the checkpoint's own encoder.
 - Multi-frame policies (e.g. Diffusion Policy) get their frame history in
@@ -21,7 +20,7 @@ LeRobotPolicyRunner: get_action(obs_dict) -> np.ndarray, reset(), and an
 from __future__ import annotations
 
 from collections import deque
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -52,6 +51,13 @@ def _safe_cfg_get(obj, attr, default=None):
         return default
 
 
+def checkpoint_fps(ckpt: dict) -> Optional[float]:
+    """The rate the training data was recorded at: the converter writes it to the dataset's env_args
+    (env_kwargs.control_freq), which robomimic saves in the checkpoint as env_metadata. None for older checkpoints."""
+    env_meta = ckpt.get("env_metadata")
+    return (env_meta.get("env_kwargs") or {}).get("control_freq") if isinstance(env_meta, dict) else None
+
+
 class RobomimicPolicyRunner:
     """Runs inference via robomimic's RolloutPolicy, loaded straight from a checkpoint."""
 
@@ -59,6 +65,9 @@ class RobomimicPolicyRunner:
         torch_device = TorchUtils.get_torch_device(try_to_use_cuda=device.startswith("cuda"))
         self._policy, ckpt = FileUtils.policy_from_checkpoint(ckpt_path=checkpoint_path, device=torch_device)
         self.obs_keys: List[str] = list(ckpt["shape_metadata"]["all_obs_keys"])
+        self.action_dim: int = int(ckpt["shape_metadata"]["ac_dim"])
+        # Each predicted action is one step at this rate (None: older checkpoint, the caller picks the rate).
+        self.fps: Optional[float] = checkpoint_fps(ckpt)
 
         # observation_horizon (To) drives DiffusionPolicyUNet._get_action_trajectory
         # directly; robomimic's own shipped configs keep config.train.frame_stack
@@ -82,7 +91,7 @@ class RobomimicPolicyRunner:
 
         logger.info(
             f"[RobomimicPolicyRunner] algo={ckpt.get('algo_name')}  device={device}  "
-            f"obs_horizon={self._obs_horizon}  checkpoint={checkpoint_path}"
+            f"obs_horizon={self._obs_horizon}  fps={self.fps}  checkpoint={checkpoint_path}"
         )
         logger.info(f"[RobomimicPolicyRunner] obs_keys: {self.obs_keys}")
 

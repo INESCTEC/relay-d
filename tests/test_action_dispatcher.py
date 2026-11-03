@@ -1,5 +1,7 @@
 """Action math and safe stop of ActionDispatcher. Needs a sourced ROS 2 (rclpy): skipped without it, run by the "Tests (ROS 2 Jazzy)" CI job."""
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -9,21 +11,17 @@ from relay_d.dispatch.action_dispatcher import ActionDispatcher  # noqa: E402
 
 @pytest.fixture
 def d():
-    return ActionDispatcher.__new__(ActionDispatcher)  # skip ROS setup: only pure methods are used
+    d = ActionDispatcher.__new__(ActionDispatcher)  # skip ROS setup: only pure methods are used
+    d._stopped, d._dry_run = True, False  # as __init__ sets them
+    d._goals, d._goals_lock = [], threading.Lock()
+    return d
 
 
-def test_limits_broadcast_clip_and_none(d):
-    lims = [{"lower_lim": 0.0, "upper_lim": 10.0}]
-    out = d._apply_limits(np.array([-1.0, 0.0, 1.0, 5.0]), lims, [-1.0, 1.0])
-    assert out.tolist() == [0.0, 5.0, 10.0, 10.0]  # out-of-range input is clipped
-    out = d._apply_limits(np.array([1.0, 0.3]), [None, {"lower_lim": 0, "upper_lim": 2}], [-1.0, 1.0])
-    assert out[0] == 1.0  # None entry: unchanged
-    assert d._apply_limits(np.array([0.5]), lims, [1.0, 1.0]).tolist() == [0.5]  # zero span: unchanged
-
-
-def test_render_command(d):
-    cmd = d._render_command("run {I[0]} {I[1]} {I[10]}", np.array([3.0, 0.1234567]))
-    assert cmd == "run 3 0.123457 {I[10]}"  # {I[1]} must not eat {I[10]}
+def test_limits_clamp_broadcast_and_none(d):
+    lims = [{"lower_lim": 0.0, "upper_lim": 2.0}]
+    assert d._apply_limits(np.array([5.0, -1.0, 1.5]), lims).tolist() == [2.0, 0.0, 1.5]  # clamp, not rescale
+    out = d._apply_limits(np.array([5.0, 5.0]), [None, {"lower_lim": 0, "upper_lim": 2}])
+    assert out.tolist() == [5.0, 2.0]  # None entry: unchanged
 
 
 def test_dispatch_drops_non_finite_action(d):
@@ -31,6 +29,10 @@ def test_dispatch_drops_non_finite_action(d):
     d._last_sent = {}
     d.dispatch(np.array([np.nan]))  # would raise (no publishers set up) if it got past the guard
     d.dispatch(np.array([np.inf]))
+    published = _stop_dispatcher(d, {"base": {"indices": [0], "topic": "/cmd_vel", "mapping": {"x": 0}, "stop": [0]}})
+    d._stopped = False
+    d.dispatch(np.array([np.nan]))
+    assert published == [("base", 0.0, 0.0)]  # a velocity controller must not keep the last command
 
 
 def test_set_nested_casts_to_field_type():
@@ -59,7 +61,7 @@ def test_fill_msg_reports_failed_mapping():
 
 def test_failed_send_is_not_remembered_so_it_is_retried(d):
     d._action_configs = {"grip": {"indices": [0], "action": True}}
-    d._last_sent, d._procs = {}, {}
+    d._last_sent = {}
     sent = []
     results = iter([False, True, True])
     d._dispatch_action = lambda name, cfg, values: sent.append(name) or next(results)
@@ -73,7 +75,7 @@ def test_dispatch_sends_nothing_if_one_entry_cannot_be_computed(d):
         "arm": {"indices": [0], "topic": "/arm"},
         "tool": {"indices": [0], "transform": {"type": "nope"}},
     }
-    d._last_sent, d._procs = {}, {}
+    d._last_sent = {}
     d._dispatch_topic = lambda *a: pytest.fail("arm must not move while the tool entry is broken")
     with pytest.raises(ValueError):
         d.dispatch(np.array([1.0]))
@@ -92,11 +94,16 @@ def test_check_mapping_rejects_a_field_the_message_does_not_have(d):
 def test_dispatch_sends_nothing_if_a_transform_gives_nan(d):
     d._action_configs = {
         "arm": {"indices": [0], "topic": "/arm"},
-        "tool": {"indices": [0], "transform": {"type": "scale", "in_min": 1, "in_max": 1, "out_min": 0, "out_max": 1}},
+        "tool": {"indices": [0], "limits": [{"lower_lim": float("nan"), "upper_lim": 1.0}]},  # e.g. a NaN limit
     }
-    d._last_sent, d._procs = {}, {}
+    d._last_sent = {}
     d._dispatch_topic = lambda *a: pytest.fail("nothing may be sent when one output is NaN")
     d.dispatch(np.array([1.0]))
+    d._action_configs["arm"].update(mapping={"x": 0}, stop=[0])
+    published = _stop_dispatcher(d, d._action_configs)
+    d._stopped = False
+    d.dispatch(np.array([1.0]))
+    assert published == [("arm", 0.0, 0.0)]  # the stop goes out instead
 
 
 def test_bool_field_is_true_only_above_half():
@@ -145,7 +152,7 @@ def test_rejected_goal_is_retried_even_if_rejected_before_send_returns(d):
     from types import SimpleNamespace
 
     d._action_configs = {"grip": {"indices": [0], "action": True}}
-    d._last_sent, d._procs = {}, {}
+    d._last_sent = {}
     sent = []
 
     def send_and_reject(name, cfg, values):  # the server answers before _dispatch_action returns
@@ -170,13 +177,87 @@ def test_fill_msg_keeps_the_frame_set_by_goal_init():
     assert (msg.header.frame_id, msg.header.stamp) == ("base_link", "now")
 
 
-def test_check_mapping_rejects_a_short_limits_list(d):
+@pytest.mark.parametrize("entry", [
+    {"action": True, "action_type": "pkg/action/Name", "topic": "/arm", "mapping": {}},
+    {"topic": "/arm", "msg_type": "std_msgs/msg/Float64MultiArray", "mapping": {}},
+])
+def test_short_limits_list_is_rejected_at_startup(tmp_path, entry):
+    import yaml
+
+    lims = [{"lower_lim": 0.0, "upper_lim": 1.0}] * 2
+    path = tmp_path / "action_config.yaml"
+    path.write_text(yaml.safe_dump({"actions": {"arm": {"indices": [0, 1, 2], "limits": lims, **entry}}}))
+    with pytest.raises(ValueError, match="limits"):  # index 2 would reuse index 1's range
+        ActionDispatcher(None, str(path))
+
+
+@pytest.mark.parametrize("key", [{"denormalize": True}, {"apply_limits": True}, {"normalized_range": [-1.0, 1.0]}])
+def test_old_denormalize_keys_are_rejected_at_startup(tmp_path, key):
+    import yaml
+
+    path = tmp_path / "action_config.yaml"
+    entry = {"indices": [0], "topic": "/grip", "msg_type": "std_msgs/msg/Float64", "mapping": {"data": 0},
+             "limits": [{"lower_lim": 0.0, "upper_lim": 2.0}], **key}
+    path.write_text(yaml.safe_dump({"actions": {"grip": entry}}))
+    with pytest.raises(ValueError, match="grip.*denormalize"):  # the model already outputs real units
+        ActionDispatcher(None, str(path))
+
+
+def _fake_node(sent):
+    """A node whose publishers append every published message to ``sent``."""
     from types import SimpleNamespace
 
-    d._node = None
-    lims = [{"lower_lim": 0.0, "upper_lim": 1.0}] * 3
-    with pytest.raises(ValueError, match="limits"):  # joints 3-5 would reuse joint 2's range
-        d._check_mapping("arm", {"indices": list(range(6)), "limits": lims, "mapping": {}}, lambda: SimpleNamespace())
+    return SimpleNamespace(create_publisher=lambda cls, topic, qos: SimpleNamespace(publish=sent.append))
+
+
+def _load(tmp_path, actions, node=None, **kwargs):
+    import yaml
+
+    path = tmp_path / "action_config.yaml"
+    path.write_text(yaml.safe_dump({"actions": actions}))
+    return ActionDispatcher(node, str(path), **kwargs)
+
+
+_GRIP = {"indices": [0], "topic": "/grip", "msg_type": "std_msgs/msg/Float64", "mapping": {"data": 0}}
+
+
+def test_limits_clamp_the_dispatched_value(tmp_path):
+    sent = []
+    entry = {**_GRIP, "limits": [{"lower_lim": 0.0, "upper_lim": 2.0}],
+             "denormalize": False}  # accepted and ignored: old configs that never de-normalized still start
+    d = _load(tmp_path, {"grip": entry}, _fake_node(sent))
+    d.dispatch(np.array([5.0]))
+    assert [m.data for m in sent] == [2.0]  # clamped to upper_lim, not sent as 5
+
+
+def test_topic_entry_is_published_every_tick(tmp_path):
+    sent = []
+    d = _load(tmp_path, {"grip": _GRIP}, _fake_node(sent))
+    d.dispatch(np.array([1.0]))
+    d.dispatch(np.array([1.0]))
+    assert [m.data for m in sent] == [1.0, 1.0]  # a controller with a watchdog needs the stream
+
+
+@pytest.mark.parametrize("extra, match", [
+    ({"command": "go {I[0]}"}, "command.*removed.*topic entry.*action entry"),
+    ({"dedupe": True}, "dedupe.*removed.*every tick"),
+    ({"transform": {"type": "scale", "in_min": 0, "in_max": 1, "out_min": 0, "out_max": 2}}, "scale.*removed.*limits"),
+    ({"transform": {"type": "clip", "out_min": 0, "out_max": 1}}, "clip.*removed.*limits"),
+    ({"transform": {"type": "vacuum"}}, "vacuum.*removed.*threshold"),
+    ({"transform": {"type": "magnetic"}}, "magnetic.*removed.*threshold"),
+])
+def test_removed_keys_are_rejected_at_startup(tmp_path, extra, match):
+    with pytest.raises(ValueError, match="'grip'.*" + match):  # never silently ignored: it would change what the robot gets
+        _load(tmp_path, {"grip": {**_GRIP, **extra}})
+
+
+@pytest.mark.parametrize("transform, expected", [
+    ({"type": "threshold", "threshold": 0.5}, [0.0, 0.0, 1.0]),  # default: 1 / 0, as before
+    ({"type": "threshold", "threshold": 0.5, "on_value": 255, "off_value": 10}, [10.0, 10.0, 255.0]),
+])
+def test_threshold_on_and_off_values(d, transform, expected):
+    out = d._apply_transform(np.array([0.2, 0.5, 0.9], dtype=np.float32), transform)
+    assert out.dtype == np.float32 and out.tolist() == expected
 
 
 def test_ack_arriving_while_a_stale_one_is_read_is_not_lost(d):
@@ -203,21 +284,10 @@ def test_ack_arriving_while_a_stale_one_is_read_is_not_lost(d):
     assert time.monotonic() - t0 < 0.4  # was: the fresh ack's signal was cleared and the wait timed out
 
 
-@pytest.mark.parametrize("transform", [
-    {"type": "scale", "in_min": 1, "in_max": 1, "out_min": 0, "out_max": 1},
-    {"type": "magnetic", "strength_scale": {"in_min": 0.5, "in_max": 0.5, "out_min": 0, "out_max": 100}},
-])
-def test_zero_input_span_is_rejected_at_startup(transform):
-    with pytest.raises(ValueError, match="in_min != in_max"):  # magnetic would raise ZeroDivisionError mid-task
-        ActionDispatcher._check_transform("tool", transform)
-    ActionDispatcher._check_transform("tool", {"type": "threshold"})
-    ActionDispatcher._check_transform("tool", None)
-
-
 def _stop_dispatcher(d, entries):
     from types import SimpleNamespace
 
-    d._action_configs, d._last_sent, d._procs, d._stop_procs, d._node = entries, {}, {}, [], None
+    d._action_configs, d._last_sent, d._node = entries, {}, None
     d._msg_classes = {n: (lambda: SimpleNamespace(x=0.0, y=0.0)) for n, c in entries.items() if "topic" in c}
     published = []
     d._publishers = {n: SimpleNamespace(publish=lambda m, n=n: published.append((n, m.x, m.y))) for n in d._msg_classes}
@@ -239,34 +309,6 @@ def test_stop_is_sent_once_until_the_next_dispatch(d):
     assert published[-1] == ("base", 0.0, 0.0) and len(published) == 4
 
 
-def test_command_after_a_stop_is_not_skipped_as_a_repeat(d, monkeypatch):
-    import relay_d.dispatch.action_dispatcher as ad
-
-    started = []
-
-    class Proc:
-        def __init__(self, argv, **kw):
-            self.argv, self.terminated = argv, False
-            started.append(self)
-
-        def poll(self):
-            return 0 if self.terminated else None
-
-        def terminate(self):
-            self.terminated = True
-
-    monkeypatch.setattr(ad.subprocess, "Popen", Proc)
-    _stop_dispatcher(d, {"vel": {"indices": [0], "command": "vel {I[0]}", "stop": [0]}})
-    d.dispatch(np.array([0.5]))
-    motion = started[0]
-    d.send_stop()
-    assert motion.terminated and started[1].argv == ["vel", "0"]  # the old motion ends, the stop command runs
-    d.close()
-    assert not started[1].terminated  # close() must not kill the stop command
-    d.dispatch(np.array([0.5]))
-    assert started[-1].argv == ["vel", "0.5"]  # same as before the stop, but sent: the robot was stopped since
-
-
 def test_one_failing_stop_does_not_block_the_others(d):
     from types import SimpleNamespace
 
@@ -282,12 +324,105 @@ def test_one_failing_stop_does_not_block_the_others(d):
 
 @pytest.mark.parametrize("cfg, match", [
     ({"indices": [0], "action": True, "stop": [0]}, "cancel"),
-    ({"indices": [0, 1], "command": "go {I[0]} {I[1]}", "stop": [0]}, "too few"),
-    ({"indices": [0], "command": "go {I[0]}", "stop": "zero"}, "list of numbers"),
-    ({"indices": [0], "command": "go {I[0]}", "stop": [float("nan")]}, "list of numbers"),
+    ({"indices": [0, 1], "topic": "/a", "mapping": {"x": 0, "y": 1}, "stop": [0]}, "does not fit"),
+    ({"indices": [0], "topic": "/a", "mapping": {"x": 0}, "stop": "zero"}, "list of numbers"),
+    ({"indices": [0], "topic": "/a", "mapping": {"x": 0}, "stop": [float("nan")]}, "list of numbers"),
     ({"indices": [0], "topic": "/a", "mapping": {"x": 0, "nope": 1}, "stop": [0, 0]}, "does not fit"),
 ])
 def test_a_broken_stop_is_rejected_at_startup(d, cfg, match):
     _stop_dispatcher(d, {"e": cfg})
     with pytest.raises(ValueError, match=match):
         d._check_stop("e", cfg)
+
+
+def test_dry_run_creates_no_publisher_and_logs_dispatch_and_stop(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import relay_d.dispatch.action_dispatcher as ad
+
+    logged = []
+    monkeypatch.setattr(ad.logger, "info", logged.append)
+    monkeypatch.setattr(ad.logger, "warning", logged.append)
+    node = SimpleNamespace(create_publisher=lambda *a: pytest.fail("dry run must not create a publisher"))
+    d = _load(tmp_path, {"grip": {**_GRIP, "stop": [0.25]}}, node, dry_run=True)
+    d.dispatch(np.array([1.5]))
+    d.send_stop()
+    dry = [m for m in logged if "[DRY RUN]" in m]
+    assert len(dry) == 2 and "'grip'" in dry[0] and "1.5" in dry[0] and "stop" in dry[1] and "0.25" in dry[1]
+
+
+def test_dry_run_creates_no_action_client_and_does_not_wait_for_feedback(tmp_path, monkeypatch):
+    import time
+
+    import relay_d.dispatch.action_dispatcher as ad
+
+    logged = []
+    monkeypatch.setattr(ad.logger, "info", logged.append)
+    monkeypatch.setattr(ad, "ActionClient", lambda *a: pytest.fail("dry run must not create an action client"))
+    entry = {"indices": [0], "action": True, "topic": "/fib", "action_type": "example_interfaces/action/Fibonacci",
+             "mapping": {"order": 0}, "feedback": {"success_field": "sequence", "timeout": 5.0, "on_timeout": "raise"}}
+    with pytest.raises(ValueError, match="mapping"):  # messages are still built: a mapping error still stops startup
+        _load(tmp_path, {"fib": {**entry, "mapping": {"nope": 0}}}, dry_run=True)
+    d = _load(tmp_path, {"fib": entry}, dry_run=True)
+    t0 = time.monotonic()
+    d.dispatch(np.array([3.0]))  # no server answers in a dry run: no wait for its result
+    assert time.monotonic() - t0 < 1.0
+    assert any("[DRY RUN]" in m and "'fib'" in m and "order=3" in m for m in logged)
+
+
+def _goal_handle(status=1):  # 1 = STATUS_ACCEPTED
+    from types import SimpleNamespace
+
+    h = SimpleNamespace(accepted=True, status=status, cancels=[])
+    h.cancel_goal_async = lambda: h.cancels.append(1)
+    return h
+
+
+def _accept(d, handle, name="fib"):
+    from types import SimpleNamespace
+
+    d._goal_response_callback(SimpleNamespace(result=lambda: handle), name)
+
+
+def test_stop_cancels_each_active_goal_once(d):
+    _stop_dispatcher(d, {"fib": {"indices": [0], "action": True}})
+    active, done = _goal_handle(), _goal_handle(status=4)  # 4 = STATUS_SUCCEEDED
+    d._stopped = False  # a goal was sent
+    _accept(d, active)
+    _accept(d, done)
+    d.send_stop()
+    d.send_stop()
+    assert active.cancels == [1] and done.cancels == []  # a finished goal has nothing to cancel
+    late = _goal_handle()
+    _accept(d, late)  # sent before the stop, accepted after it: still cancelled
+    assert late.cancels == [1]
+
+
+def test_stop_cancels_a_goal_sent_by_the_waiting_path(d):
+    from types import SimpleNamespace
+
+    _stop_dispatcher(d, {"fib": {"indices": [0], "action": True}})
+    handle = _goal_handle()
+    handle.get_result_async = lambda: SimpleNamespace(add_done_callback=lambda cb: None)  # never finishes
+    future = SimpleNamespace(add_done_callback=lambda cb: cb(SimpleNamespace(result=lambda: handle)))
+    client = SimpleNamespace(send_goal_async=lambda goal, feedback_callback=None: future)
+    d._stopped = False
+    d._dispatch_action_and_wait("fib", client, object(), {"timeout": 0.05})
+    d.send_stop()
+    assert handle.cancels == [1]
+
+
+def test_dry_run_logs_the_cancel_of_a_sent_goal(tmp_path, monkeypatch):
+    import relay_d.dispatch.action_dispatcher as ad
+
+    logged = []
+    monkeypatch.setattr(ad.logger, "info", logged.append)
+    monkeypatch.setattr(ad.logger, "warning", logged.append)
+    entry = {"indices": [0], "action": True, "topic": "/fib", "action_type": "example_interfaces/action/Fibonacci",
+             "mapping": {"order": 0}}
+    d = _load(tmp_path, {"fib": entry}, dry_run=True)
+    d.send_stop()
+    assert not [m for m in logged if "cancel" in m]  # nothing sent yet
+    d.dispatch(np.array([3.0]))
+    d.send_stop()
+    assert len([m for m in logged if "[DRY RUN]" in m and "'fib'" in m and "cancel" in m]) == 1
