@@ -15,8 +15,8 @@ _DUMMY_STAMP = Time()
 
 class ReprocessRecordedData:
     def __init__(self, input_dir, output_dir=None, new_config=None):
-        self.input_dir = input_dir
-        self.output_dir = output_dir or os.path.join(input_dir, "reprocessed")
+        self.input_dir = os.path.abspath(input_dir)
+        self.output_dir = os.path.abspath(output_dir or os.path.join(input_dir, "reprocessed"))
         self.yaml_parser = self._load_new_config(new_config) if new_config else None
 
     def _load_new_config(self, new_config):
@@ -126,7 +126,7 @@ def main():
         "group from a new output.streams config, reading from the raw inputs "
         "already present in each recorded .h5 file."
     )
-    parser.add_argument("--input_dir", help="Path to the raw recorded dataset directory")
+    parser.add_argument("--input_dir", required=True, help="Path to the raw recorded dataset directory")
     parser.add_argument("--output_dir", help="Path to the output directory for reprocessed data")
     parser.add_argument(
         "--config",

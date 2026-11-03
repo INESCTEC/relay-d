@@ -13,7 +13,7 @@ config:
 
   dataset_name: my_robot_demo     # prefix used for HDF5 group names (e.g. demo_0, demo_1)
   recording_frequency: 20         # samples per second saved to disk (Hz)
-  normalize_actions: false        # reserved — keep false
+  # max_buffer_mb: 4096           # optional: recording stops sampling past this much buffered image data (Stop still saves)
 
   # ---------------------------------------------------------------------------
   # inputs — define every sensor source
@@ -605,6 +605,10 @@ config:
   #
   # The streams are concatenated column-wise in the order listed.
   # n_actions above must equal the total number of columns.
+  # The action of step t is the target of the next step: the stream's value at
+  # t+1, or (in delta_actions) the change from t to t+1. A stream in
+  # delta_actions must not set `normalize: true` (the dispatcher could not turn
+  # a normalized delta back into real units): use a second, raw stream for it.
   # ---------------------------------------------------------------------------
 
   actions_to_extract:
@@ -629,80 +633,9 @@ config:
   #   # an obs-only stream since it isn't listed here.
 
   # ---------------------------------------------------------------------------
-  # metadata — embedded into the Robomimic output as env_args
-  #
-  # Required fields for Robomimic compatibility:
-  #   env_name, env_version, type (1 = Robosuite)
-  #
-  # env_kwargs mirrors the Robosuite environment constructor arguments.
+  # Format-specific settings (robomimic env metadata, training_model, split fractions,
+  # LeRobot task, ...) do NOT belong here. Put them in `postprocess_config.yaml`
+  # (see relay_d/acquisition/qt_app/ui/config/templates/postprocess_config_template.yaml); the Post-process page picks it up
+  # from the same folder as this file. Keys left in this file still work but are
+  # deprecated and log a warning at conversion time.
   # ---------------------------------------------------------------------------
-
-  metadata:
-    env_name: Lift                # Robosuite environment name
-    env_version: 1.5.1
-    type: 1                       # 1 = Robosuite
-
-    env_kwargs:
-      robots:
-        - IIWA                    # robot model name in Robosuite
-
-      control_freq: 20            # controller frequency (Hz)
-
-      # Rendering — set both to false for headless recording
-      has_renderer: false
-      has_offscreen_renderer: false
-
-      # Observations
-      use_camera_obs: false       # set true if recording camera obs for policy
-      use_object_obs: true        # set true to include object state in obs
-
-      # Episode behaviour
-      ignore_done: true
-      reward_shaping: false
-      lite_physics: false
-
-      # Camera resolution (used if use_camera_obs: true)
-      camera_heights: 84
-      camera_widths: 84
-      camera_depths: false
-
-      # Controller configuration (example: operational space control)
-      controller_configs:
-        type: BASIC
-        body_parts:
-          right:
-            type: OSC_POSE
-            input_min: -1
-            input_max: 1
-            output_min:
-              - -0.05
-              - -0.05
-              - -0.05
-              - -0.5
-              - -0.5
-              - -0.5
-            output_max:
-              - 0.05
-              - 0.05
-              - 0.05
-              - 0.5
-              - 0.5
-              - 0.5
-            kp: 150
-            kp_limits:
-              - 0
-              - 300
-            damping: 1
-            damping_limits:
-              - 0
-              - 10
-            impedance_mode: fixed
-            uncouple_pos_ori: true
-            control_delta: true
-            ramp_ratio: 0.2
-            input_ref_frame: world
-            interpolation: null
-            orientation_limits: null
-            position_limits: null
-            gripper:
-              type: GRIP

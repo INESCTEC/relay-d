@@ -1,19 +1,18 @@
-import os
-import sys
-import tkinter as tk
 
 # Import utils
 from .yaml_parser import YamlParser
-from ..settings.config_manager import config
 from relay_d.utils.coloring_logger import logger
 from ...utils.custom_message_box import CustomMessageBox
 from ...utils.stream_builder import StreamBuilder
+from ...utils.default_configs import generate_default_configs
+from ..settings.config_manager import config
 
-from PyQt5.QtWidgets import QMainWindow, QApplication, QLabel, QTextEdit, QPushButton
-from PyQt5 import uic
-from PyQt5.QtCore import Qt
 from PyQt5.QtCore import QObject, pyqtSignal
-from PyQt5.QtWidgets import QFileDialog
+from PyQt5.QtWidgets import QFileDialog, QTabWidget, QVBoxLayout, QWidget
+
+from ..page_style import add_page_header
+from .builder.builder_page import BuilderPage
+from .builder.config_check import check_config
 
 
 # Create a signal manager class
@@ -34,19 +33,44 @@ class ConfigPage:
 
         # Setup all button connections
         self._setup_connections()
+        self._build_tabs()
 
-        # Connect to config changes
-        config.settings_changed.connect(self._on_settings_loaded)
+    def _build_tabs(self):
+        """Put the existing file view in a "Load / edit file" tab and add the "Build from ROS" tab next to it."""
+        layout = getattr(self.ui, "importPageLayout", None)
+        names = ("importHeaderWidget", "importSeparator", "txt_config_display", "metricsWidget")
+        if layout is None or not all(hasattr(self.ui, n) for n in names):
+            return  # a UI without the Config page widgets (tests)
+        file_tab = QWidget()
+        file_layout = QVBoxLayout(file_tab)
+        file_layout.setContentsMargins(0, 8, 0, 0)
+        file_layout.setSpacing(12)
+        for name in names:
+            widget = getattr(self.ui, name)
+            layout.removeWidget(widget)
+            file_layout.addWidget(widget)
+        self.builder = BuilderPage(
+            get_node=lambda: getattr(self.ui, "node", None),
+            get_tf_buffer=self._tf_buffer,
+            use_config=self.load_config_path,
+            current_config=lambda: self.yaml_parser.yaml_data if self.yaml_parser.is_loaded() else None,
+            dialog_dir=config.config_dialog_dir,
+        )
+        self.ui.importPageTitle.hide()  # the page title is now above the tabs, so both tabs share it
+        add_page_header(layout, "Configuration")
+        self.tabs = QTabWidget()
+        self.tabs.addTab(file_tab, "Load / edit file")
+        self.tabs.addTab(self.builder, "Build from ROS")
+        layout.addWidget(self.tabs, 1)
 
-    def _on_settings_loaded(self, settings):
-        """Handle settings changes via signal"""
-        # Config page doesn't need to react to many settings
-        # but we could refresh config preview or other things here
+    def _tf_buffer(self, tf_topic):
+        subscribers = getattr(getattr(self.ui, "page_record", None), "topic_subscribers", None)
+        try:
+            return subscribers._get_or_create_tf_buffer(tf_topic, "/tf_static") if subscribers else None
+        except Exception as e:
+            logger.warning(f"No TF buffer for {tf_topic}: {e}")
+            return None
 
-        if "hdf5_load_folder" in settings:
-            self.load_folder = settings["hdf5_load_folder"]
-            if self.load_folder and hasattr(self.ui, "lineEdit_hdf5_load_folder"):
-                self.ui.lineEdit_hdf5_load_folder.setText(self.load_folder)
 
     ## Connect all the buttons related with config page
     def _setup_connections(self):
@@ -56,6 +80,11 @@ class ConfigPage:
                 self.ui.btn_insert_config.clicked.connect(self.insert_config_file)
             else:
                 logger.error(f"No button btn_insert_config found.")
+
+            if hasattr(self.ui, "btn_generate_configs"):
+                self.ui.btn_generate_configs.clicked.connect(
+                    lambda: generate_default_configs(self.ui)
+                )
 
             if hasattr(self.ui, "btn_remove_config"):
                 self.ui.btn_remove_config.clicked.connect(self.remove_config_file)
@@ -81,8 +110,8 @@ class ConfigPage:
 
         try:
             fn, _ = QFileDialog.getOpenFileName(
-                parent=self.load_folder if self.load_folder else None,
                 caption="Open Config File",
+                directory=config.config_dialog_dir(),
                 filter="YAML files (*.yaml *.yml)",
             )
         except Exception as e:
@@ -92,8 +121,11 @@ class ConfigPage:
         if not fn:
             logger.error("The user did not select any file.")
             return
-        else:
-            logger.info(f"Loaded file {fn}.")
+        self.load_config_path(fn)
+
+    def load_config_path(self, fn):
+        """Load, validate and announce the config file ``fn`` (the Insert button, and "Save and use now" of the builder)."""
+        logger.info(f"Loaded file {fn}.")
 
         ## Parse the YAML file
         if not self.yaml_parser.load_yaml_file(fn):
@@ -136,6 +168,8 @@ class ConfigPage:
             CustomMessageBox.error(message)
             return
 
+        self._warn_about_problems()
+
         ## Send the signal to the signal_manager
         self.signal_manager.config_loaded.emit(fn)
         logger.debug(f"Emitted config_loaded signal with file path: {fn}")
@@ -145,6 +179,15 @@ class ConfigPage:
         logger.debug(f"Config file preview updated for file: {fn}")
 
         return
+
+    def _warn_about_problems(self):
+        """Show what the shared config check finds (undefined inputs, limits count, ...). Warnings only: configs written
+        by hand that worked before must still load."""
+        problems = check_config(self.yaml_parser.yaml_data)
+        if problems:
+            lines = [f"  {p.message}" for p in problems]
+            logger.warning("Config check:\n" + "\n".join(lines))
+            CustomMessageBox.warning("The config loaded, but the check found:\n" + "\n".join(lines[:8]) + (f"\n  ... and {len(lines) - 8} more (see the log)" if len(lines) > 8 else ""))
 
     def _validate_input_availability(self):
         """Check every configured input's topic/TF against the live ROS
@@ -197,6 +240,7 @@ class ConfigPage:
         return StreamBuilder(self.yaml_parser).get_build_errors()
 
     def remove_config_file(self):
+        """Unload the current config and tell the other pages (``config_cleared``)."""
 
         if not self.yaml_parser.current_config:
             logger.warning(f"There is no lodaded config to remove.")
@@ -206,6 +250,7 @@ class ConfigPage:
         logger.info(f"Removing config file")
 
         self.yaml_parser.clear()
+        self.yaml_parser.yaml_data = None  # else Post-process re-syncs the removed config
         self.clear_config_preview()
         ## Emit a signal to say the config is not loaded anymore
         self.signal_manager.config_cleared.emit()
@@ -254,10 +299,6 @@ class ConfigPage:
 
     def show_config_preview(self):
 
-        # First retrieve answer from yaml
-        yaml_str = self.yaml_parser.get_raw_yaml()
-
-        # Append the message
         if hasattr(self.ui, "txt_config_display"):
             self.clear_config_preview()
 

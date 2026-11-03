@@ -27,10 +27,7 @@ import argparse
 import subprocess
 import sys
 
-try:
-    import xmltodict
-except ImportError:
-    sys.exit("ERROR: xmltodict is required.  Install with: pip install xmltodict")
+from relay_d.acquisition.qt_app.ui.config.builder.urdf_limits import parse_joint_limits as _parse
 
 
 # ---------------------------------------------------------------------------
@@ -85,54 +82,14 @@ def _load_from_ros2(node_name: str = "robot_state_publisher",
 # ---------------------------------------------------------------------------
 
 def parse_joint_limits(xml_string: str, joint_filter: list | None = None) -> list:
-    """
-    Parse a URDF XML string and return a list of dicts for each
-    revolute / prismatic joint, in URDF document order (or joint_filter order).
-
-    Each dict:
-      name     : str
-      type     : str   ('revolute' | 'prismatic')
-      lower    : float  position lower limit (rad or m)
-      upper    : float  position upper limit
-      velocity : float  max velocity (always positive)
-      effort   : float  max effort (always positive)
-    """
+    """Same as the library function, but exits with a message on a bad URDF and warns about unknown joints."""
     try:
-        robot = xmltodict.parse(xml_string)["robot"]
-    except (KeyError, Exception) as exc:
-        sys.exit(f"ERROR: failed to parse URDF XML: {exc}")
-
-    raw_joints = robot.get("joint", [])
-    if not isinstance(raw_joints, list):
-        raw_joints = [raw_joints]
-
-    # Build name → data map
-    joint_map: dict = {}
-    for j in raw_joints:
-        jtype = j.get("@type", "")
-        if jtype not in ("revolute", "prismatic"):
-            continue
-        name = j.get("@name", "")
-        lim = j.get("limit", {}) or {}
-        joint_map[name] = {
-            "name": name,
-            "type": jtype,
-            "lower":    float(lim.get("@lower",    0.0)),
-            "upper":    float(lim.get("@upper",    0.0)),
-            "velocity": float(lim.get("@velocity", 0.0)),
-            "effort":   float(lim.get("@effort",   0.0)),
-        }
-
-    if joint_filter:
-        result = []
-        for jname in joint_filter:
-            if jname not in joint_map:
-                print(f"WARNING: joint '{jname}' not found in URDF (skipped)", file=sys.stderr)
-            else:
-                result.append(joint_map[jname])
-        return result
-
-    return list(joint_map.values())
+        joints = _parse(xml_string, joint_filter)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
+    for name in set(joint_filter or []) - {j["name"] for j in joints}:
+        print(f"WARNING: joint '{name}' not found in URDF (skipped)", file=sys.stderr)
+    return joints
 
 
 # ---------------------------------------------------------------------------

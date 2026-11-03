@@ -11,17 +11,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import h5py
+from relay_d.utils.ros_media_codec import cv2_to_imgmsg
 import numpy as np
 
-from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CompressedImage, JointState
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from std_msgs.msg import String, Float32, Float64, Int32, Bool
 
 from relay_d.utils.coloring_logger import logger
-
-# Groups under data/<demo_name>/ that are not "raw input" containers.
-_NON_INPUT_GROUPS = {"streams", "metadata", "gripper_states"}
+from .demo_validator import NON_INPUT_GROUPS
 
 _SIMPLE_MSG_CLASSES = {
     "string": String,
@@ -31,7 +29,6 @@ _SIMPLE_MSG_CLASSES = {
     "bool": Bool,
 }
 
-_cv_bridge = CvBridge()
 
 
 class ChannelKind(Enum):
@@ -227,7 +224,7 @@ class PlaybackChannel:
         # topic's encoding - reconstruct as bgr8, not the stored (original)
         # image_encoding attr.
         arr = np.asarray(self.group["images"][idx])
-        msg = _cv_bridge.cv2_to_imgmsg(arr, encoding="bgr8")
+        msg = cv2_to_imgmsg(arr, encoding="bgr8")
         msg.header.stamp = stamp
         msg.header.frame_id = self.frame_id or self.name
         return msg
@@ -290,7 +287,7 @@ class DemoPlaybackReader:
     def _scan_channels(self):
         channels = []
         for name, item in self.demo_group.items():
-            if name in _NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
+            if name in NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
                 continue
             channels.append(self._classify_group(name, item))
         return channels

@@ -1,4 +1,3 @@
-import os
 import yaml
 import re
 import html
@@ -27,8 +26,8 @@ class YamlParser:
         self.yaml_data = None
         self.yaml_config_data = []
         self.yaml_input_data = []
+        self.yaml_input_data_raw = {}
         self.yaml_output_data = []
-        self.yaml_topic_data = []
         self.yaml_streams_data = {}
         self.yaml_actions_to_extract = []
         self.current_config = {}
@@ -177,10 +176,6 @@ class YamlParser:
             parent_info = f" (parent: {item['parent']})" if "parent" in item else ""
             logger.info(f"  {item['name']}.{item['field']}: {item['source']}{parent_info}")
 
-        if self.yaml_topic_data:
-            logger.info("\n=== TOPIC TYPES ===")
-            for item in self.yaml_topic_data:
-                logger.info(f"  {item['name']}: {item['type']}")
 
     # ------------------------------------------------------------------
     # HTML / syntax highlighting
@@ -309,10 +304,6 @@ class YamlParser:
             logger.error(f"Error saving YAML file: {e}")
             return False
 
-    def save_specific_to_yaml(self, file_path=None, content=list):
-
-        return True
-
     def load_from_yaml_string(self, yaml_string):
         """Load YAML data from a string (used for editing)"""
         try:
@@ -331,10 +322,12 @@ class YamlParser:
         return bool(self.current_config)
 
     def clear(self):
+        """Reset the parsed lists. ``yaml_data`` and ``current_config`` are kept: this also
+        runs at the start of every load. To unload a config, reset those two as well."""
         self.yaml_config_data = []
         self.yaml_input_data = []
+        self.yaml_input_data_raw = {}
         self.yaml_output_data = []
-        self.yaml_topic_data = []
         self.yaml_streams_data = {}
         self.yaml_actions_to_extract = []
         self.prefix_path = ""
@@ -351,37 +344,14 @@ class YamlParser:
             return yaml.dump(self.yaml_data, default_flow_style=False)
         return ""
 
-    def get_config_data(self):
-        return self.yaml_config_data
-
     def get_input_data(self):
         return self.yaml_input_data
 
     def get_input_data_raw(self):
         return self.yaml_input_data_raw
 
-    def get_tf_data(self):
-        tf_data = []
-        for entry in self.yaml_input_data:
-            if entry.get("is_tf", False):
-                tf_data.append(
-                    {
-                        "name": entry["name"],
-                        "parent_frame": entry.get("parent_frame"),
-                        "child_frame": entry.get("child_frame"),
-                        "transfer_rate": entry.get("transfer_rate", -1),
-                    }
-                )
-        return tf_data
-
     def get_output_data(self):
         return self.yaml_output_data
-
-    def get_topic_data(self):
-        return self.yaml_topic_data
-
-    def get_prefix_path(self):
-        return self.prefix_path
 
     def get_dataset_name(self):
         return self.dataset_name
@@ -413,17 +383,17 @@ class YamlParser:
             if key not in ("streams", "prefix_path") and isinstance(value, str)
         }
 
-    def get_actions_to_extract(self) -> list:
-        return self.yaml_actions_to_extract
+    def get_train_model_name(self, options=None):
+        """Robomimic training-config model, default bc_rnn_gmm.
 
-    def get_input_by_name(self, name):
-        for entry in self.yaml_input_data:
-            if entry["name"] == name:
-                return entry
-        return None
+        Read from the postprocess options (`robomimic.training_model`) when given, else
+        from the legacy `config.training_model` key. Matches the
+        `robomimic_<model>_config.json` files shipped in postprocess_configs/.
+        """
+        from ..postprocess.postprocess_options import PostprocessOptions
 
-    def get_train_model_name(self):
-        return self.yaml_data['config']['training_model']
+        config = (self.yaml_data or {}).get("config") or {}
+        return (options or PostprocessOptions()).training_model(config)
 
     # This is for the action dispatcher
     def get_obs_config(self):
@@ -436,12 +406,13 @@ class YamlParser:
             key: {"source": path.split("/")[0]}
             for key, path in self.get_output_bridge_map().items()
         }
-        return {
-            "config": {
-                "sync":{
-                    "threshold": self.yaml_data['config']['sync_tolerance_sec'],
-                },
-                "input": self.get_input_data_raw(),
-                "observations": {**self.get_streams(), **bridge_obs},
-                },
-            }
+        obs_config = {
+            "input": self.get_input_data_raw(),
+            "observations": {**self.get_streams(), **bridge_obs},
+        }
+        # Omitting `sync` disables the timestamp-gap check (see obs_config_template.yaml),
+        # so only emit it when the acquisition config sets sync_tolerance_sec.
+        threshold = self.yaml_data["config"].get("sync_tolerance_sec")
+        if threshold is not None:
+            obs_config = {"sync": {"threshold": threshold}, **obs_config}
+        return {"config": obs_config}

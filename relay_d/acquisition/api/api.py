@@ -1,7 +1,4 @@
-import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import rclpy
 from threading import Thread, current_thread
@@ -12,9 +9,9 @@ from ..qt_app.ui.record.topic_subscribers import TopicSubscribers
 from ..qt_app.ui.record.data_recorder import DataRecorder
 from ..qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
 from ..qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
+from ..qt_app.ui.postprocess.postprocess_options import FORMAT_SUFFIX, PostprocessOptions
 from ..qt_app.ui.review.demo_validator import DemoValidator
 from relay_d.utils.coloring_logger import logger
-from ..qt_app.utils.demo_file_ops import delete_demo_file
 
 class ContainerAdapter:
     def __init__(self, data: dict):
@@ -27,7 +24,12 @@ class ContainerAdapter:
 
 
 class AppAPI:
-    def __init__(self, config_path: str, output_dir: Optional[str] = None):
+    def __init__(
+        self,
+        config_path: str,
+        output_dir: Optional[str] = None,
+        postprocess_config_path: Optional[str] = None,
+    ):
         self._rclpy_initialized = False
         try:
             rclpy.init()
@@ -42,16 +44,21 @@ class AppAPI:
         self._yaml_converter = YAMLDrivenConverter(self._config_loader)
         if config_path:
             self._yaml_converter.load_data_config(config_path)
+        # Format options for conversion: explicit path, else a postprocess_config.yaml
+        # next to the acquisition config, else defaults (legacy keys in the config still work).
+        options_path = postprocess_config_path or PostprocessOptions.find_sibling(config_path)
+        if options_path:
+            options, problems = PostprocessOptions.load(options_path)
+            if options is not None:
+                self._yaml_converter.options = options
+            else:
+                logger.error(f"Ignoring postprocess options {options_path}: {'; '.join(problems)}")
 
-        if output_dir is None:
-            output_dir = os.path.join(os.path.expanduser("~"), "lfd_recordings")
-
-        # Pass the output directory to the DataRecorder instance
-        self._base_output_dir = output_dir
+        # An explicit output_dir wins; otherwise the recorder reads the hdf5_save_folder setting when a session starts,
+        # so a changed setting applies to the next recording.
         self._data_recorder.output_directory = output_dir
         self._session_h5_files: list = []
         self._validator = DemoValidator()
-        self._last_validation_results: dict = {}
 
         self._spin_thread = None
         self._should_spin = False
@@ -85,10 +92,12 @@ class AppAPI:
             rclpy.spin_once(self._data_recorder, timeout_sec=0.0)
 
     def start_recording(self, demo_name: Optional[str] = None) -> bool:
-        self.demo_name_ = demo_name
-        return self._data_recorder.start_recording(
+        started = self._data_recorder.start_recording(
             self._topic_subscribers, demo_name, flush_stale_data=True
         )
+        if self._data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
+            self._session_h5_files.append(self._data_recorder.retried_file)
+        return started
 
     def pause_recording(self) -> bool:
         return self._data_recorder.pause_recording()
@@ -102,38 +111,31 @@ class AppAPI:
             file_path = self._data_recorder.h5_file_path
             self._session_h5_files.append(file_path)
             try:
-                self._last_validation_results[file_path] = self._validator.validate(file_path)
+                self._validator.validate(file_path)  # logs the result
             except Exception as e:
                 logger.error(f"Error validating recording: {e}")
         return result
-
-    def get_validation_result(self, file_path: str):
-        return self._last_validation_results.get(file_path)
-
-    def delete_recording(self, file_path: str) -> bool:
-        ok = delete_demo_file(file_path)
-        if ok:
-            if file_path in self._session_h5_files:
-                self._session_h5_files.remove(file_path)
-            self._last_validation_results.pop(file_path, None)
-        return ok
 
     def get_recording_status(self) -> dict:
         return {
             "is_recording": self._data_recorder.is_recording,
             "is_paused": self._data_recorder.is_paused,
+            "buffer_full": self._data_recorder.buffer_full,
             "file_path": self._data_recorder.h5_file_path,
             "samples": len(self._data_recorder.timestamps),
         }
 
-    def convert_recording_to_dataset(self) -> bool:
+    def convert_recording_to_dataset(self, output_format: str = "robomimic") -> bool:
+        """Convert this session's recordings. `output_format` is "robomimic" (one .h5
+        file) or "lerobot" (a LeRobotDataset v3.0 directory)."""
         try:
             if not self._session_h5_files:
                 logger.warning("No recordings in this session to convert.")
                 return False
-            output_path = os.path.join(self._data_recorder.recorded_data_dir, "combined_dataset.h5")
+            name = "combined_dataset" + FORMAT_SUFFIX[output_format] + ("" if output_format == "lerobot" else ".h5")
+            output_path = os.path.join(self._data_recorder.recorded_data_dir, name)
             success = self._yaml_converter.convert_multiple_files(
-                "robomimic", self._session_h5_files, output_path
+                output_format, self._session_h5_files, output_path
             )
             if success:
                 logger.info(
@@ -145,7 +147,19 @@ class AppAPI:
             logger.error(f"Error converting recording to dataset: {e}")
             return False
 
-    def shutdown(self):
+    def shutdown(self) -> bool:
+        """Save a running recording, convert the session and stop ROS. Returns False, and leaves everything
+        running, if a recording could not be saved: its samples are only in memory (fix the disk and call again)."""
+        if self._data_recorder.is_recording:  # its samples are only in memory: save them before converting
+            self.stop_recording()
+        if getattr(self._data_recorder, "_unsaved", False):
+            if not self._data_recorder.retry_save():
+                logger.error(
+                    f"Not shutting down: the last recording could not be saved to "
+                    f"{self._data_recorder.h5_file_path} and is still only in memory."
+                )
+                return False
+            self._session_h5_files.append(self._data_recorder.retried_file)
         self.convert_recording_to_dataset()
         self._should_spin = False
 
@@ -170,3 +184,4 @@ class AppAPI:
             self._topic_subscribers.close()
             if self._rclpy_initialized:
                 rclpy.shutdown()
+        return True

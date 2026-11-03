@@ -1,114 +1,74 @@
-import sys
+"""The shared `logger`: stdlib logging printing `<time> - <LEVEL> - <message>` to stdout.
+
+Colour is used on a terminal that supports it. The minimum level is INFO unless
+RELAYD_LOG_LEVEL is set, and can be changed at run time with `set_level()`.
+"""
+
+import logging
 import os
+import sys
 from datetime import datetime
-import inspect
+
+_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+_COLORS = {"DEBUG": "\033[36m", "INFO": "\033[32m", "WARNING": "\033[33m", "ERROR": "\033[31m", "CRITICAL": "\033[35m"}
 
 
-# Minimum level printed by every ColoredLogger instance (existing and
-# future) — checked live in _log(), not cached per-instance, so changing it
-# via set_level() takes effect everywhere immediately. Defaults to INFO
-# (suppressing DEBUG); override for a single run with RELAYD_LOG_LEVEL=DEBUG.
-_LEVELS = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40, "CRITICAL": 50}
-_min_level = _LEVELS.get(os.environ.get("RELAYD_LOG_LEVEL", "INFO").upper(), 20)
+def _supports_color() -> bool:
+    if not sys.stdout.isatty():
+        return False
+    term = os.environ.get("TERM", "").lower()
+    return any(t in term for t in ("color", "ansi", "xterm")) or os.environ.get("COLORTERM", "").lower() in (
+        "truecolor",
+        "24bit",
+        "yes",
+    )
+
+
+class _Formatter(logging.Formatter):
+    def format(self, record):
+        stamp = datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        level = f"{record.levelname:<8}"
+        if _supports_color():
+            level = f"{_COLORS.get(record.levelname, '')}{level}\033[0m"
+        text = f"{stamp} - {level} - {record.getMessage()}"
+        # an unencodable character must not lose the line
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        return text.encode(encoding, errors="replace").decode(encoding)
+
+
+class _StdoutHandler(logging.StreamHandler):
+    """Writes to whatever `sys.stdout` is at the time of each record (it may be redirected)."""
+
+    @property
+    def stream(self):
+        return sys.stdout
+
+    @stream.setter
+    def stream(self, _value):
+        pass
 
 
 def set_level(level: str) -> None:
-    """Set the minimum level printed by every ColoredLogger instance
-    (existing and future). One of: DEBUG, INFO, WARNING, ERROR, CRITICAL."""
-    global _min_level
+    """Set the minimum level printed. One of: DEBUG, INFO, WARNING, ERROR, CRITICAL."""
     name = str(level).upper()
     if name not in _LEVELS:
         raise ValueError(f"Unknown log level '{level}'. Use one of: {', '.join(_LEVELS)}")
-    _min_level = _LEVELS[name]
+    logger.setLevel(name)
 
 
-def get_level() -> str:
-    """Return the current minimum level printed, as its name."""
-    return next(name for name, val in _LEVELS.items() if val == _min_level)
+def apply_user_level() -> None:
+    """Level from RELAYD_LOG_LEVEL if set, else from the ``log_level`` user setting, else INFO."""
+    from relay_d.utils import user_settings
+
+    level = (os.environ.get("RELAYD_LOG_LEVEL") or user_settings.get("log_level", "INFO")).upper()
+    logger.setLevel(level if level in _LEVELS else "INFO")
 
 
-class ColoredLogger:
-    # ANSI color codes
-    COLORS = {
-        "DEBUG": "\033[36m",  # Cyan
-        "INFO": "\033[32m",  # Green
-        "WARNING": "\033[33m",  # Yellow
-        "ERROR": "\033[31m",  # Red
-        "CRITICAL": "\033[35m",  # Magenta
-        "RESET": "\033[0m",  # Reset color
-    }
-
-    def __init__(self, name=None):
-        if name is None:
-            # Get the name of the calling module
-            frame = inspect.currentframe().f_back
-            name = frame.f_globals.get("__name__", "unknown")
-        self.name = name
-
-        # Check if we're in a terminal that supports colors
-        self.use_colors = self._supports_color()
-
-    def _supports_color(self):
-        """Check if the terminal supports ANSI colors"""
-        if not hasattr(sys.stdout, "isatty") or not sys.stdout.isatty():
-            return False
-
-        # Check for common color-supporting terminals
-        term = os.environ.get("TERM", "").lower()
-        colorterm = os.environ.get("COLORTERM", "").lower()
-
-        return (
-            "color" in term
-            or "ansi" in term
-            or "xterm" in term
-            or colorterm in ("truecolor", "24bit", "yes")
-        )
-
-    def _log(self, level, message):
-        if _LEVELS.get(level, 20) < _min_level:
-            return
-
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-
-        if self.use_colors:
-            color = self.COLORS.get(level, "")
-            reset = self.COLORS["RESET"]
-            formatted_message = f"{timestamp} - {color}{level:<8}{reset} - {message}"
-        else:
-            formatted_message = f"{timestamp} - {level:<8} - {message}"
-
-        try:
-            print(formatted_message, file=sys.stdout)
-        except UnicodeEncodeError:
-            safe_message = formatted_message.encode("utf-8", errors="replace").decode(
-                "utf-8"
-            )
-            print(safe_message, file=sys.stdout)
-        sys.stdout.flush()
-
-    def debug(self, message):
-        self._log("DEBUG", str(message))
-
-    def info(self, message):
-        self._log("INFO", str(message))
-
-    def warning(self, message):
-        self._log("WARNING", str(message))
-
-    def warn(self, message):  # Alias for warning
-        self.warning(message)
-
-    def error(self, message):
-        self._log("ERROR", str(message))
-
-    def critical(self, message):
-        self._log("CRITICAL", str(message))
-
-
-# Create a default logger instance that can be imported directly
-logger = ColoredLogger()
-
-
-# Also provide a function to create named loggers if needed
-def get_logger(name):
-    return ColoredLogger(name)
+logger = logging.getLogger("relay_d")
+if not any(getattr(h, "relayd", False) for h in logger.handlers):  # importing twice must not double every line
+    _handler = _StdoutHandler()
+    _handler.relayd = True
+    _handler.setFormatter(_Formatter())
+    logger.addHandler(_handler)
+    logger.propagate = False
+    apply_user_level()

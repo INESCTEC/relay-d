@@ -16,10 +16,8 @@ or its upstream repository, not guessed from memory.
 | `h5py` | BSD-3-Clause | |
 | `opencv-python-headless` | Apache-2.0 | Packaging scripts (the `opencv-python` project itself) are MIT; the bundled OpenCV library is Apache-2.0 (OpenCV ≥4.5) |
 | `pyqt5` | **GPL-3.0** (or a paid Riverbank commercial license) | See ⚠️ note below |
-| `PyQt5-sip` | BSD-2-Clause | |
 | `pyqtgraph` | MIT | |
 | `xmltodict` | MIT | |
-| `scipy` | BSD-3-Clause | |
 
 ## Python — optional extra (`pip install ".[robomimic]"`)
 
@@ -31,8 +29,6 @@ or its upstream repository, not guessed from memory.
 
 | Package | License |
 |---|---|
-| `jurigged` | MIT |
-| `watchdog` | Apache-2.0 |
 
 ## ROS 2 (system, sourced from a ROS 2 Jazzy install — not pip-installable)
 

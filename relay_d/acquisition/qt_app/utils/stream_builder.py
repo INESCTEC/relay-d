@@ -241,9 +241,11 @@ class StreamBuilder:
         n = len(indices)
         filtered = _types.SimpleNamespace()
         filtered.name     = [names[i] for i in indices]
-        filtered.position = [msg.position[i] for i in indices] if msg.position else [0.0] * n
-        filtered.velocity = [msg.velocity[i] for i in indices] if msg.velocity else [0.0] * n
-        filtered.effort   = [msg.effort[i]   for i in indices] if msg.effort   else [0.0] * n
+        # An array not filled for every joint (e.g. no velocity) reads as zeros instead of raising IndexError.
+        full = len(names)
+        filtered.position = [msg.position[i] for i in indices] if len(msg.position) == full else [0.0] * n
+        filtered.velocity = [msg.velocity[i] for i in indices] if len(msg.velocity) == full else [0.0] * n
+        filtered.effort   = [msg.effort[i]   for i in indices] if len(msg.effort)   == full else [0.0] * n
         filtered.header   = msg.header
         return filtered
 
@@ -293,7 +295,7 @@ class StreamBuilder:
                         else:
                             v = float(val)
                             row.append(float(math_op(v)) if math_op is not None else v)
-                    except (AttributeError, TypeError):
+                    except (AttributeError, TypeError, IndexError, ValueError):  # e.g. a short joint array: hold the last row
                         ok = False
                         break
                 else:  # "binary": op_func(operand_a, operand_b), both scalars
@@ -315,7 +317,7 @@ class StreamBuilder:
                     msg_b = self.apply_joint_filter(in_b, msg_b)
                     try:
                         row.append(float(op_func(float(get_a(msg_a)), float(get_b(msg_b)))))
-                    except (AttributeError, TypeError):
+                    except (AttributeError, TypeError, IndexError, ValueError):  # e.g. a short joint array: hold the last row
                         ok = False
                         break
             buf = self._stream_buffers.setdefault(stream_name, [])

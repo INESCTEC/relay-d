@@ -1,6 +1,5 @@
 import os
 import glob
-import json
 from threading import Thread
 
 import cv2
@@ -27,14 +26,19 @@ from PyQt5.QtWidgets import (
     QRadioButton,
     QLineEdit,
     QProgressBar,
+    QComboBox,
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QColor, QBrush
 
+from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
+from ..page_style import add_page_header, page_layout
+from ..settings.config_manager import config
 from ...utils.custom_message_box import CustomMessageBox
 from ...utils.demo_file_ops import delete_demo_file
-from .demo_validator import DemoValidator, CheckStatus
+from .demo_validator import NON_INPUT_GROUPS, DemoValidator, CheckStatus
+from .lerobot_reader import LeRobotDataset, LeRobotError, is_lerobot_dataset
 
 _STATUS_COLORS = {
     CheckStatus.PASS: "#16A34A",
@@ -47,9 +51,6 @@ _STATUS_LABELS = {
     CheckStatus.WARN: "WARN",
     CheckStatus.FAIL: "FAIL",
 }
-
-# Groups under data/<demo_name>/ that are not "raw input" containers.
-_NON_INPUT_GROUPS = {"streams", "metadata", "gripper_states"}
 
 
 class ReviewPage:
@@ -66,6 +67,13 @@ class ReviewPage:
 
         self.session_dir = None
         self.demo_entries = {}  # file_path -> DemoValidationResult
+
+        # LeRobot (view-only) source: opened dataset, selected episode and its curves
+        self._sources = []  # [("h5", None) | ("lerobot", dataset_path)]
+        self._lerobot = None
+        self._lerobot_episode = None
+        self._lerobot_arrays = None
+        self._lerobot_checked = {}  # dataset path -> (info.json mtime, validation result, {episode: status})
 
         self._current_h5 = None
         self._current_demo_group = None
@@ -90,7 +98,12 @@ class ReviewPage:
 
     def _build_ui(self):
         page = self.ui.page_review
-        root_layout = QHBoxLayout(page)
+        outer = page_layout(page)
+        add_page_header(outer, "Review")
+        root_layout = QHBoxLayout()  # session list on the left, the tabs on the right
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(12)
+        outer.addLayout(root_layout, 1)
 
         # --- Sidebar: session picker + demo list ---
         sidebar = QWidget()
@@ -108,6 +121,12 @@ class ReviewPage:
         self.btn_refresh = QPushButton("Refresh")
         self.btn_refresh.clicked.connect(self.refresh_demo_list)
         sidebar_layout.addWidget(self.btn_refresh)
+
+        self.combo_source = QComboBox()
+        self.combo_source.setToolTip("Recorded demos (.h5) or a LeRobot dataset found in this folder")
+        self.combo_source.currentIndexChanged.connect(self._on_source_changed)
+        self.combo_source.setVisible(False)
+        sidebar_layout.addWidget(self.combo_source)
 
         self.list_demos = QListWidget()
         self.list_demos.currentItemChanged.connect(self._on_demo_selected)
@@ -150,6 +169,10 @@ class ReviewPage:
 
         self.image_page = QWidget()
         layout_image = QVBoxLayout(self.image_page)
+        self.combo_camera = QComboBox()  # LeRobot datasets can have several cameras
+        self.combo_camera.currentIndexChanged.connect(lambda _i: self._show_frame(self.slider_scrub.value()))
+        self.combo_camera.setVisible(False)
+        layout_image.addWidget(self.combo_camera)
         self.label_image = QLabel("No image data")
         self.label_image.setAlignment(Qt.AlignCenter)
         self.label_image.setMinimumHeight(300)
@@ -186,7 +209,7 @@ class ReviewPage:
         self.widget_urdf_file_row = QWidget()
         file_row_layout = QHBoxLayout(self.widget_urdf_file_row)
         file_row_layout.setContentsMargins(20, 0, 0, 0)
-        self.edit_urdf_path = QLineEdit()
+        self.edit_urdf_path = QLineEdit(user_settings.get("review_last_robot_description"))  # remembered
         file_row_layout.addWidget(self.edit_urdf_path, 1)
         btn_browse_urdf = QPushButton("Browse...")
         btn_browse_urdf.clicked.connect(self._browse_urdf_file)
@@ -207,7 +230,9 @@ class ReviewPage:
 
         frame_row = QHBoxLayout()
         frame_row.addWidget(QLabel("Fixed frame:"))
-        self.edit_fixed_frame = QLineEdit("base_link")
+        self._fixed_frame_default = user_settings.get("review_default_fixed_frame")
+        self.edit_fixed_frame = QLineEdit(self._fixed_frame_default)
+        config.settings_changed.connect(self._on_settings_changed)
         frame_row.addWidget(self.edit_fixed_frame, 1)
         layout.addLayout(frame_row)
 
@@ -263,9 +288,7 @@ class ReviewPage:
         if not session_dir:
             session_dir = self.session_dir
 
-        if not session_dir and self.settings_page is not None and hasattr(
-            self.settings_page, "get_hdf5_save_folder"
-        ):
+        if not session_dir and self.settings_page is not None:
             session_dir = self.settings_page.get_hdf5_save_folder() or None
 
         if session_dir:
@@ -282,18 +305,75 @@ class ReviewPage:
             self.refresh_demo_list()
 
     def refresh_demo_list(self):
+        """Look for recorded demos and LeRobot datasets in the session folder and list the first source."""
+        self._close_current_file()
+        self._close_lerobot()
         self.list_demos.clear()
         self.demo_entries = {}
-        self._close_current_file()
+        self._sources = []
 
         if not self.session_dir or not os.path.isdir(self.session_dir):
             self.label_session.setText("No session selected")
+            self._update_source_combo()
             return
 
+        if glob.glob(os.path.join(self.session_dir, "*.h5")):
+            self._sources.append(("h5", None))
+        for path in self._find_lerobot_datasets(self.session_dir):
+            self._sources.append(("lerobot", path))
+        self._update_source_combo()
+        self.label_session.setText(f"Session: {self.session_dir}")
+        self._populate_list()
+
+    @staticmethod
+    def _find_lerobot_datasets(folder):
+        """The folder itself if it is a LeRobot dataset, else its child folders that are."""
+        if is_lerobot_dataset(folder):
+            return [folder]
+        children = sorted(os.path.join(folder, d) for d in os.listdir(folder))
+        return [c for c in children if os.path.isdir(c) and is_lerobot_dataset(c)]
+
+    def _update_source_combo(self):
+        self.combo_source.blockSignals(True)
+        self.combo_source.clear()
+        for kind, path in self._sources:
+            self.combo_source.addItem("Recorded demos (.h5)" if kind == "h5" else f"LeRobot: {os.path.basename(path)}")
+        self.combo_source.blockSignals(False)
+        self.combo_source.setVisible(len(self._sources) > 1)
+
+    def _on_source_changed(self, _index):
+        self._close_current_file()
+        self._close_lerobot()
+        self._populate_list()
+
+    def _current_source(self):
+        i = self.combo_source.currentIndex()
+        return self._sources[i] if 0 <= i < len(self._sources) else ("h5", None)
+
+    def _set_mode(self, lerobot: bool):
+        """LeRobot datasets are view-only: no delete, no ROS playback."""
+        self.btn_delete.setEnabled(not lerobot)
+        self.btn_delete.setToolTip("LeRobot datasets are view-only here" if lerobot else "")
+        self.tab_widget.setTabEnabled(1, not lerobot)
+        self.tab_widget.setTabToolTip(1, "Playback needs recorded .h5 demos" if lerobot else "")
+        if lerobot:
+            self.tab_widget.setCurrentIndex(0)
+        self.combo_camera.setVisible(lerobot)
+
+    def _populate_list(self):
+        self.list_demos.clear()
+        kind, dataset_path = self._current_source()
+        self._set_mode(kind == "lerobot")
+        if kind == "lerobot":
+            self._populate_lerobot(dataset_path)
+            return
+
+        self.text_validation.clear()
         paths = sorted(
             p
             for p in glob.glob(os.path.join(self.session_dir, "*.h5"))
-            if os.path.basename(p) != "combined_dataset.h5"
+            # a robomimic dataset written into the session (AppAPI) is not a recorded demo; combined_dataset.h5 is the old name
+            if not os.path.basename(p).endswith("_Robomimic.h5") and os.path.basename(p) != "combined_dataset.h5"
         )
 
         for path in paths:
@@ -318,14 +398,97 @@ class ReviewPage:
             self.label_session.setText(f"Session: {self.session_dir} (no demos found)")
 
     # ------------------------------------------------------------------
+    # LeRobot datasets (view-only)
+    # ------------------------------------------------------------------
+
+    def _populate_lerobot(self, path):
+        try:
+            self._lerobot = LeRobotDataset(path)
+            episodes = self._lerobot.episodes()
+        except LeRobotError as e:
+            logger.error(f"Cannot open LeRobot dataset {path}: {e}")
+            self.text_validation.setPlainText(str(e))
+            return
+        info_mtime = os.path.getmtime(os.path.join(path, "meta", "info.json"))
+        cached = self._lerobot_checked.get(path)
+        if cached is None or cached[0] != info_mtime:
+            result = self._lerobot.validate()
+            statuses = {e.index: self._lerobot.episode_check(e) for e in episodes}
+            cached = self._lerobot_checked[path] = (info_mtime, result, statuses)
+        _, result, statuses = cached
+        self.text_validation.setPlainText(
+            self._lerobot.summary() + f"\n\nChecks: {_STATUS_LABELS[result.overall_status]}\n" + result.summary_text()
+        )
+        for ep in episodes:
+            status = statuses[ep.index]
+            item = QListWidgetItem(f"[{_STATUS_LABELS[status]}] {ep.label}")
+            item.setData(Qt.UserRole, ("lerobot", ep.index))
+            item.setForeground(QBrush(QColor(_STATUS_COLORS[status])))
+            self.list_demos.addItem(item)
+
+        self.combo_camera.blockSignals(True)
+        self.combo_camera.clear()
+        self.combo_camera.addItems(self._lerobot.camera_keys)
+        self.combo_camera.blockSignals(False)
+
+    def _close_lerobot(self):
+        if self._lerobot is not None:
+            self._lerobot.close()
+        self._lerobot = None
+        self._lerobot_episode = None
+        self._lerobot_arrays = None
+
+    def load_lerobot_episode(self, index):
+        self._close_current_file()
+        ds = self._lerobot
+        episode = next((e for e in ds.episodes() if e.index == index), None) if ds else None
+        if episode is None:
+            return
+        try:
+            self._lerobot_arrays = ds.arrays(episode)
+        except LeRobotError as e:
+            logger.error(f"Cannot read episode {index}: {e}")
+            self.label_image.setText(str(e))
+            return
+        self._lerobot_episode = episode
+        channels = []
+        if ds.camera_keys:
+            channels.append(("image", None, "Image"))
+        for key in ("observation.state", "action"):
+            if key in self._lerobot_arrays:
+                channels.append(("lerobot", key, f"{key}\n({episode.length}x{self._lerobot_arrays[key].shape[1]})"))
+        self.slider_scrub.setMaximum(max(episode.length - 1, 0))
+        self.slider_scrub.setValue(0)
+        self._show_frame(0)
+        self._populate_channel_buttons(channels)
+
+    def _render_lerobot_plot(self, key):
+        arrays, ds = self._lerobot_arrays, self._lerobot
+        t, data = arrays["time"], arrays[key]
+        step = max(1, -(-len(t) // int(user_settings.get("review_plot_max_points"))))  # decimate long episodes
+        names = ds.names(key)
+        plot = pg.PlotWidget(title=key)
+        plot.setLabel("bottom", "time", units="s")
+        plot.addLegend()
+        for i in range(data.shape[1]):
+            plot.plot(t[::step], data[::step, i], pen=pg.intColor(i, hues=max(data.shape[1], 1)),
+                      name=names[i] if i < len(names) else f"{key}[{i}]")
+        self._add_playback_cursor(plot)
+        self._playback_cursor_line.setPos(t[min(self.slider_scrub.value(), len(t) - 1)])
+        self.layout_display_graph.addWidget(plot)
+
+    # ------------------------------------------------------------------
     # Demo loading / playback
     # ------------------------------------------------------------------
 
     def _on_demo_selected(self, current, previous):
         if current is None:
             return
-        path = current.data(Qt.UserRole)
-        self.load_demo(path)
+        data = current.data(Qt.UserRole)
+        if isinstance(data, (tuple, list)):  # ("lerobot", episode_index)
+            self.load_lerobot_episode(data[1])
+        else:
+            self.load_demo(data)
 
     def load_demo(self, path):
         self._close_current_file()
@@ -364,6 +527,8 @@ class ReviewPage:
         self._current_demo_group = None
         self._current_image_dataset = None
         self._current_image_kind = None
+        self._lerobot_episode = None
+        self._lerobot_arrays = None
         self.slider_scrub.setMaximum(0)
         self.label_image.setText("No image data")
         self.label_frame_index.setText("Frame 0 / 0")
@@ -387,7 +552,7 @@ class ReviewPage:
     def _find_input_group(self, demo_group, dataset_key, name_hints=None):
         candidates = []
         for name, item in demo_group.items():
-            if name in _NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
+            if name in NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
                 continue
             if dataset_key in item:
                 candidates.append((name, item))
@@ -427,8 +592,6 @@ class ReviewPage:
         self.channel_buttons = []
 
     def _build_channel_matrix(self, demo_group):
-        self._clear_channel_matrix()
-
         channels = []
         if self._gripper_state_keys(demo_group):
             channels.append(("gripper", None, "Gripper"))
@@ -438,7 +601,10 @@ class ReviewPage:
             for name in sorted(demo_group["streams"].keys()):
                 shape_text = "x".join(str(d) for d in demo_group["streams"][name].shape)
                 channels.append(("stream", name, f"{name}\n({shape_text})"))
+        self._populate_channel_buttons(channels)
 
+    def _populate_channel_buttons(self, channels):
+        self._clear_channel_matrix()
         columns = 3
         for i, (kind, name, label) in enumerate(channels):
             btn = QPushButton(label)
@@ -469,6 +635,11 @@ class ReviewPage:
 
         self.display_stack.setCurrentWidget(self.graph_page)
         self._clear_layout(self.layout_display_graph)
+
+        if kind == "lerobot":
+            if self._lerobot_arrays is not None:
+                self._render_lerobot_plot(name)
+            return
 
         demo_group = self._current_demo_group
         if demo_group is None:
@@ -546,8 +717,14 @@ class ReviewPage:
 
     def _on_scrub(self, value):
         self._show_frame(value)
+        if self._lerobot_arrays is not None and self._playback_cursor_line is not None:
+            t = self._lerobot_arrays["time"]
+            self._playback_cursor_line.setPos(t[min(value, len(t) - 1)])
 
     def _show_frame(self, index):
+        if self._lerobot_episode is not None:
+            self._show_lerobot_frame(index)
+            return
         if self._current_image_dataset is None:
             return
         count = self._current_image_dataset.shape[0]
@@ -573,9 +750,26 @@ class ReviewPage:
         except Exception as e:
             logger.error(f"Error showing frame {index}: {e}")
 
+    def _show_lerobot_frame(self, index):
+        ep, ds = self._lerobot_episode, self._lerobot
+        camera = self.combo_camera.currentText()
+        if not camera:
+            self.label_image.setText("This dataset has no camera")
+            return
+        index = max(0, min(index, ep.length - 1))
+        try:
+            self._display_rgb_frame(ds.frame(ep, camera, index))
+            self.label_frame_index.setText(f"Frame {index} / {ep.length - 1}   ({index / ds.fps:.2f} s)")
+        except (LeRobotError, IndexError) as e:
+            logger.error(f"Error showing frame {index}: {e}")
+            self.label_image.setText(str(e))
+
     def _display_cv_frame(self, cv_image):
-        height, width = cv_image.shape[:2]
-        rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+        self._display_rgb_frame(cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB))
+
+    def _display_rgb_frame(self, rgb_image):
+        rgb_image = np.ascontiguousarray(rgb_image)
+        height, width = rgb_image.shape[:2]
         bytes_per_line = 3 * width
         qt_image = QImage(
             rgb_image.data, width, height, bytes_per_line, QImage.Format_RGB888
@@ -600,7 +794,9 @@ class ReviewPage:
             return
 
         path = item.data(Qt.UserRole)
-        confirmed = CustomMessageBox.question(
+        if isinstance(path, (tuple, list)):  # a LeRobot episode: view-only
+            return
+        confirmed = not user_settings.get("confirm_destructive") or CustomMessageBox.question(
             f"Permanently delete this demo?\n\n{os.path.basename(path)}",
             title="Delete Demo",
         )
@@ -610,9 +806,7 @@ class ReviewPage:
         self._close_current_file()
 
         if delete_demo_file(path):
-            if self.record_page is not None and hasattr(
-                self.record_page, "remove_session_file"
-            ):
+            if self.record_page is not None:
                 self.record_page.remove_session_file(path)
             self.refresh_demo_list()
         else:
@@ -631,6 +825,16 @@ class ReviewPage:
         is_file_mode = self.radio_urdf_file.isChecked()
         self.widget_urdf_file_row.setVisible(is_file_mode)
         self.widget_robot_desc_topic_row.setVisible(not is_file_mode)
+
+    def _on_settings_changed(self, values):
+        """The fixed frame follows its setting, unless the user typed another one here."""
+        new = values.get("review_default_fixed_frame")
+        try:
+            if new is not None and self.edit_fixed_frame.text() == self._fixed_frame_default:
+                self.edit_fixed_frame.setText(new)
+        except RuntimeError:  # widget deleted
+            return
+        self._fixed_frame_default = new
 
     def _browse_urdf_file(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -691,6 +895,7 @@ class ReviewPage:
             except RobotDescriptionError as e:
                 CustomMessageBox.error(str(e), title="Robot Description Error")
                 return
+            config.save_settings({"review_last_robot_description": urdf_path})  # the one of the last playback
             self._launch_playback(demo_path, urdf_xml)
         else:
             self._resolve_topic_then_launch(demo_path)
@@ -709,7 +914,7 @@ class ReviewPage:
             )
 
             try:
-                result_holder["urdf"] = resolve_from_topic(topic, timeout_sec=5.0)
+                result_holder["urdf"] = resolve_from_topic(topic, timeout_sec=float(user_settings.get("review_urdf_timeout_s")))
             except RobotDescriptionError as e:
                 result_holder["error"] = str(e)
 
@@ -743,7 +948,7 @@ class ReviewPage:
         )
         from .data_player import DataPlayer
 
-        fixed_frame = self.edit_fixed_frame.text().strip() or "base_link"
+        fixed_frame = self.edit_fixed_frame.text().strip() or user_settings.get("review_default_fixed_frame")
 
         if self._player is None:
             self._player = DataPlayer(
@@ -797,7 +1002,7 @@ class ReviewPage:
         self.btn_play.setEnabled(False)
         self.btn_pause.setEnabled(True)
         self.btn_stop.setEnabled(True)
-        self._playback_progress_timer.start(150)
+        self._playback_progress_timer.start(int(user_settings.get("review_playback_tick_ms")))
 
     def _on_pause_clicked(self):
         if self._player is None:
@@ -839,25 +1044,19 @@ class ReviewPage:
         """Full teardown: stop publishing, reset to frame 0, close rviz2 and
         robot_state_publisher. Safe to call even if playback was never started.
         """
-        if getattr(self, "_playback_progress_timer", None) is not None:
-            self._playback_progress_timer.stop()
+        self._playback_progress_timer.stop()
         if self._player is not None:
             self._player.close()
         if self._process_manager is not None:
             self._process_manager.stop()
 
-        if hasattr(self, "progress_bar"):
-            self.progress_bar.setRange(0, 1)
-            self.progress_bar.setValue(0)
-        if hasattr(self, "label_playback_progress"):
-            self.label_playback_progress.setText("Frame 0 / 0")
-        if hasattr(self, "label_channel_summary"):
-            self.label_channel_summary.setText("")
-        if hasattr(self, "label_playback_status"):
-            self.label_playback_status.setText("")
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(0)
+        self.label_playback_progress.setText("Frame 0 / 0")
+        self.label_channel_summary.setText("")
+        self.label_playback_status.setText("")
 
         self._set_playback_controls_locked(False)
-        if hasattr(self, "btn_play"):
-            self.btn_play.setEnabled(True)
-            self.btn_pause.setEnabled(False)
-            self.btn_stop.setEnabled(False)
+        self.btn_play.setEnabled(True)
+        self.btn_pause.setEnabled(False)
+        self.btn_stop.setEnabled(False)

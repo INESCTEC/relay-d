@@ -43,6 +43,11 @@
 #   limits            list[dict]     required if denormalizing. {lower_lim, upper_lim} per index, or 1 entry to broadcast
 #   transform         dict           optional.  one of: scale / threshold / clip / vacuum / magnetic / euler_to_quat
 #                                                (see TRANSFORMS section below)
+#   stop              list[float]    optional, command and topic entries.  values sent ONCE when inference stops
+#                                                sending (inputs stale, model error, Ctrl+C, exit), e.g. [0, 0, 0] for a
+#                                                velocity: a controller without a watchdog keeps the last command. Real-world
+#                                                values fed straight to mapping / {I[n]} (no limits, no transform). An action
+#                                                entry cannot have one (cancel its goal on the server instead).
 #
 #   -- then pick exactly ONE dispatch method --
 #   command                                 METHOD 1.  shell string, {I[0]}, {I[1]}, ... substituted, run via subprocess
@@ -166,6 +171,8 @@ actions:
   #                                           # reached: true bool check
   #     timeout: 15.0
   #     on_timeout: warn
+  #   dedupe: false                          # topic entries are published every tick;
+  #                                           # true = skip when the value is unchanged
 
   robotiq_gripper:
     indices: [7]
@@ -181,7 +188,7 @@ actions:
       force: 100
       velocity: 100
     mapping:
-      position: 7
+      position: 0                         # slice index: indices [7] gives a 1-value slice
 
   # Same as robotiq_gripper, but blocking dispatch() until the gripper skill
   # itself confirms completion — illustrative; adjust success_field/
@@ -203,7 +210,7 @@ actions:
   #     force: 100
   #     velocity: 100
   #   mapping:
-  #     position: 7
+  #     position: 0
   #   feedback:
   #     source: result                       # or "feedback" if this server
   #                                           # only ever signals completion
@@ -304,36 +311,15 @@ actions:
   # them with "goal." (the goal object IS the mapping root, same as topic
   # dispatch's message root).
   #
-  # NOTE: for simple one-shot goals, the `command`-based
-  # `ros2 action send_goal ...` form (see DISPATCH METHOD 1 above) is often
-  # simpler and is what this repo's own gripper actions use in practice —
-  # native action: true dispatch is worth it mainly when you need persistent
-  # goal-handle/feedback tracking across ticks.
+  # Worked example: the ACTIVE robotiq_gripper entry at the top. The Goal is
+  # {string mode, uint8 force, uint8 position, uint8 velocity}: mode / force /
+  # velocity are constants (goal_init, set as written); only `position` comes
+  # from the model (mapping). A mapped value is cast to the type of the field
+  # it fills, so integer fields such as uint8 work.
   #
-  # Worked example — RobotiqGripperSkill's Goal is {string mode, uint8 force,
-  # uint8 position, uint8 velocity}. `mode`/`force`/`velocity` are fixed
-  # constants every tick, so they belong in goal_init (set AS-IS, no float
-  # coercion); only `position` comes from the model, so it's the one mapping
-  # entry. CAVEAT: mapping always does float(value) before setattr, and
-  # ROS2's generated uint8 setters reject a float outright — the failure is
-  # only logged, not raised, so `position` would silently stay 0. This is
-  # exactly why the ACTIVE robotiq_gripper entry above uses `command:`
-  # instead — prefer that form for any action whose Goal has integer fields.
-  # skill_via_action:
-  #   indices: [7]
-  #   denormalize: true
-  #   normalized_range: [-1.0, 1.0]
-  #   limits:
-  #     - {lower_lim: 0.0, upper_lim: 255.0}
-  #   action: true
-  #   action_type: robotiq_gripper_skill_msgs/action/RobotiqGripperSkill
-  #   topic: /RobotiqGripperSkill
-  #   goal_init:
-  #     mode: "BASIC"
-  #     force: 100
-  #     velocity: 100
-  #   mapping:
-  #     position: 0
+  # For simple one-shot goals the `command` form (METHOD 1:
+  # `ros2 action send_goal ...`) is also fine; use `action: true` when you
+  # need to know that the goal was accepted / finished (see `feedback`).
 
 
   # ===========================================================================
@@ -347,7 +333,8 @@ actions:
   #
   # Key differences from `mapping`:
   #   - goal_init values are set AS-IS (string/bool/int/float/list all work).
-  #   - mapping values are always coerced to float (they come from the model).
+  #   - mapping values come from the model and are cast to the type of the field they fill
+  #     (float, int or bool).
   #
   # ARRAY PRE-ALLOCATION:
   #   A bare top-level key (no dots, no brackets) with a plain int value
@@ -369,68 +356,15 @@ actions:
   #     "transforms[0].header.frame_id":     "base"
   #     "transforms[0].child_frame_id":      "robotiq_tcp"
   #
-  # ---------------------------------------------------------------------------
-  # Worked example — production pattern (see config/action_config.yaml's real
-  # move_eef entry). Model outputs 7 raw pose deltas that are ALREADY in the
-  # units the robot interface expects, so limits/denormalize are omitted
-  # entirely — they aren't required.
-  # ---------------------------------------------------------------------------
-  # move_eef:
-  #   indices: [0, 1, 2, 3, 4, 5, 6]        # x, y, z, qx, qy, qz, qw deltas
-  #   denormalize: false                    # no limits -> nothing to denormalize
-  #   msg_type: my_arm_interface/msg/ArmCommand
-  #   topic: /arm_interface/streaming_command
-  #   goal_init:
-  #     use_delta: true
-  #     speed: 12.0
-  #     acceleration: 0.6
-  #     blending: 0.0
-  #     duration: 0.0
-  #     transforms: 1                              # pre-allocate 1 TransformStamped
-  #     "transforms[0].header.frame_id": "base"
-  #     "transforms[0].child_frame_id": "robotiq_tcp"
-  #   mapping:
-  #     "transforms[0].transform.translation.x": 0
-  #     "transforms[0].transform.translation.y": 1
-  #     "transforms[0].transform.translation.z": 2
-  #     "transforms[0].transform.rotation.x":    3
-  #     "transforms[0].transform.rotation.y":    4
-  #     "transforms[0].transform.rotation.z":    5
-  #     "transforms[0].transform.rotation.w":    6
-
-  # ---------------------------------------------------------------------------
-  # Alternative to move_eef — JOINT-SPACE control via ArmCommand.joint_trajectory
-  # ---------------------------------------------------------------------------
-  # Same message/topic as move_eef above, for models that output 7 joint
-  # positions (or deltas) directly instead of a Cartesian pose delta.
-  # `transforms` and `joint_trajectory` are mutually exclusive on this
-  # message — leave whichever one you're not using untouched; an array field
-  # that's never referenced in goal_init/mapping is simply left empty, which
-  # is exactly what the message expects for the unused trajectory type.
+  # Both ACTIVE entries at the top (move_eef, move_arm_joint) use this pattern. They target the same
+  # ArmCommand message: `transforms` (Cartesian pose) and `joint_trajectory` (joint space) are mutually
+  # exclusive, leave the one you do not use untouched.
   #
   # FIELD-PATH GOTCHA: joint_trajectory IS the array itself (a
-  # trajectory_msgs/JointTrajectoryPoint[] directly on ArmCommand) — there is
-  # no intermediate JointTrajectory.points[] wrapper. So goal_init pre-
-  # allocates ONE JointTrajectoryPoint the same way `transforms: 1` does
-  # above, and mapping sets all 7 of its `.positions` values in a SINGLE
-  # list-valued entry (see the list-valued mapping note under DISPATCH
-  # METHOD 2) rather than 7 separate bracket-indexed scalar entries.
-  # ---------------------------------------------------------------------------
-  # move_arm_joint:
-  #   indices: [0, 1, 2, 3, 4, 5, 6]        # 7 iiwa joint positions (or deltas)
-  #   denormalize: false                    # set true + add limits if the model
-  #                                          # outputs normalized joint values instead
-  #   msg_type: kuka_iiwa_arm_sim_interface/msg/ArmCommand
-  #   topic: /kuka_iiwa_arm_interface/streaming_command
-  #   goal_init:
-  #     use_delta: true                     # false if positions are absolute targets
-  #     speed: 12.0
-  #     acceleration: 0.6
-  #     blending: 0.0
-  #     duration: 0.0
-  #     joint_trajectory: 1                 # pre-allocate 1 JointTrajectoryPoint
-  #   mapping:
-  #     "joint_trajectory[0].positions": [0, 1, 2, 3, 4, 5, 6]
+  # trajectory_msgs/JointTrajectoryPoint[] directly on ArmCommand), there is no
+  # JointTrajectory.points[] wrapper. goal_init pre-allocates ONE point
+  # (`joint_trajectory: 1`) and mapping sets all its `.positions` in a single
+  # list-valued entry (see the list-valued mapping note under DISPATCH METHOD 2).
 
 
   # ===========================================================================
@@ -475,6 +409,7 @@ actions:
   #     out_min: -0.1
   #     out_max:  0.1
   #   command: "ros2 topic pub -1 /cmd_vel ... \"{I[0]}, {I[1]}, {I[2]}\""
+  #   stop: [0.0, 0.0, 0.0]   # sent once when inference stops: the base must not keep the last velocity
 
   # Example: clip transform
   # safe_velocity:
@@ -590,62 +525,13 @@ actions:
   #     pose.orientation.z: 5
   #     pose.orientation.w: 6
 
-  # ---------------------------------------------------------------------------
-  # Example B — model outputs [x, y, z, roll, pitch, yaw, gripper] (7 values).
-  #             gripper is index 6 in the model but index 7 after the splice.
-  #             Result: [x, y, z, qx, qy, qz, qw, gripper]  (7 in → 8 out)
-  # ---------------------------------------------------------------------------
-  # eef_pose_plus_gripper:
-  #   indices: [0, 1, 2, 3, 4, 5, 6]       # x, y, z, roll, pitch, yaw, gripper
-  #   denormalize: true
-  #   normalized_range: [-1.0, 1.0]
-  #   limits:
-  #     - {lower_lim: -0.8,    upper_lim:  0.8}     # x
-  #     - {lower_lim: -0.8,    upper_lim:  0.8}     # y
-  #     - {lower_lim:  0.0,    upper_lim:  0.8}     # z
-  #     - {lower_lim: -3.1416, upper_lim:  3.1416}  # roll
-  #     - {lower_lim: -1.5708, upper_lim:  1.5708}  # pitch
-  #     - {lower_lim: -3.1416, upper_lim:  3.1416}  # yaw
-  #     - {lower_lim:  0.0,    upper_lim:  0.08}    # gripper (metres)
-  #   transform:
-  #     type: euler_to_quat
-  #     euler_start: 3      # gripper was model-index 6, result-index 7 after splice
-  #   topic: /target_pose
-  #   msg_type: geometry_msgs/msg/PoseStamped
-  #   frame_id: base
-  #   mapping:
-  #     pose.position.x:    0
-  #     pose.position.y:    1
-  #     pose.position.z:    2
-  #     pose.orientation.x: 3
-  #     pose.orientation.y: 4
-  #     pose.orientation.z: 5
-  #     pose.orientation.w: 6
-  #   # dispatch gripper separately in its own action entry using indices: [6]
-
-  # ---------------------------------------------------------------------------
-  # Example C — model outputs only [roll, pitch, yaw] (pure rotation, no position).
-  #             Result: [qx, qy, qz, qw]  (3 in → 4 out)
-  # ---------------------------------------------------------------------------
-  # eef_rotation_only:
-  #   indices: [3, 4, 5]                   # roll, pitch, yaw only
-  #   denormalize: true
-  #   normalized_range: [-1.0, 1.0]
-  #   limits:
-  #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # roll
-  #     - {lower_lim: -1.5708, upper_lim: 1.5708}   # pitch
-  #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # yaw
-  #   transform:
-  #     type: euler_to_quat
-  #     euler_start: 0      # entire slice is the Euler trio → result is [qx,qy,qz,qw]
-  #   topic: /target_orientation
-  #   msg_type: geometry_msgs/msg/QuaternionStamped
-  #   frame_id: base
-  #   mapping:
-  #     quaternion.x: 0
-  #     quaternion.y: 1
-  #     quaternion.z: 2
-  #     quaternion.w: 3
+  # Other layouts of the same transform:
+  #   - values after the Euler trio (e.g. a gripper at index 6) are kept but
+  #     shift by +1 (6 -> 7); give them their own entry with the model index
+  #     (indices: [6]) or map them by their shifted position.
+  #   - a slice that is only [roll, pitch, yaw] uses euler_start: 0 and gives
+  #     [qx, qy, qz, qw] (e.g. msg_type geometry_msgs/msg/QuaternionStamped,
+  #     mapping quaternion.x ... quaternion.w: 0..3).
 
   # ---------------------------------------------------------------------------
   # QUATERNION -> EULER  (TF/sensor provides quat, model expects roll/pitch/yaw)

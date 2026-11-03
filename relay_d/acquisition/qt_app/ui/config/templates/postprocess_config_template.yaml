@@ -1,0 +1,113 @@
+# =============================================================================
+# Postprocess options — conversion choices that are NOT part of what gets recorded
+# =============================================================================
+# Optional. Keep this file next to your acquisition config as
+# `postprocess_config.yaml` (it is picked up automatically) or load it with
+# "Load Options..." on the Post-process page. Any key left out falls back to the
+# same key inside the acquisition config (deprecated) and then to a default.
+# The acquisition config itself only says what to record and how streams/actions
+# are built; nothing in here changes the recording.
+# =============================================================================
+
+postprocess:
+
+  # ---------------------------------------------------------------------------
+  # robomimic — used when converting to the Robomimic HDF5 format
+  # ---------------------------------------------------------------------------
+  robomimic:
+
+    # Training-config template written next to the dataset:
+    # bc_rnn_gmm (default), bc_transformer_gmm or diffusion_policy
+    training_model: bc_rnn_gmm
+
+    # Fractions for the dataset's `mask/train|valid|test` groups
+    splits:
+      train_frac: 0.8
+      val_frac: 0.2
+      test_frac: 0.0
+
+    # Embedded into the output as env_args.
+    # Required for Robomimic compatibility: env_name, env_version, type (1 = Robosuite).
+    # env_kwargs mirrors the Robosuite environment constructor arguments.
+
+    metadata:
+      env_name: Lift                # Robosuite environment name
+      env_version: 1.5.1
+      type: 1                       # 1 = Robosuite
+
+      env_kwargs:
+        robots:
+          - IIWA                    # robot model name in Robosuite
+
+        control_freq: 20            # controller frequency (Hz)
+
+        # Rendering — set both to false for headless recording
+        has_renderer: false
+        has_offscreen_renderer: false
+
+        # Observations
+        use_camera_obs: false       # set true if recording camera obs for policy
+        use_object_obs: true        # set true to include object state in obs
+
+        # Episode behaviour
+        ignore_done: true
+        reward_shaping: false
+        lite_physics: false
+
+        # Camera resolution (used if use_camera_obs: true)
+        camera_heights: 84
+        camera_widths: 84
+        camera_depths: false
+
+        # Controller configuration (example: operational space control)
+        controller_configs:
+          type: BASIC
+          body_parts:
+            right:
+              type: OSC_POSE
+              input_min: -1
+              input_max: 1
+              output_min:
+                - -0.05
+                - -0.05
+                - -0.05
+                - -0.5
+                - -0.5
+                - -0.5
+              output_max:
+                - 0.05
+                - 0.05
+                - 0.05
+                - 0.5
+                - 0.5
+                - 0.5
+              kp: 150
+              kp_limits:
+                - 0
+                - 300
+              damping: 1
+              damping_limits:
+                - 0
+                - 10
+              impedance_mode: fixed
+              uncouple_pos_ori: true
+              control_delta: true
+              ramp_ratio: 0.2
+              input_ref_frame: world
+              interpolation: null
+              orientation_limits: null
+              position_limits: null
+              gripper:
+                type: GRIP
+
+
+  # ---------------------------------------------------------------------------
+  # lerobot — used when converting to the LeRobotDataset v3.0 format
+  # (fps comes from `recording_frequency` in the acquisition config)
+  # ---------------------------------------------------------------------------
+  lerobot:
+    task: "describe the task here"     # natural-language task text (default: dataset_name)
+    # robot_type: iiwa                 # optional, written to meta/info.json
+    # state_streams:                   # optional: which output.streams make up
+    #   - robot_joint_pos              # observation.state, in this order
+    #   - eef_translation              # (default: all numeric streams, in declaration order)

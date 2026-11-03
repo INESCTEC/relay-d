@@ -1,10 +1,8 @@
+from relay_d.utils.ros_media_codec import imgmsg_to_cv2
 import cv2
 import numpy as np
-import json
 import time
-import tempfile
 import os
-import rclpy
 import datetime
 import math
 
@@ -16,12 +14,10 @@ from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from std_msgs.msg import String, Float32, Float64, Int32, Bool
 from tf2_msgs.msg import TFMessage
 from sensor_msgs_py import point_cloud2
-from PyQt5.QtWidgets import QLabel, QVBoxLayout, QTextEdit, QProgressBar
-from PyQt5.QtCore import QTimer, pyqtSignal, QThread, QMutex, QUrl, Qt
-from PyQt5.QtGui import QPixmap, QImage, QFont
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from PyQt5.QtCore import QTimer, QMutex, Qt
+from PyQt5.QtGui import QPixmap, QImage
+from PyQt5.QtMultimedia import QMediaPlayer
 from PyQt5.QtMultimediaWidgets import QVideoWidget
-from cv_bridge import CvBridge
 
 
 class ContainerVisualizer:
@@ -30,17 +26,14 @@ class ContainerVisualizer:
     """
 
     def __init__(self):
-        self.cv_bridge = CvBridge()
         self.visualization_timers = {}  # container_id -> QTimer
         self.update_mutex = QMutex()
         self.media_players = {}  # container_id -> QMediaPlayer
         self.temp_video_files = {}  # container_id -> temp file path
 
         # Visualization update rate (Hz)
-        self.update_rate = config.get("update_rate", 20) or 20
+        self.update_rate = config.get("visualizer_update_rate", 20) or 20
 
-        self.last_msg_time = {}  # container_id -> last header.stamp
-        self.last_msg_arrival = {}  # container_id -> wall-time of last message
         self.framerate_window = {}  # container_id -> list of arrival times (for rolling FPS)
 
         # Connect to config changes for update_rate
@@ -49,9 +42,9 @@ class ContainerVisualizer:
     def _on_settings_changed(self, settings):
         """Handle settings changes via signal (Triggered when Save is clicked)"""
         # 1. Update Update Rate
-        if "update_rate" in settings:
-            rate = settings["update_rate"]
-            if rate and rate > 0:
+        if "visualizer_update_rate" in settings:
+            rate = settings["visualizer_update_rate"]
+            if rate and rate > 0 and rate != self.update_rate:
                 self.update_rate = rate
                 for timer in self.visualization_timers.values():
                     timer.setInterval(1000 // self.update_rate)
@@ -209,7 +202,7 @@ class ContainerVisualizer:
                 cv_image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
             else:
                 # Convert regular image message
-                cv_image = self.cv_bridge.imgmsg_to_cv2(image_msg, "bgr8")
+                cv_image = imgmsg_to_cv2(image_msg, "bgr8")
 
             if cv_image is None:
                 return
@@ -365,7 +358,6 @@ class ContainerVisualizer:
             # Extract basic point cloud information
             num_points = pc_msg.width * pc_msg.height
             point_step = pc_msg.point_step
-            row_step = pc_msg.row_step
 
             # Get field names
             field_names = [field.name for field in pc_msg.fields]
@@ -742,7 +734,7 @@ class ContainerVisualizer:
                         value = getattr(msg, slot, None)
                         if value is not None:
                             display_text += f"  {slot}: {value}\n"
-                    except:
+                    except Exception:
                         pass
 
             if hasattr(container, "text_data_display"):
@@ -861,8 +853,6 @@ class ContainerVisualizer:
     def _update_status_info(self, container, msg_type, message_count):
         """Update container status information"""
         try:
-            status_text = f"Type: {msg_type}\nMessages: {message_count}"
-
             if hasattr(container, "label_status"):
                 container.label_status.setText(f"Active ({message_count} msgs)")
 
@@ -874,42 +864,6 @@ class ContainerVisualizer:
 
         except Exception as e:
             logger.error(f"Error updating status info: {e}")
-
-    def stop_container_visualization(self, container):
-        """Stop visualization for a container"""
-        try:
-            container_id = getattr(container, "container_id", None)
-            if container_id:
-                # Stop timer
-                if container_id in self.visualization_timers:
-                    timer = self.visualization_timers[container_id]
-                    timer.stop()
-                    del self.visualization_timers[container_id]
-
-                # Stop media player
-                if container_id in self.media_players:
-                    media_player = self.media_players[container_id]
-                    media_player.stop()
-                    del self.media_players[container_id]
-
-                # Clean up temp video files
-                if container_id in self.temp_video_files:
-                    temp_file = self.temp_video_files[container_id]
-                    try:
-                        os.remove(temp_file)
-                    except:
-                        pass
-                    del self.temp_video_files[container_id]
-
-                # Remove overlay label if exists
-                if hasattr(container, "_video_overlay_label"):
-                    container._video_overlay_label.deleteLater()
-                    delattr(container, "_video_overlay_label")
-
-                logger.info(f"Stopped visualization for container {container_id}")
-
-        except Exception as e:
-            logger.error(f"Error stopping container visualization: {e}")
 
     def stop_all_visualizations(self):
         """Stop all container visualizations"""
@@ -928,7 +882,7 @@ class ContainerVisualizer:
             for container_id, temp_file in list(self.temp_video_files.items()):
                 try:
                     os.remove(temp_file)
-                except:
+                except Exception:
                     pass
             self.temp_video_files.clear()
 
@@ -936,13 +890,3 @@ class ContainerVisualizer:
 
         except Exception as e:
             logger.error(f"Error stopping all visualizations: {e}")
-
-    def set_update_rate(self, rate_hz):
-        """Set the visualization update rate"""
-        self.update_rate = max(1, min(rate_hz, 30))  # Limit between 1-30 Hz
-
-        # Update existing timers
-        for timer in self.visualization_timers.values():
-            timer.setInterval(1000 // self.update_rate)
-
-        logger.info(f"Set visualization update rate to {self.update_rate} Hz")

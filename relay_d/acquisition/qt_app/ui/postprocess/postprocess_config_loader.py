@@ -1,6 +1,6 @@
 import os
 import yaml
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from relay_d.utils.coloring_logger import logger
 
 
@@ -209,49 +209,6 @@ class PostprocessConfigLoader:
         """Get the output structure for a format"""
         config = self.get_config(format_name)
         return config.get("output_structure") if config else None
-
-    def get_conversion_rules(self, format_name: str) -> Optional[Dict]:
-        """Get the conversion rules for a format"""
-        config = self.get_config(format_name)
-        return config.get("conversion_rules") if config else None
-
-    def get_environment_metadata_schema(self, format_name: str) -> Optional[Dict]:
-        """Get the environment metadata schema for a format"""
-        config = self.get_config(format_name)
-        return config.get("environment_metadata") if config else None
-
-    def get_validation_rules(self, format_name: str) -> Optional[Dict]:
-        """Get the validation rules for a format"""
-        config = self.get_config(format_name)
-        return config.get("validation") if config else None
-
-    def get_required_env_metadata_fields(self, format_name: str) -> List[Dict]:
-        """Get required environment metadata fields"""
-        env_schema = self.get_environment_metadata_schema(format_name)
-        if not env_schema:
-            return []
-
-        required_fields = []
-        for field in env_schema.get("required_fields", []):
-            field["required"] = True
-            required_fields.append(field)
-
-        return required_fields
-
-    def get_optional_env_metadata_fields(self, format_name: str) -> List[Dict]:
-        """Get optional environment metadata fields"""
-        env_schema = self.get_environment_metadata_schema(format_name)
-        if not env_schema:
-            return []
-
-        optional_fields = []
-        for field in env_schema.get("required_fields", []):
-            if field.get("optional_fields"):
-                for opt_field in field["optional_fields"]:
-                    opt_field["required"] = False
-                    optional_fields.append(opt_field)
-
-        return optional_fields
 
     def get_output_train_config(self, format_name: str, model: str="bc_rnn_gmm") -> Optional[Dict]:
         """Get the output train config for a format"""

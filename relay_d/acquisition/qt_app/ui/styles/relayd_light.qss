@@ -223,13 +223,6 @@ QStackedWidget > QWidget {
     margin: 0px;
 }
 
-/* Start page stays fully transparent */
-QWidget#page_start {
-    background: transparent !important;
-    border: none;
-    margin: 0px;
-}
-
 /* Explicitly set gray background for other pages */
 QWidget#page_data,
 QWidget#page_import,
@@ -282,16 +275,6 @@ QWidget.TopicContainer {
 /* ---------------------------------------------------------------------------
  * 5. PAGE TITLES & SECTION HEADERS (ORIGINAL STYLED BOXES)
  * --------------------------------------------------------------------------- */
-
-QLabel#settingsPageTitle {
-    background-color: #F8F9FB;
-    border: 1px solid #E2E5EA;
-    border-radius: 10px;
-    color: #1A1D23;
-    padding: 14px;
-    font-size: 22px;
-    font-weight: 700;
-}
 
 QLabel#label_2 {
     background-color: #F8F9FB;
@@ -762,9 +745,9 @@ QToolTip {
  * 14. PAGE TITLES (compact, left-aligned)
  * --------------------------------------------------------------------------- */
 
+QLabel#pageTitle,
 QLabel#dataPageTitle,
-QLabel#importPageTitle,
-QLabel#settingsPageTitle {
+QLabel#importPageTitle {
     background: transparent;
     border: none;
     color: #1A1D23;
@@ -796,9 +779,9 @@ QLabel#recordingSettingsLabel {
  * 16. SEPARATORS
  * --------------------------------------------------------------------------- */
 
+QFrame#pageSeparator,
 QFrame#dataSeparator,
-QFrame#importSeparator,
-QFrame#settingsSeparator {
+QFrame#importSeparator {
     color: #E2E5EA;
 }
 
@@ -982,4 +965,78 @@ QDialog#CustomMessageBox {
 QDialog#CustomMessageBox QLabel#msgBodyLabel {
     color: #6B7280;
     font-size: 12px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 20. SHARED PAGE PATTERN: group boxes, tabs, content-page buttons
+ *     (every page: 24/20 margins, QLabel#pageTitle, QFrame#pageSeparator, then content)
+ * --------------------------------------------------------------------------- */
+
+QGroupBox {
+    background: transparent;
+    border: 1px solid #E2E5EA;
+    border-radius: 8px;
+    margin-top: 14px;
+    padding: 14px 10px 10px 10px;
+    font-weight: 600;
+    color: #1A1D23;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0px 6px;
+    color: #1A1D23;
+}
+
+QTabWidget::pane {
+    border: 1px solid #E2E5EA;
+    border-radius: 8px;
+    background: transparent;
+    top: -1px;
+}
+
+QTabBar {
+    font-weight: 600;  /* on the bar, not the tab: Qt sizes the tabs from the bar's font */
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: #5A6270;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 18px;
+    margin-right: 4px;
+}
+
+QTabBar::tab:selected {
+    color: #1A1D23;
+    border-bottom: 2px solid #3B82F6;
+}
+
+QTabBar::tab:hover:!selected {
+    color: #1A1D23;
+}
+
+QStackedWidget QPushButton {
+    min-height: 28px;
+}
+
+/* scroll areas inside pages (Settings tabs, ...) show the page background, not the system palette */
+QStackedWidget QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QStackedWidget QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+/* hint shown on a page that has nothing to show yet (Record page without a config) */
+QLabel#pageHint {
+    color: #5A6270;
+    font-size: 14px;
+    padding: 4px 0px;
 }

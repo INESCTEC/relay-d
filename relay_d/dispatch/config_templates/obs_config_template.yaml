@@ -11,10 +11,14 @@
 #
 # IMPORTANT: observation order must exactly match the training checkpoint.
 #
-# Camera / organized-pointcloud obs (passthrough — see the "source:" example
-# near the bottom of config.input / config.observations below) require
-# --backend robomimic at inference time. The default --backend custom has no
-# vision encoder and will raise a clear error if handed one of these.
+# Camera obs (passthrough — see the "source:" example near the bottom of
+# config.input / config.observations below) work with both backends: robomimic
+# (RGB, depth, organized point cloud) and lerobot (RGB cameras only; the obs name
+# must be the camera key of the dataset, observation.images.<name>).
+#
+# With --backend lerobot every other observation here is part of
+# observation.state: the order comes from the dataset the policy was trained on
+# (meta/info.json), or --state-keys.
 # =============================================================================
 
 config:
@@ -254,7 +258,7 @@ config:
     # Same result as the euler.* block above, but works for non-TF inputs too.
     # The 4 quaternion specs collapse to 3 values, so limits has 3 entries.
     #
-    # From a PoseStamped topic:
+    # From a PoseStamped topic (limits: same per-axis ranges as the euler.* example above):
     # ee_rotation_rpy:
     #   specs:
     #     - ee_pose.pose.orientation.x
@@ -269,20 +273,8 @@ config:
     #     - {lower_lim: -1.57079633, upper_lim: 1.57079633}   # pitch
     #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # yaw
     #
-    # From a TF input (equivalent to listing tf_eef.euler.roll/pitch/yaw):
-    # eef_rotation_action:
-    #   specs:
-    #     - tf_eef.rotation.x
-    #     - tf_eef.rotation.y
-    #     - tf_eef.rotation.z
-    #     - tf_eef.rotation.w
-    #   rotation_format: rpy
-    #   normalize: true
-    #   normalized_range: [-1.0, 1.0]
-    #   limits:
-    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # roll
-    #     - {lower_lim: -1.57079633, upper_lim: 1.57079633}   # pitch
-    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # yaw
+    # A TF input works the same way (tf_eef.rotation.x / .y / .z / .w): the result
+    # equals listing tf_eef.euler.roll / .pitch / .yaw.
     #
     # Order matters: x, y, z, w (w LAST). A wrong order yields wrong angles
     # silently — the node logs a warning if the 4 field names aren't x/y/z/w.
@@ -385,14 +377,14 @@ config:
     # plain list form (no normalize/limits) as shown here.
     #
     # object:
-    #   - tf_object.translation.x
+    #   - tf_object.translation.x            # (the object pose specs from the example above ...)
     #   - tf_object.translation.y
     #   - tf_object.translation.z
     #   - tf_object.rotation.x
     #   - tf_object.rotation.y
     #   - tf_object.rotation.z
     #   - tf_object.rotation.w
-    #   - tf_object.translation.x - tf_eef.translation.x   # gripper_to_cube x
+    #   - tf_object.translation.x - tf_eef.translation.x   # ... plus gripper_to_cube x
     #   - tf_object.translation.y - tf_eef.translation.y   # gripper_to_cube y
     #   - tf_object.translation.z - tf_eef.translation.z   # gripper_to_cube z
     #
@@ -461,7 +453,7 @@ config:
     # camera_rgb/images`) that the checkpoint was trained against — the
     # obs_key here should match that bridge-map key exactly.
     #
-    # Requires --backend robomimic (see the note at the top of this file).
+    # Backends: see the note at the top of this file.
     # agentview_image:
     #   source: camera_rgb
     # agentview_pointcloud:

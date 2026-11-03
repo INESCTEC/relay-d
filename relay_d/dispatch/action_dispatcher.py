@@ -13,13 +13,11 @@ import threading
 import time
 
 import numpy as np
-import rclpy
 import subprocess
 import shlex
 
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from std_msgs.msg import Header
 from typing import Dict, Any
 
 from rosidl_runtime_py.utilities import get_message
@@ -71,69 +69,59 @@ def _parse_part(part: str):
     return name, indices
 
 
-def _set_nested(obj: Any, path: str, value: float) -> None:
-    """
-    Set a value at a dot-separated path, supporting array indexing.
+def _walk(obj: Any, path: str):
+    """Follow a dot path such as "move_point[0].transform.translation.x" to its last segment.
 
-    Examples:
-        "data"                               -> obj.data = value
-        "pose.position.x"                    -> obj.pose.position.x = value
-        "move_point[0].transform.translation.x" -> obj.move_point[0].transform.translation.x = value
+    Returns (parent, last_name, last_indices): the field itself is ``getattr(parent, last_name)[i]...``.
     """
     parts = path.split(".")
-
     for part in parts[:-1]:
         name, indices = _parse_part(part)
         obj = getattr(obj, name)
         for idx in indices:
             obj = obj[idx]
+    name, indices = _parse_part(parts[-1])
+    return obj, name, indices
 
-    last_name, last_indices = _parse_part(parts[-1])
-    if last_indices:
-        target = getattr(obj, last_name)
-        for idx in last_indices[:-1]:
+
+def _assign(obj: Any, path: str, make) -> None:
+    """Set the field at ``path`` to ``make(current_value)``, supporting array indexing."""
+    parent, name, indices = _walk(obj, path)
+    if indices:
+        target = getattr(parent, name)
+        for idx in indices[:-1]:
             target = target[idx]
-        target[last_indices[-1]] = float(value)
+        target[indices[-1]] = make(target[indices[-1]])
     else:
-        setattr(obj, last_name, float(value))
+        setattr(parent, name, make(getattr(parent, name)))
+
+
+def _set_nested(obj: Any, path: str, value: float) -> None:
+    """Set one scalar at a dot path, cast to the type of the field it overwrites."""
+    _assign(obj, path, lambda current: _coerce(current, value))
+
+
+def _coerce(current: Any, value: float) -> Any:
+    """Cast a model output to the type of the field it overwrites (rclpy rejects a float for an int/bool field)."""
+    if isinstance(current, bool):
+        return float(value) > 0.5  # bool(-0.9) would be True
+    if isinstance(current, int):
+        return int(round(float(value)))
+    return float(value)
 
 
 def _set_nested_array(obj: Any, path: str, values) -> None:
-    """
-    Like _set_nested, but assigns an entire list to the final field instead
-    of a single scalar — for float64[]-style array fields (e.g. a
-    JointTrajectoryPoint's `positions`) that must be set in one shot rather
-    than index-by-index.
-    """
-    parts = path.split(".")
-
-    for part in parts[:-1]:
-        name, indices = _parse_part(part)
-        obj = getattr(obj, name)
-        for idx in indices:
-            obj = obj[idx]
-
-    last_name, last_indices = _parse_part(parts[-1])
+    """Assign a whole list at a dot path, for float64[] fields (e.g. a JointTrajectoryPoint's `positions`)."""
     values = [float(v) for v in values]
-    if last_indices:
-        target = getattr(obj, last_name)
-        for idx in last_indices[:-1]:
-            target = target[idx]
-        target[last_indices[-1]] = values
-    else:
-        setattr(obj, last_name, values)
+    _assign(obj, path, lambda _current: values)
 
 
 def _get_nested(obj: Any, path: str) -> Any:
-    """
-    Read a value at a dot-separated path, supporting array indexing.
-    Mirrors _set_nested, but reads instead of writes.
-    """
-    for part in path.split("."):
-        name, indices = _parse_part(part)
-        obj = getattr(obj, name)
-        for idx in indices:
-            obj = obj[idx]
+    """Read the value at a dot path, supporting array indexing."""
+    parent, name, indices = _walk(obj, path)
+    obj = getattr(parent, name)
+    for idx in indices:
+        obj = obj[idx]
     return obj
 
 
@@ -149,21 +137,25 @@ def _check_success(msg: Any, fb_cfg: dict, default_field: str = "reached") -> bo
     try:
         return _get_nested(msg, field) == expected
     except Exception as e:
-        logger.warn(
+        logger.warning(
             f"[ActionDispatcher] feedback success_field '{field}' not found "
             f"on {type(msg).__name__}: {e}"
         )
         return False
 
 
-def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node) -> None:
-    """Fill header (if present) and mapped fields into a ROS message."""
-    if hasattr(msg, "header"):
-        msg.header = Header()
+def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node) -> bool:
+    """Fill header (if present) and mapped fields into a ROS message.
+
+    Returns False if any mapped field could not be set: the message would carry default
+    values (zero velocity, zero quaternion) and must not be sent to the robot.
+    """
+    if hasattr(msg, "header"):  # keep the header: goal_init may have set its frame_id
         msg.header.stamp = node.get_clock().now().to_msg()
         if "frame_id" in cfg:
             msg.header.frame_id = cfg["frame_id"]
 
+    ok = True
     for field_path, slice_idx in cfg["mapping"].items():
         try:
             if isinstance(slice_idx, list):
@@ -171,9 +163,11 @@ def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node) -> None
             else:
                 _set_nested(msg, field_path, slice_values[slice_idx])
         except Exception as e:
-            logger.warn(
+            ok = False
+            logger.warning(
                 f"[ActionDispatcher] Failed to set {field_path}: {e}"
             )
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -193,13 +187,16 @@ class ActionDispatcher:
         self._goal_classes: Dict[str, Any] = {}
         self._msg_classes: Dict[str, Any] = {}
         self._last_sent: Dict[str, str] = {}
+        self._procs: Dict[str, subprocess.Popen] = {}
+        self._stop_procs: list = []  # stop commands: close() must not terminate them
+        self._stopped = True  # nothing commanded yet, so there is nothing to stop (see send_stop)
 
         # feedback: -- opt-in ack-wait for topic entries (see _wait_for_ack)
         self._ack_latest: Dict[str, Any] = {}
         self._ack_events: Dict[str, threading.Event] = {}
 
-        # __init__: change if -> elif
         for name, cfg in self._action_configs.items():
+            self._check_transform(name, cfg.get("transform"))
             is_action = cfg.get("action", False)
             is_command = "command" in cfg
 
@@ -208,7 +205,7 @@ class ActionDispatcher:
                     f"[ActionDispatcher] '{name}' -> COMMAND '{cfg['command'][:50]}...'"
                 )
 
-            elif is_action:                          # <-- elif, not if
+            elif is_action:
                 if "action_type" not in cfg:
                     raise ValueError(
                         f"[ActionDispatcher] '{name}' has action: true "
@@ -222,6 +219,7 @@ class ActionDispatcher:
                         f"Result/Feedback shapes vary per action type)."
                     )
                 action_class = get_action(cfg["action_type"])
+                self._check_mapping(name, cfg, action_class.Goal)
                 self._goal_classes[name] = action_class.Goal
                 self._action_clients[name] = ActionClient(
                     node, action_class, cfg["topic"]
@@ -244,6 +242,7 @@ class ActionDispatcher:
                         f"[ActionDispatcher] '{name}' is missing 'msg_type'."
                     )
                 msg_class = get_message(cfg["msg_type"])
+                self._check_mapping(name, cfg, msg_class)
                 self._msg_classes[name] = msg_class
                 self._publishers[name] = node.create_publisher(
                     msg_class, cfg["topic"], 10
@@ -273,13 +272,23 @@ class ActionDispatcher:
                         f"advancing, timeout={fb.get('timeout', 10.0)}s"
                     )
 
+        for name, cfg in self._action_configs.items():
+            if "stop" in cfg:
+                self._check_stop(name, cfg)
+
     # -------------------------------------------------------------------------
     # Public
     # -------------------------------------------------------------------------
 
     def dispatch(self, action: np.ndarray) -> None:
-        for name, cfg in self._action_configs.items():
+        if not np.isfinite(action).all():
+            logger.error(f"[ActionDispatcher] Non-finite action, not dispatching: {action}")
+            return
 
+        # Phase 1: compute every output. If one config entry is broken (bad slice, unknown transform)
+        # this raises before anything was sent, instead of moving the arm and skipping the gripper.
+        outputs = []
+        for name, cfg in self._action_configs.items():
             slice_values = action[cfg["indices"]]
 
             # 1. Per-index denormalization: model output range -> real-world range
@@ -295,64 +304,176 @@ class ActionDispatcher:
                 transformed = self._apply_transform(slice_values, cfg["transform"])
             else:
                 transformed = slice_values
+            values = list(transformed.values()) if isinstance(transformed, dict) else transformed
+            if not np.isfinite(values).all():  # e.g. a `scale` transform with in_min == in_max
+                logger.error(f"[ActionDispatcher] '{name}' output is not finite after its transform, not dispatching: {transformed}")
+                return
+            outputs.append((name, cfg, transformed))
 
+        # Phase 2: send.
+        self._stopped = False
+        for name, cfg, transformed in outputs:
             # Command template path — simplest, just shell out
             if "command" in cfg:
                 cmd = self._render_command(cfg["command"], transformed)
                 if self._last_sent.get(name) == cmd:
                     continue
-                self._last_sent[name] = cmd
-                self._dispatch_command(name, cfg, cmd)
+                proc = self._procs.get(name)
+                if proc is not None and proc.poll() is None:
+                    continue  # previous command still running: retry next tick, don't pile up
+                # Remember it only once it was started, so a failed start is retried.
+                if self._dispatch_command(name, cfg, cmd):
+                    self._last_sent[name] = cmd
 
             # ROS2 action client path
             elif cfg.get("action", False):
                 key = str(transformed)
                 if self._last_sent.get(name) == key:
                     continue
+                # Remember it before sending: a rejection (on the executor thread) may arrive before
+                # _dispatch_action returns, and its pop must win so the goal is retried.
                 self._last_sent[name] = key
-                self._dispatch_action(name, cfg, transformed)
+                if not self._dispatch_action(name, cfg, transformed):
+                    self._last_sent.pop(name, None)
 
-            # Publisher path
+            # Publisher path: sent every tick (controllers with a watchdog need a stream);
+            # set `dedupe: true` on the entry to skip repeats.
             else:
                 key = str(transformed)
-                if self._last_sent.get(name) == key:
+                if cfg.get("dedupe", False) and self._last_sent.get(name) == key:
                     continue
-                self._last_sent[name] = key
-                self._dispatch_topic(name, cfg, transformed)
+                if self._dispatch_topic(name, cfg, transformed):
+                    self._last_sent[name] = key
+
+    def send_stop(self) -> None:
+        """Send each entry's ``stop:`` values once, e.g. a zero velocity: called when inference stops sending (inputs
+        stale, model error, Ctrl+C, close), because a controller without a watchdog keeps the last command.
+
+        Nothing happens again until the next dispatch(). Never raises: every entry is tried, failures are logged.
+        """
+        if self._stopped:
+            return
+        self._stopped = True
+        for name, cfg in self._action_configs.items():
+            if "stop" not in cfg:
+                continue
+            # The first command after the stop must go out even if it equals the one before (commands are deduped).
+            self._last_sent.pop(name, None)
+            try:
+                values = np.asarray(cfg["stop"], dtype=np.float64)
+                if "command" in cfg:
+                    running = self._procs.pop(name, None)
+                    if running is not None and running.poll() is None:
+                        running.terminate()  # an older motion command must not keep running after its stop
+                    self._stop_procs.append(subprocess.Popen(
+                        shlex.split(self._render_command(cfg["command"], values)),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    ))
+                else:
+                    msg = self._stop_message(name, cfg, values)
+                    if msg is None:
+                        raise ValueError("a mapped field could not be set")
+                    self._publishers[name].publish(msg)
+                logger.warning(f"[ActionDispatcher] '{name}': sent stop {cfg['stop']}")
+            except Exception as e:
+                logger.error(f"[ActionDispatcher] '{name}': stop could not be sent: {e}")
+
+    def close(self) -> None:
+        """Stop the shell commands this dispatcher started and is still running (stop commands are left to finish)."""
+        for proc in self._procs.values():
+            if proc.poll() is None:
+                proc.terminate()
 
     # -------------------------------------------------------------------------
     # Private
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _check_transform(name: str, transform: Any) -> None:
+        """A scale with in_min == in_max divides by zero. Found at startup, not the first time the gripper switches on."""
+        for scale in (transform or {}, (transform or {}).get("strength_scale") or {}):
+            if "in_min" in scale and "in_max" in scale and float(scale["in_min"]) == float(scale["in_max"]):
+                raise ValueError(f"[ActionDispatcher] '{name}': transform needs in_min != in_max, both are {scale['in_min']}.")
+
+    def _stop_message(self, name: str, cfg: dict, values: np.ndarray) -> Any:
+        """The topic message carrying ``stop:`` values (no limits, no transform), or None if the mapping does not fit."""
+        msg = self._msg_classes[name]()
+        if "goal_init" in cfg:
+            self._init_goal(msg, cfg["goal_init"], name)
+        return msg if _fill_msg(msg, cfg, values, self._node) else None
+
+    def _check_stop(self, name: str, cfg: dict) -> None:
+        """A broken ``stop:`` must stop startup: it is only needed at the moment something already went wrong."""
+        stop = cfg["stop"]
+        if cfg.get("action", False) and "command" not in cfg:
+            raise ValueError(f"[ActionDispatcher] '{name}': 'stop' is for topic and command entries; "
+                             f"an action goal is stopped by cancelling it on the action server.")
+        if not isinstance(stop, list) or not stop or not all(
+                isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) for v in stop):
+            raise ValueError(f"[ActionDispatcher] '{name}': 'stop' must be a list of numbers, got {stop!r}.")
+        values = np.asarray(stop, dtype=np.float64)
+        if "command" in cfg:
+            if re.search(r'\{I\[\d+\]\}', self._render_command(cfg["command"], values)):
+                raise ValueError(f"[ActionDispatcher] '{name}': 'stop' has {len(stop)} values, too few for the command's {{I[n]}}.")
+        elif self._stop_message(name, cfg, values) is None:
+            raise ValueError(f"[ActionDispatcher] '{name}': 'stop' does not fit 'mapping' (see the warnings above).")
+
+    def _check_mapping(self, name: str, cfg: dict, msg_class: Any) -> None:
+        """Fill one message of ``msg_class`` with dummy values, so a broken ``mapping`` / ``goal_init``
+        stops startup. Found at the first tick it would send the other entries (the arm) without this one."""
+        values = np.zeros(len(cfg["indices"]), dtype=np.float32)
+        if "limits" in cfg and len(cfg["limits"]) not in (1, len(cfg["indices"])):
+            raise ValueError(f"[ActionDispatcher] '{name}': 'limits' needs 1 entry or one per index "
+                             f"({len(cfg['indices'])}), got {len(cfg['limits'])}.")
+        if "limits" in cfg and cfg.get("denormalize", cfg.get("apply_limits", True)):
+            values = self._apply_limits(values, cfg["limits"], cfg.get("normalized_range", [-1.0, 1.0]))
+        if "transform" in cfg:
+            with np.errstate(all="ignore"):
+                values = self._apply_transform(values, cfg["transform"])
+            if isinstance(values, np.ndarray):
+                values = np.nan_to_num(values)  # only the field names and indices are checked here
+        msg = msg_class()
+        if "goal_init" in cfg:
+            self._init_goal(msg, cfg["goal_init"], name)
+        if not _fill_msg(msg, cfg, values, self._node):
+            raise ValueError(f"[ActionDispatcher] '{name}': 'mapping' does not fit {msg_class.__name__} (see the warnings above).")
+
     def _dispatch_command(
         self, name: str, cfg: dict, cmd: str
-    ) -> None:
+    ) -> bool:
         logger.debug(
             f"[ActionDispatcher] Running command for '{name}':\n  {cmd}"
         )
         try:
-            subprocess.Popen(
+            self._procs[name] = subprocess.Popen(
                 shlex.split(cmd),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
+            return True
         except Exception as e:
-            logger.warn(
+            logger.warning(
                 f"[ActionDispatcher] Command failed for '{name}': {e}\n  cmd: {cmd}"
             )
+            return False
 
-    def _dispatch_topic(self, name: str, cfg: dict, slice_values: np.ndarray) -> None:
+    def _dispatch_topic(self, name: str, cfg: dict, slice_values: np.ndarray) -> bool:
         msg = self._msg_classes[name]()
         if "goal_init" in cfg:
             self._init_goal(msg, cfg["goal_init"], name)
-        _fill_msg(msg, cfg, slice_values, self._node)
+        if not _fill_msg(msg, cfg, slice_values, self._node):
+            logger.error(f"[ActionDispatcher] '{name}' not published: a mapped field could not be set.")
+            return False
         logger.debug(
             f"[ActionDispatcher] Publishing '{name}' -> {cfg['topic']}:\n  {msg}"
         )
+        if "feedback" in cfg:
+            self._ack_events[name].clear()  # before publishing: an ack that comes back at once must not be wiped
         self._publishers[name].publish(msg)
 
         if "feedback" in cfg:
-            self._wait_for_ack(name, cfg["feedback"], msg.header.stamp)
+            self._wait_for_ack(name, cfg["feedback"], getattr(getattr(msg, "header", None), "stamp", None))
+        return True
 
     def _on_ack(self, msg: Any, name: str) -> None:
         self._ack_latest[name] = msg
@@ -379,27 +500,26 @@ class ActionDispatcher:
         correlation_field = fb_cfg.get("correlation_field", "command_stamp")
         deadline = time.monotonic() + timeout
         ev = self._ack_events[name]
-        ev.clear()
 
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             if ev.wait(timeout=min(0.05, remaining)):
+                ev.clear()  # before reading: an ack landing in between sets it again instead of being lost
                 ack = self._ack_latest.get(name)
-                ev.clear()
                 if ack is None:
                     continue
-                if correlation_field:
+                if correlation_field and sent_stamp is not None:  # no header: nothing to correlate on
                     try:
                         stamp = _get_nested(ack, correlation_field)
                         if (stamp.sec, stamp.nanosec) != (sent_stamp.sec, sent_stamp.nanosec):
                             continue  # stale ack from an earlier command
                     except Exception as e:
-                        logger.warn(
+                        logger.warning(
                             f"[ActionDispatcher] '{name}' correlation_field "
                             f"'{correlation_field}' not found on ack: {e}"
                         )
                 if not _check_success(ack, fb_cfg):
-                    logger.warn(f"[ActionDispatcher] '{name}' did not report success.")
+                    logger.warning(f"[ActionDispatcher] '{name}' did not report success.")
                 return
         self._handle_timeout(name, fb_cfg, timeout)
 
@@ -416,16 +536,16 @@ class ActionDispatcher:
         )
         if fb_cfg.get("on_timeout", "warn") == "raise":
             raise RuntimeError(msg)
-        logger.warn(msg + "; proceeding anyway.")
+        logger.warning(msg + "; proceeding anyway.")
 
-    def _dispatch_action(self, name: str, cfg: dict, slice_values: np.ndarray) -> None:
+    def _dispatch_action(self, name: str, cfg: dict, slice_values: np.ndarray) -> bool:
         client = self._action_clients[name]
 
         if not client.server_is_ready():
-            logger.warn(
+            logger.warning(
                 f"[ActionDispatcher] Action server '{cfg['topic']}' not ready, skipping."
             )
-            return
+            return False
 
         goal = self._goal_classes[name]()
 
@@ -434,7 +554,9 @@ class ActionDispatcher:
             self._init_goal(goal, cfg["goal_init"], name)
 
         # 2. Fill model output values into mapped fields
-        _fill_msg(goal, cfg, slice_values, self._node)
+        if not _fill_msg(goal, cfg, slice_values, self._node):
+            logger.error(f"[ActionDispatcher] '{name}' goal not sent: a mapped field could not be set.")
+            return False
 
         logger.debug(
             f"[ActionDispatcher] Sending goal for '{name}':\n{goal}"
@@ -446,9 +568,10 @@ class ActionDispatcher:
             future.add_done_callback(
                 lambda f, n=name: self._goal_response_callback(f, n)
             )
-            return
+            return True
 
         self._dispatch_action_and_wait(name, client, goal, fb_cfg)
+        return True
 
     def _dispatch_action_and_wait(
         self, name: str, client: ActionClient, goal: Any, fb_cfg: dict
@@ -472,14 +595,6 @@ class ActionDispatcher:
         dedicated future/goal-handle chain, so there's no stale-data/
         correlation problem across calls to solve.
         """
-        if "success_field" not in fb_cfg:
-            raise ValueError(
-                f"[ActionDispatcher] '{name}' has an action 'feedback' "
-                f"block but is missing required 'success_field' (there's "
-                f"no universal default — Result/Feedback shapes vary per "
-                f"action type)."
-            )
-
         source = fb_cfg.get("source", "result")
         ev = threading.Event()
         holder: Dict[str, Any] = {}
@@ -492,7 +607,8 @@ class ActionDispatcher:
         def _on_goal_response(f):
             goal_handle = f.result()
             if not goal_handle.accepted:
-                logger.warn(f"[ActionDispatcher] Goal rejected by '{name}'")
+                logger.warning(f"[ActionDispatcher] Goal rejected by '{name}'")
+                self._last_sent.pop(name, None)  # not sent after all: retry it next tick
                 holder["rejected"] = True
                 ev.set()
                 return
@@ -517,7 +633,7 @@ class ActionDispatcher:
         if holder.get("rejected"):
             return
         if source == "result" and not _check_success(holder.get("msg"), fb_cfg):
-            logger.warn(f"[ActionDispatcher] '{name}' action did not report success.")
+            logger.warning(f"[ActionDispatcher] '{name}' action did not report success.")
 
     def _init_goal(self, goal: Any, init_cfg: dict, name: str) -> None:
         """
@@ -560,28 +676,11 @@ class ActionDispatcher:
                         array.append(ARRAY_TYPES[first_name]())
                     continue
 
-                # All other cases: navigate dot-path and set value
-                obj = goal
-                for part in parts[:-1]:
-                    part_name, indices = _parse_part(part)
-                    obj = getattr(obj, part_name)
-                    for idx in indices:
-                        obj = obj[idx]
-
-                last_name, last_indices = _parse_part(parts[-1])
-                if last_indices:
-                    target = getattr(obj, last_name)
-                    for idx in last_indices[:-1]:
-                        target = target[idx]
-                    target[last_indices[-1]] = value
-                else:
-                    setattr(obj, last_name, value)
+                _assign(goal, field_path, lambda _current, v=value: v)  # all other cases: set the value at the path
 
             except Exception as e:
-                logger.warn(
-                    f"[ActionDispatcher] goal_init failed for "
-                    f"'{name}.{field_path}': {e}"
-                )
+                # Raise, never skip: a message missing a goal_init field (e.g. use_delta) moves the robot wrongly.
+                raise ValueError(f"[ActionDispatcher] goal_init failed for '{name}.{field_path}': {e}") from e
 
     def _render_command(self, template: str, values) -> str:
         """
@@ -589,18 +688,13 @@ class ActionDispatcher:
         values can be np.ndarray or dict.
         """
         result = template
-        if isinstance(values, dict):
-            for idx, val in values.items():
-                # Format ints as ints, floats as floats
-                formatted = str(int(val)) if float(val).is_integer() else str(round(float(val), 6))
-                result = result.replace(f"{{I[{idx}]}}", formatted)
-        else:
-            for idx, val in enumerate(values):
-                formatted = str(int(val)) if float(val).is_integer() else str(round(float(val), 6))
-                result = result.replace(f"{{I[{idx}]}}", formatted)
+        for idx, val in (values.items() if isinstance(values, dict) else enumerate(values)):
+            # Format ints as ints, floats as floats
+            formatted = str(int(val)) if float(val).is_integer() else str(round(float(val), 6))
+            result = result.replace(f"{{I[{idx}]}}", formatted)
 
         if re.search(r'\{I\[\d+\]\}', result):
-            logger.warn(
+            logger.warning(
                 f"[ActionDispatcher] Command template has unreplaced placeholders "
                 f"(action slice has {len(values)} values): {result!r}"
             )
@@ -629,7 +723,7 @@ class ActionDispatcher:
         result = slice_values.copy().astype(np.float32)
 
         if span == 0.0:
-            logger.warn(
+            logger.warning(
                 f"[ActionDispatcher] normalized_range has zero span "
                 f"({model_min} == {model_max}); skipping denormalization."
             )
@@ -696,6 +790,7 @@ class ActionDispatcher:
     def _goal_response_callback(self, future: Any, name: str) -> None:
         goal_handle = future.result()
         if not goal_handle.accepted:
-            logger.warn(
+            logger.warning(
                 f"[ActionDispatcher] Goal rejected by '{name}'"
             )
+            self._last_sent.pop(name, None)  # not sent after all: retry it next tick

@@ -1,17 +1,20 @@
 name: CI
 
-# NOTE: This workflow deliberately does NOT install or exercise ROS 2 (rclpy,
-# tf2_ros, cv_bridge, ROS 2 message packages). GitHub-hosted runners don't
-# have ROS 2 preinstalled, and this project has no automated test suite for
-# those code paths yet (see CONTRIBUTING.md). This workflow only sanity-checks
-# that the pip-installable subset of the package builds and installs cleanly,
-# plus a non-blocking lint report.
+# It does:
+#   - sanity-check that the pip-installable subset of the package builds and installs,
+#   - run the ROS-free test suite (config parsing, dataset conversion to robomimic
+#     and LeRobot formats, the headless converter, ...) on a plain runner,
+#   - run the whole suite again inside the ros:jazzy image, so the tests that need
+#     rclpy (action dispatcher, recorder, AppAPI, inference session) run too: they
+#     skip themselves on the plain runner. No robot, no live topics: unit tests only.
+#   - produce a non-blocking lint report.
+# Only the `main` branch is covered.
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -38,6 +41,45 @@ jobs:
       - name: Install the package (pip-installable dependencies only)
         run: pip install .
 
+  test:
+    name: Tests (ROS-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The tests need neither ROS nor torch. They do use Qt (offscreen) and OpenCV for the pages and the
+      # LeRobot viewer: without them those tests skip themselves and CI stays green without running them.
+      - name: Install test dependencies
+        run: python -m pip install pytest numpy h5py pyyaml pyarrow av opencv-python-headless pyqt5 pyqtgraph
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  test-ros:
+    name: Tests (ROS 2 Jazzy)
+    runs-on: ubuntu-latest
+    container: ros:jazzy
+    steps:
+      - uses: actions/checkout@v4
+
+      # Qt and OpenCV from apt, built against the system numpy that ROS uses; pip adds only what apt lacks.
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3-pip python3-pytest python3-opencv python3-pyqt5
+          pip install --break-system-packages h5py "pyarrow<21" av pyqtgraph  # pyarrow 21+ needs NumPy 2
+
+      - name: Run tests
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          python3 -m pytest -q
+
   lint:
     name: Lint (non-blocking)
     runs-on: ubuntu-latest
@@ -51,6 +93,10 @@ jobs:
 
       - name: Install ruff
         run: python -m pip install ruff
+
+      # An undefined name only crashes when that code path runs, and the ROS / Qt pages are not run in CI.
+      - name: Undefined names (fails the build)
+        run: ruff check --select F821 --exclude relay_d/acquisition/qt_app/resources_rc.py .
 
       - name: Run ruff (report-only, does not fail the build)
         run: ruff check --exit-zero .

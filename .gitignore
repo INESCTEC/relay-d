@@ -41,3 +41,5 @@ opencode.md
 *.h5
 *.claude
 *.editorconfig
+graphify-out/
+CLAUDE.md

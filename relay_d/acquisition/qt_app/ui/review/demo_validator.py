@@ -12,6 +12,8 @@ from enum import Enum
 import h5py
 import numpy as np
 
+from relay_d.utils.numerics import RATE_TOLERANCE, median_rate
+
 
 class CheckStatus(str, Enum):
     PASS = "pass"
@@ -23,7 +25,7 @@ _SEVERITY = {CheckStatus.PASS: 0, CheckStatus.WARN: 1, CheckStatus.FAIL: 2}
 
 # Groups under data/<demo_name>/ that are not "raw input" containers and
 # should be skipped when scanning for per-input sample-count/joint checks.
-_NON_INPUT_GROUPS = {"streams", "metadata", "gripper_states"}
+NON_INPUT_GROUPS = {"streams", "metadata", "gripper_states"}
 
 # Dataset keys (in priority order) used to determine an input group's sample count.
 _PRIMARY_DATASET_KEYS = (
@@ -71,10 +73,8 @@ class DemoValidator:
         "max_fill_pct_fail": 0.50,  # -> fail
     }
 
-    def __init__(self, thresholds: dict = None):
-        self.thresholds = dict(self.DEFAULT_THRESHOLDS)
-        if thresholds:
-            self.thresholds.update(thresholds)
+    def __init__(self):
+        self.thresholds = self.DEFAULT_THRESHOLDS
 
     def validate(self, h5_path: str) -> DemoValidationResult:
         result = DemoValidationResult(file_path=h5_path)
@@ -103,6 +103,7 @@ class DemoValidator:
                 result.demo_name = demo_name
                 self._check_min_length(demo_group, result)
                 self._check_timestamps_and_gaps(demo_group, result)
+                self._check_sample_rate(demo_group, result)
                 self._check_sample_counts(demo_group, result)
                 self._check_joint_counts(demo_group, result)
                 self._check_gap_fill(demo_group, result)
@@ -255,6 +256,25 @@ class DemoValidator:
                         )
                     )
 
+    def _check_sample_rate(self, grp, result):
+        """The rate actually recorded against the configured one: the dataset uses the configured rate as its time
+        base (LeRobot fps), so a PC that could not keep up records demos the policy would replay too fast."""
+        try:
+            configured = float(self._get_metadata_attrs(grp).get("recording_frequency"))
+        except (TypeError, ValueError):
+            return
+        rate = median_rate(grp["timestamps"][:]) if "timestamps" in grp else None
+        if rate is None or configured <= 0:
+            return
+        if abs(rate - configured) > RATE_TOLERANCE * configured:
+            result.checks.append(CheckResult(
+                "sample_rate", CheckStatus.FAIL,
+                f"Recorded at {rate:.1f} Hz, but recording_frequency is {configured:g} Hz: this PC did not keep up. "
+                "Lower recording_frequency (or the camera load) and record again; LeRobot conversion skips this demo.",
+            ))
+        else:
+            result.checks.append(CheckResult("sample_rate", CheckStatus.PASS, f"Recorded at {rate:.1f} Hz"))
+
     def _check_sample_counts(self, grp, result):
         n = grp["timestamps"].shape[0] if "timestamps" in grp else 0
         mismatches = []
@@ -265,7 +285,7 @@ class DemoValidator:
                     mismatches.append(f"streams/{name}: {ds.shape[0]} rows vs {n} timestamps")
 
         for name, item in grp.items():
-            if name in _NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
+            if name in NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
                 continue
             for key in _PRIMARY_DATASET_KEYS:
                 if key in item:

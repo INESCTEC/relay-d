@@ -4,51 +4,68 @@ import numpy as np
 import rclpy
 import rclpy.time
 from rclpy.node import Node
-import cv2
+from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
-from ...utils.stream_builder import StreamBuilder
-from .data_normalization import DataNormalizer
+from ...utils.stream_builder import StreamBuilder, fill_none_gaps
 import time
 import json
 from threading import Lock, Thread
 from collections import defaultdict
-from cv_bridge import CvBridge
-from sensor_msgs.msg import Image, CompressedImage, PointCloud2, JointState
-from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
-from std_msgs.msg import String, Float32, Float64, Int32, Bool
-from sensor_msgs_py import point_cloud2
 from datetime import datetime
-from relay_d.utils.ros_media_codec import decode_image, decode_organized_pointcloud
+from .message_encoding import encode_message
+
+def _sample_nbytes(sample: dict) -> int:
+    """RAM held by one recorded sample: every array in it (image `data`, point cloud `points`, ...)."""
+    return sum(v.nbytes for v in sample.values() if isinstance(v, np.ndarray))
+
+
+def _write_stacked(group, name: str, frames: list):
+    """Write equally shaped arrays as one (N, ...) dataset, frame by frame.
+
+    np.stack would build a second full copy first (a full 4 GB buffer would need 8 GB at Stop).
+    With compression each frame is its own chunk, so writing a frame never recompresses its neighbours.
+    """
+    first = frames[0]
+    options = user_settings.h5_compression()
+    dataset = group.create_dataset(
+        name, shape=(len(frames), *first.shape), dtype=first.dtype,
+        chunks=(1, *first.shape) if options else None, **options,
+    )
+    for i, frame in enumerate(frames):
+        dataset[i] = frame
+    return dataset
+
 
 class DataRecorder(Node):
     def __init__(self, yaml_parser):
         super().__init__("data_recorder")
         self.yaml_parser = yaml_parser
-        self.cv_bridge = CvBridge()
-        self.data_normalizer = DataNormalizer()
 
         self.recorded_data = defaultdict(list)
         self.recording_metadata = {}
         self.current_demo_number = 0
+        self.retried_file = None  # path of the demo saved by the last retry_save()
 
-        self.recording_frequency = 30
+        self._apply_setting_defaults()  # the config file's values win (below, and again at each start_recording)
 
         # Update from yaml_parser if available
         if self.yaml_parser and self.yaml_parser.is_loaded():
             config = self.yaml_parser.yaml_data.get("config", {})
-            self.recording_frequency = config.get("recording_frequency", 30)
-        self.max_buffer_size = 1000000
+            self.recording_frequency = config.get("recording_frequency", self.recording_frequency)
+        # shortcut: samples live in RAM until Stop, so a crash loses the demo being recorded; upgrade to a journal or
+        # chunked HDF5 writes if demos get long enough for that to hurt. Past this many bytes of frames the loop stops
+        # sampling (Stop still saves what is buffered) instead of running the PC out of memory.
+        self._buffered_bytes = 0
+        self._unsaved = False  # a save failed and the samples are still only in memory
+        self.buffer_full = False  # the loop stopped sampling because max_buffer_bytes was reached
 
         self.output_directory = None
         self.recorded_data_dir = None
         self.h5_file = None
         self.h5_file_path = None
 
-        self.gripper_states = {}
         self.timestamps = []
         self.timestamp_spreads = []
-        self._sync_tolerance = None
-        self._sync_mode = "soft"
 
         self._stream_builder = StreamBuilder(self.yaml_parser)
         self._fill_gaps_containers = set()
@@ -60,9 +77,7 @@ class DataRecorder(Node):
 
         self.recording_thread = None
         self.stop_recording_flag = False
-        self.recording_start_time = None
         self.recording_sample_count = 0
-        self.decimation_counter = 0.0
 
         self.is_recording = False
         self.is_paused = False
@@ -71,11 +86,6 @@ class DataRecorder(Node):
         self._clock = self.get_clock()
 
         logger.info("DataRecorder initialized")
-
-    def _stop_recording_due_to_error(self, reason):
-        logger.error(f"Stopping recording due to error: {reason}")
-        if self.is_recording:
-            self.stop_recording()
 
     def pause_recording(self):
         try:
@@ -115,6 +125,13 @@ class DataRecorder(Node):
             logger.error(f"Failed to resume recording: {e}")
             return False
 
+    def _apply_setting_defaults(self):
+        """The ``rec_default_*`` settings as they are now (a change in Settings applies to the next recording)."""
+        self.recording_frequency = user_settings.get("rec_default_frequency")
+        self.max_buffer_bytes = int(user_settings.get("rec_default_max_buffer_mb")) * 1024**2
+        self._sync_tolerance = user_settings.get("rec_default_sync_tolerance_sec") or None  # 0 = off
+        self._sync_mode = user_settings.get("rec_default_sync_mode")
+
     def start_recording(self, topic_subscribers, demo_name=None, flush_stale_data=False):
         try:
             with self.recording_lock:
@@ -122,7 +139,18 @@ class DataRecorder(Node):
                     logger.warning("Recording already in progress")
                     return False
 
+                self.retried_file = None
+                if self._unsaved:
+                    logger.warning("Previous recording was not saved; retrying the save before starting")
+                    if not self.retry_save():
+                        logger.error(
+                            "Cannot start: the previous recording is still unsaved (fix the disk "
+                            "problem and try again). Starting would erase it."
+                        )
+                        return False
+
                 self.topic_subscribers = topic_subscribers
+                self._apply_setting_defaults()
 
                 if demo_name is None:
                     demo_name = f"demo_{self.current_demo_number}"
@@ -148,10 +176,20 @@ class DataRecorder(Node):
                     # Always re-read recording_frequency so it matches the loaded config,
                     # not the stale value from __init__ (which ran before config was loaded).
                     config = self.yaml_parser.yaml_data.get("config", {})
-                    self.recording_frequency = config.get("recording_frequency", self.recording_frequency)
+                    # YAML first, then the user setting (so a config without the key does not inherit the last one)
+                    self.recording_frequency = config.get(
+                        "recording_frequency", user_settings.get("rec_default_frequency")
+                    )
+                    self.max_buffer_bytes = int(
+                        float(config.get("max_buffer_mb") or user_settings.get("rec_default_max_buffer_mb")) * 1024**2
+                    )
+                    self.recording_metadata["recording_frequency"] = self.recording_frequency
                     logger.info(f"Recording frequency: {self.recording_frequency} Hz")
-                    self._sync_tolerance = config.get("sync_tolerance_sec", None)
-                    self._sync_mode = config.get("sync_mode", "soft")
+                    # 0 means off, in the YAML as in the setting
+                    self._sync_tolerance = config.get(
+                        "sync_tolerance_sec", user_settings.get("rec_default_sync_tolerance_sec")
+                    ) or None
+                    self._sync_mode = config.get("sync_mode", user_settings.get("rec_default_sync_mode"))
                     self.recording_metadata["sync_tolerance_sec"] = self._sync_tolerance
                     if self._sync_tolerance is not None:
                         logger.info(
@@ -160,9 +198,10 @@ class DataRecorder(Node):
                         )
 
                 self.recorded_data.clear()
+                self._buffered_bytes = 0
+                self.buffer_full = False
                 self.timestamps.clear()
                 self.timestamp_spreads = []
-                self.gripper_states.clear()
                 self._last_valid_raw = {}
                 self._stream_builder = StreamBuilder(self.yaml_parser)
                 self._fill_gaps_containers = self._build_fill_gaps_set()
@@ -170,15 +209,7 @@ class DataRecorder(Node):
                 if self._fill_gaps_containers:
                     logger.info(f"Gap-fill (hold) enabled for: {sorted(self._fill_gaps_containers)}")
 
-                if self.yaml_parser.is_loaded():
-                    config_data = self.yaml_parser.get_config_data()
-                    for config_item in config_data:
-                        if config_item["name"] == "gripper":
-                            gripper_count = config_item["count"]
-                            for i in range(gripper_count):
-                                self.gripper_states[f"gripper_{i + 1}"] = []
-
-                if flush_stale_data and hasattr(self.topic_subscribers, "flush_latest_data"):
+                if flush_stale_data:
                     self.topic_subscribers.flush_latest_data()
                     logger.info("Flushed stale data before recording start")
 
@@ -222,11 +253,10 @@ class DataRecorder(Node):
             # one sample before we start writing timestamps. This prevents leading
             # None entries caused by an empty TF buffer or topics that haven't
             # published yet.
-            warmup_timeout = 2.0
+            warmup_timeout = float(user_settings.get("rec_warmup_s"))
             warmup_start = time.monotonic()
-            while time.monotonic() - warmup_start < warmup_timeout:
-                if hasattr(topic_subscribers, "update_tf_lookups"):
-                    topic_subscribers.update_tf_lookups()
+            while time.monotonic() - warmup_start < warmup_timeout and not self.stop_recording_flag:  # Stop must not wait out a long warm-up
+                topic_subscribers.update_tf_lookups()
                 snapshot = topic_subscribers.get_content()
                 if snapshot and all(v is not None for v in snapshot.values()):
                     break
@@ -261,15 +291,14 @@ class DataRecorder(Node):
                             f"Seeded hold default ({_default!r}) for '{_cid}' ({_type_name})"
                         )
 
-            self.recording_start_time = self._clock.now()
             self.recording_sample_count = 0
-            self.decimation_counter = 0.0
 
             interval = 1.0 / self.recording_frequency
             # Monotonic next-tick anchor — corrects for loop body processing time
             # so the actual sample rate stays close to recording_frequency.
             next_tick = time.monotonic()
 
+            consecutive_errors = 0
             while not self.stop_recording_flag:
                 try:
                     if self.is_paused:
@@ -280,19 +309,17 @@ class DataRecorder(Node):
                     # Flush any TF messages queued in DDS since the last external
                     # spin. Non-blocking: skip if the Qt timer or API spin thread
                     # already holds the lock.
-                    if hasattr(topic_subscribers, "_spin_lock"):
-                        if topic_subscribers._spin_lock.acquire(blocking=False):
-                            try:
-                                rclpy.spin_once(topic_subscribers, timeout_sec=0.0)
-                            except Exception:
-                                pass
-                            finally:
-                                topic_subscribers._spin_lock.release()
+                    if topic_subscribers._spin_lock.acquire(blocking=False):
+                        try:
+                            rclpy.spin_once(topic_subscribers, timeout_sec=0.0)
+                        except Exception:
+                            pass
+                        finally:
+                            topic_subscribers._spin_lock.release()
 
                     # Refresh all TF transforms before snapshotting data so that
                     # every input (topics and TF alike) reflects the same moment.
-                    if hasattr(topic_subscribers, "update_tf_lookups"):
-                        topic_subscribers.update_tf_lookups()
+                    topic_subscribers.update_tf_lookups()
 
                     # Atomic snapshot of data AND timestamps — both dicts are read
                     # under a single lock so topic callbacks cannot update one after
@@ -368,45 +395,42 @@ class DataRecorder(Node):
                                     else:
                                         next_tick = time.monotonic()
                                     continue
-                    self.timestamp_spreads.append(spread)
-
                     current_time = self._clock.now().to_msg()
                     timestamp_nsec = (
                         current_time.sec * 1000000000 + current_time.nanosec
                     )
-                    self.timestamps.append(timestamp_nsec)
 
-                    # Streams share the same snapshot as all containers.
-                    if self._stream_builder.has_streams():
-                        self._stream_builder.evaluate(all_data)
-
-                    data_processed = 0
-                    all_container_ids = list(self.topic_subscribers.subscribers.keys())
-                    for container_id in all_container_ids:
+                    # Encode the whole tick first, append it only once all of it worked: a tick that
+                    # fails half way would leave some inputs one sample behind the timestamps for good.
+                    tick = {}
+                    for container_id in self.recorded_data.keys() | self.topic_subscribers.subscribers.keys():
                         msg_data = all_data.get(container_id)
+                        processed_data = None
                         if msg_data is not None:
                             msg_data = self._stream_builder.apply_joint_filter(container_id, msg_data)
                             processed_data = self._process_message_for_recording(
                                 msg_data, container_id
                             )
-                            if processed_data:
-                                self._last_valid_raw[container_id] = processed_data
-                                self.recorded_data[container_id].append(processed_data)
-                                data_processed += 1
-                            elif container_id in self._last_valid_raw:
-                                self.recorded_data[container_id].append(
-                                    self._last_valid_raw[container_id]
-                                )
-                            else:
-                                self.recorded_data[container_id].append(None)
-                        elif container_id in self._last_valid_raw:
-                            self.recorded_data[container_id].append(
-                                self._last_valid_raw[container_id]
-                            )
-                        else:
-                            self.recorded_data[container_id].append(None)
+                        tick[container_id] = processed_data
+
+                    # Streams share the same snapshot as all containers.
+                    if self._stream_builder.has_streams():
+                        self._stream_builder.evaluate(all_data)
+
+                    self.timestamp_spreads.append(spread)
+                    self.timestamps.append(timestamp_nsec)
+                    data_processed = 0
+                    for container_id, processed_data in tick.items():
+                        if processed_data:
+                            self._last_valid_raw[container_id] = processed_data
+                            self._buffered_bytes += _sample_nbytes(processed_data)
+                            data_processed += 1
+                        self.recorded_data[container_id].append(
+                            processed_data or self._last_valid_raw.get(container_id)
+                        )
 
                     self.recording_sample_count += 1
+                    consecutive_errors = 0
 
                     if self.recording_sample_count % 100 == 0:
                         logger.info(
@@ -414,10 +438,14 @@ class DataRecorder(Node):
                             f"{data_processed} with actual data"
                         )
 
-                    if self.recording_sample_count > self.max_buffer_size:
-                        logger.warning(
-                            f"Recording buffer full ({self.max_buffer_size} samples)."
+                    if self._buffered_bytes > self.max_buffer_bytes:
+                        self.buffer_full = True
+                        logger.error(
+                            f"Recording buffer full ({self._buffered_bytes / 1024**3:.1f} GB): "
+                            f"sampling stopped at {self.recording_sample_count} samples. "
+                            "Press Stop to save what was recorded."
                         )
+                        break
 
                     # Drift-corrected sleep: subtract the time already spent in the
                     # loop body so the inter-sample interval stays at 1/recording_frequency.
@@ -432,6 +460,12 @@ class DataRecorder(Node):
 
                 except Exception as e:
                     logger.error(f"Error in recording loop: {e}")
+                    # Don't retry at full speed: wait one tick, and give up if it keeps failing.
+                    consecutive_errors += 1
+                    if consecutive_errors >= 50:
+                        logger.error("Recording loop failed 50 times in a row; sampling stopped.")
+                        break
+                    time.sleep(interval)
 
             logger.info(
                 f"Standard recording loop finished. Total samples: {self.recording_sample_count}"
@@ -444,6 +478,11 @@ class DataRecorder(Node):
             logger.error(f"Fatal error in standard recording loop: {e}")
 
     def stop_recording(self):
+        """Stop the loop, save the buffered samples to the H5 file and close it.
+
+        Returns True only if the data was saved. If saving fails, returns False and
+        keeps the samples in memory (``recorded_data``) so nothing is lost silently.
+        """
         try:
             with self.recording_lock:
                 if not self.is_recording:
@@ -455,14 +494,17 @@ class DataRecorder(Node):
                 self.is_paused = False
 
                 if self.recording_thread and self.recording_thread.is_alive():
-                    self.recording_thread.join(timeout=2.0)
+                    # The loop checks the stop flag every tick; wait long enough that it is really done
+                    # before saving (saving while it still appends would corrupt the samples).
+                    self.recording_thread.join(timeout=30.0)
+                    if self.recording_thread.is_alive():
+                        logger.error("Recording loop did not stop within 30 s; saving what is buffered")
 
                 expected = len(self.timestamps)
-                for cid, samples in self.recorded_data.items():
+                for cid, samples in list(self.recorded_data.items()):
                     if len(samples) != expected:
-                        logger.warning(
-                            f"Sample count mismatch: '{cid}' has {len(samples)} samples, "
-                            f"expected {expected}. Gap-fill will be applied before saving."
+                        logger.error(
+                            f"Sample count mismatch: '{cid}' has {len(samples)} samples, expected {expected}."
                         )
 
                 self.recording_metadata["end_time"] = time.time()
@@ -472,7 +514,7 @@ class DataRecorder(Node):
                 )
                 self.recording_metadata["total_samples"] = len(self.timestamps)
 
-                self._save_recorded_data()
+                saved = self._save_recorded_data()
 
                 if self._fill_count_summary:
                     total_filled = sum(self._fill_count_summary.values())
@@ -489,6 +531,11 @@ class DataRecorder(Node):
                     self.h5_file.close()
                     self.h5_file = None
 
+                if not saved:
+                    self._unsaved = True
+                    logger.error(f"Recording NOT saved to {self.h5_file_path}; data is still in memory")
+                    return False
+
                 logger.info(
                     f"Recording stopped. Saved {len(self.timestamps)} samples in {self.h5_file_path}"
                 )
@@ -503,26 +550,52 @@ class DataRecorder(Node):
             logger.error(f"Failed to stop recording: {e}")
             return False
 
-    def _create_h5_file(self, demo_name):
-        """Create H5 file for recording data, reusing session folder if already set."""
+    def retry_save(self):
+        """Save the samples left in memory by a failed stop_recording(). True on success."""
         try:
-            if self.recorded_data_dir and os.path.exists(self.recorded_data_dir):
+            self._create_h5_file(self.recording_metadata["demo_name"], mode="w")  # replaces its own partial file
+            saved = self._save_recorded_data()
+        except Exception as e:
+            logger.error(f"Retry save failed: {e}")
+            saved = False
+        if self.h5_file:
+            self.h5_file.close()
+            self.h5_file = None
+        if saved:
+            self._unsaved = False
+            self.retried_file = self.h5_file_path  # the caller adds it to its session list
+            self.current_demo_number += 1
+        return saved
+
+    def _recordings_base(self):
+        """Folder the sessions go into, read when a demo starts: an explicit ``output_directory`` (AppAPI), else the setting."""
+        return self.output_directory or user_settings.get("hdf5_save_folder") or os.path.join(os.path.expanduser("~"), "lfd_recordings")
+
+    @staticmethod
+    def _session_folder_name():
+        """Folder name of a recording session: the ``session_folder_format`` setting (strftime pattern) + ``_Recording``."""
+        name = datetime.now().strftime(user_settings.get("session_folder_format") or "%Y-%m-%d_%H-%M-%S")
+        return (name.replace(os.sep, "_") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")) + "_Recording"
+
+    def _create_h5_file(self, demo_name, mode="w-"):
+        """Create the H5 file of a demo in the current session folder. A session folder is reused only while it is still
+        inside the recordings folder: after a change in Settings the next demo opens a new session there."""
+        try:
+            base = self._recordings_base()
+            same_base = self.recorded_data_dir and os.path.normpath(os.path.dirname(self.recorded_data_dir)) == os.path.normpath(base)
+            if same_base and os.path.exists(self.recorded_data_dir):
                 output_dir = self.recorded_data_dir
-            elif self.output_directory:
-                timestamp_folder = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                output_dir = os.path.join(self.output_directory, timestamp_folder)
             else:
-                timestamp_folder = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                output_dir = os.path.join(
-                    os.path.expanduser("~"), "lfd_recordings", timestamp_folder
-                )
+                output_dir = os.path.join(base, self._session_folder_name())
+                logger.info(f"Recording session folder: {output_dir} (recordings folder: {base})")
 
             if not os.path.exists(output_dir):
                 os.makedirs(output_dir)
 
             self.recorded_data_dir = output_dir
             self.h5_file_path = os.path.join(str(output_dir), f"{demo_name}.h5")
-            self.h5_file = h5py.File(self.h5_file_path, "w", libver="latest")
+            # "w-": never overwrite a demo already there (the demo counter restarts in every process)
+            self.h5_file = h5py.File(self.h5_file_path, mode, libver="latest")
             logger.info(f"Created H5 file: {self.h5_file_path}")
         except Exception as e:
             logger.error(f"Failed to create H5 file: {e}")
@@ -530,258 +603,9 @@ class DataRecorder(Node):
 
     def _process_message_for_recording(self, msg, container_id=None):
         try:
-            msg_type = type(msg).__name__
-
-            if isinstance(msg, (Image, CompressedImage)):
-                return self._process_image_message(msg, container_id)
-            elif isinstance(msg, PointCloud2):
-                return self._process_pointcloud_message(msg, container_id)
-            elif isinstance(msg, JointState) or (
-                hasattr(msg, "name") and hasattr(msg, "position")
-                and hasattr(msg, "velocity") and hasattr(msg, "effort")
-                and hasattr(msg, "header")
-            ):
-                return self._process_joint_message(msg)
-            elif isinstance(msg, PoseStamped):
-                return self._process_pose_message(msg)
-            elif isinstance(msg, Twist):
-                return self._process_twist_message(msg)
-            elif isinstance(msg, TransformStamped):
-                return self._process_transform_stamped_message(msg)
-            elif isinstance(msg, (String, Float32, Float64, Int32, Bool)):
-                return self._process_simple_message(msg)
-            else:
-                return self._process_generic_message(msg)
-
+            return encode_message(msg, self._modalities.get(container_id))
         except Exception as e:
-            logger.error(f"Error processing message for recording: {e}")
-            return None
-
-    def _process_image_message(self, img_msg, container_id=None):
-        try:
-            if isinstance(img_msg, CompressedImage):
-                return {
-                    "type": "compressed_image",
-                    "format": img_msg.format,
-                    "data": np.frombuffer(img_msg.data, np.uint8),
-                    "header": {
-                        "stamp": img_msg.header.stamp.sec * 1000000000
-                        + img_msg.header.stamp.nanosec,
-                        "frame_id": img_msg.header.frame_id,
-                    },
-                }
-            else:
-                is_depth = self._modalities.get(container_id) == "depth"
-                cv_image = decode_image(img_msg, self.cv_bridge, is_depth=is_depth)
-                if cv_image is None:
-                    return None
-                return {
-                    "type": "image",
-                    "encoding": img_msg.encoding,
-                    "width": img_msg.width,
-                    "height": img_msg.height,
-                    "data": cv_image,
-                    "header": {
-                        "stamp": img_msg.header.stamp.sec * 1000000000
-                        + img_msg.header.stamp.nanosec,
-                        "frame_id": img_msg.header.frame_id,
-                    },
-                }
-
-        except Exception as e:
-            logger.error(f"Error processing image message: {e}")
-            return None
-
-    def _process_pointcloud_message(self, pc_msg, container_id=None):
-        try:
-            field_names = [field.name for field in pc_msg.fields]
-            wants_scan = self._modalities.get(container_id) == "scan"
-            is_scan_raster = pc_msg.height > 1 and wants_scan
-
-            if is_scan_raster:
-                points = decode_organized_pointcloud(pc_msg)
-                if points is None:
-                    return None
-            else:
-                raw = list(
-                    point_cloud2.read_points(
-                        pc_msg, field_names=field_names, skip_nans=True
-                    )
-                )
-                points = np.array(raw) if raw else np.array([])
-
-            return {
-                "type": "pointcloud",
-                "organized": is_scan_raster,
-                "width": pc_msg.width,
-                "height": pc_msg.height,
-                "fields": field_names,
-                "points": points,
-                "header": {
-                    "stamp": pc_msg.header.stamp.sec * 1000000000
-                    + pc_msg.header.stamp.nanosec,
-                    "frame_id": pc_msg.header.frame_id,
-                },
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing pointcloud message: {e}")
-            return None
-
-    def _process_joint_message(self, joint_msg):
-        try:
-            names = list(joint_msg.name) if joint_msg.name else []
-            positions = list(joint_msg.position) if joint_msg.position else []
-            velocities = list(joint_msg.velocity) if joint_msg.velocity else []
-            efforts = list(joint_msg.effort) if joint_msg.effort else []
-
-            positions = [float(p) for p in positions] if positions else []
-            velocities = [float(v) for v in velocities] if velocities else []
-            efforts = [float(e) for e in efforts] if efforts else []
-
-            if self.data_normalizer.has_limits():
-                try:
-                    if positions:
-                        pos_dict = dict(zip(names, positions))
-                        normalized_pos = self.data_normalizer.normalize_joint_data(pos_dict, "position")
-                        if normalized_pos is not None:
-                            positions = [normalized_pos[name] for name in names]
-
-                    if velocities:
-                        vel_dict = dict(zip(names, velocities))
-                        normalized_vel = self.data_normalizer.normalize_joint_data(vel_dict, "velocity")
-                        if normalized_vel is not None:
-                            velocities = [normalized_vel[name] for name in names]
-
-                    if efforts:
-                        eff_dict = dict(zip(names, efforts))
-                        normalized_eff = self.data_normalizer.normalize_joint_data(eff_dict, "effort")
-                        if normalized_eff is not None:
-                            efforts = [normalized_eff[name] for name in names]
-
-                except Exception as e:
-                    logger.error(f"Normalization failed: {e}")
-                    if self.is_recording:
-                        self._stop_recording_due_to_error(f"Normalization error: {e}")
-                    return None
-
-            return {
-                "type": "joint_state",
-                "names": names,
-                "positions": positions,
-                "velocities": velocities,
-                "efforts": efforts,
-                "header": {
-                    "stamp": joint_msg.header.stamp.sec * 1000000000
-                    + joint_msg.header.stamp.nanosec,
-                    "frame_id": joint_msg.header.frame_id,
-                },
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing joint message: {e}")
-            return None
-
-    def _process_pose_message(self, pose_msg):
-        try:
-            return {
-                "type": "pose",
-                "position": [
-                    pose_msg.pose.position.x,
-                    pose_msg.pose.position.y,
-                    pose_msg.pose.position.z,
-                ],
-                "orientation": [
-                    pose_msg.pose.orientation.x,
-                    pose_msg.pose.orientation.y,
-                    pose_msg.pose.orientation.z,
-                    pose_msg.pose.orientation.w,
-                ],
-                "header": {
-                    "stamp": pose_msg.header.stamp.sec * 1000000000
-                    + pose_msg.header.stamp.nanosec,
-                    "frame_id": pose_msg.header.frame_id,
-                },
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing pose message: {e}")
-            return None
-
-    def _process_twist_message(self, twist_msg):
-        try:
-            return {
-                "type": "twist",
-                "linear": [twist_msg.linear.x, twist_msg.linear.y, twist_msg.linear.z],
-                "angular": [
-                    twist_msg.angular.x,
-                    twist_msg.angular.y,
-                    twist_msg.angular.z,
-                ],
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing twist message: {e}")
-            return None
-
-    def _process_transform_stamped_message(self, transform_msg):
-        try:
-            return {
-                "type": "transform_stamped",
-                "parent_frame": transform_msg.header.frame_id,
-                "child_frame": transform_msg.child_frame_id,
-                "translation": [
-                    transform_msg.transform.translation.x,
-                    transform_msg.transform.translation.y,
-                    transform_msg.transform.translation.z,
-                ],
-                "rotation": [
-                    transform_msg.transform.rotation.x,
-                    transform_msg.transform.rotation.y,
-                    transform_msg.transform.rotation.z,
-                    transform_msg.transform.rotation.w,
-                ],
-                "header": {
-                    "stamp": transform_msg.header.stamp.sec * 1000000000
-                    + transform_msg.header.stamp.nanosec,
-                    "frame_id": transform_msg.header.frame_id,
-                },
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing TransformStamped message: {e}")
-            return None
-
-    def _process_simple_message(self, msg):
-        try:
-            return {
-                "type": type(msg).__name__.lower(),
-                "data": msg.data if hasattr(msg, "data") else str(msg),
-            }
-
-        except Exception as e:
-            logger.error(f"Error processing simple message: {e}")
-            return None
-
-    def _process_generic_message(self, msg):
-        try:
-            msg_data = {"type": type(msg).__name__, "fields": {}}
-
-            if hasattr(msg, "__slots__"):
-                for slot in msg.__slots__:
-                    try:
-                        value = getattr(msg, slot)
-                        if isinstance(value, (int, float, str, bool)):
-                            msg_data["fields"][slot] = value
-                        else:
-                            msg_data["fields"][slot] = str(value)
-                    except:
-                        msg_data["fields"][slot] = "Error reading field"
-
-            return msg_data
-
-        except Exception as e:
-            logger.error(f"Error processing generic message: {e}")
+            logger.error(f"Error processing {type(msg).__name__} for recording ({container_id}): {e}")
             return None
 
     def _build_output_map_lookup(self) -> dict:
@@ -829,24 +653,6 @@ class DataRecorder(Node):
                         self._fill_defaults[container_id] = default_val
         return fill_set
 
-    def _forward_fill(self, data_list):
-        """Hold-last-value forward-fill: replace None with the most recent valid entry.
-
-        Leading Nones that have no prior value are left as-is (handled upstream by
-        seeding _last_valid_raw before the recording loop starts).
-        Returns the original list unchanged when all entries are None.
-        """
-        if not any(item is not None for item in data_list):
-            return data_list
-        filled = list(data_list)
-        last_valid = None
-        for i, item in enumerate(filled):
-            if item is not None:
-                last_valid = item
-            elif last_valid is not None:
-                filled[i] = last_valid
-        return filled
-
     def _save_recorded_data(self):
         try:
             if not self.h5_file:
@@ -873,18 +679,18 @@ class DataRecorder(Node):
                 streams_grp = demo_group.create_group("streams")
                 for stream_name, arr in new_streams.items():
                     streams_grp.create_dataset(
-                        stream_name, data=arr, compression="gzip", compression_opts=4
+                        stream_name, data=arr, **user_settings.h5_compression()
                     )
                     logger.info(f"Saved stream '{stream_name}': shape {arr.shape}")
 
-            for container_id, data_list in self.recorded_data.items():
+            for container_id, data_list in list(self.recorded_data.items()):
                 if not data_list:
                     continue
 
                 non_null_raw = sum(1 for d in data_list if d is not None)
 
                 if container_id in self._fill_gaps_containers:
-                    filled_list = self._forward_fill(data_list)
+                    filled_list = fill_none_gaps(data_list)
                     fill_count = sum(
                         1 for a, b in zip(data_list, filled_list)
                         if a is None and b is not None
@@ -894,6 +700,14 @@ class DataRecorder(Node):
                 else:
                     filled_list = data_list
                     fill_count = 0
+
+                # Samples taken before the first message arrived are None. Dropping them would
+                # leave this container shorter than `timestamps` and shift it against the rest.
+                first_valid = next((d for d in filled_list if d is not None), None)
+                if first_valid is None:
+                    logger.error(f"{container_id}: no data received during the whole recording")
+                else:
+                    filled_list = [first_valid if d is None else d for d in filled_list]
 
                 fill_suffix = f", {fill_count} gap-filled by hold" if fill_count > 0 else ""
                 logger.info(
@@ -918,24 +732,6 @@ class DataRecorder(Node):
                         container_group, data_type, type_data_list
                     )
 
-            if self.gripper_states:
-                gripper_group = demo_group.create_group("gripper_states")
-                for gripper_name, states in self.gripper_states.items():
-                    if states:
-                        if isinstance(states[0], dict):
-                            state_values = [s["state"] for s in states]
-                            timestamps = [s["timestamp"] for s in states]
-                            gripper_group.create_dataset(
-                                f"{gripper_name}_states", data=np.array(state_values)
-                            )
-                            gripper_group.create_dataset(
-                                f"{gripper_name}_timestamps", data=np.array(timestamps)
-                            )
-                        else:
-                            gripper_group.create_dataset(
-                                gripper_name, data=np.array(states)
-                            )
-
             self.recording_metadata["fill_count_summary"] = dict(self._fill_count_summary)
             self._save_metadata_to_h5(demo_group)
 
@@ -945,6 +741,26 @@ class DataRecorder(Node):
         except Exception as e:
             logger.error(f"Error saving recorded data: {e}")
             return False
+
+    def _save_joint_series(self, group, dataset_name, series):
+        """Save one per-sample joint list (positions/velocities/efforts) as a dataset.
+
+        Equal lengths give a regular array (empty samples become zeros); mixed lengths are saved
+        as variable-length rows. Nothing is written if every sample is empty.
+        """
+        series = [[float(v) for v in row] for row in series]
+        lengths = {len(row) for row in series if row}
+        if not lengths:
+            return
+        if len(lengths) == 1:
+            first_len = next(iter(lengths))
+            group.create_dataset(
+                dataset_name, data=np.array([row if row else [0.0] * first_len for row in series])
+            )
+        else:
+            logger.warning(f"{dataset_name} have inconsistent lengths, saving as variable-length")
+            rows = [np.array(row, dtype=np.float64) for row in series]  # empty rows too: one row per timestamp
+            group.create_dataset(dataset_name, data=rows, dtype=h5py.vlen_dtype(np.float64))
 
     def _save_data_type_to_h5_safe(self, group, data_type, data_list):
         try:
@@ -966,17 +782,14 @@ class DataRecorder(Node):
                     )
 
                     if consistent_shape:
-                        images_array = np.stack(images)
-                        group.create_dataset(
-                            "images", data=images_array, compression="gzip"
-                        )
+                        _write_stacked(group, "images", images)
                     else:
                         logger.warning(
                             "Images have inconsistent shapes, saving individually"
                         )
                         for i, img in enumerate(images):
                             group.create_dataset(
-                                f"image_{i}", data=img, compression="gzip"
+                                f"image_{i}", data=img, **user_settings.h5_compression()
                             )
 
                 if data_list:
@@ -1005,127 +818,14 @@ class DataRecorder(Node):
                     )
 
             elif data_type == "joint_state":
-                positions = []
-                velocities = []
-                efforts = []
-
-                for item in data_list:
-                    if "positions" in item:
-                        pos = item["positions"]
-                        if isinstance(pos, (list, tuple)) and len(pos) > 0:
-                            positions.append([float(p) for p in pos])
-                        elif pos is None or len(pos) == 0:
-                            positions.append([])
-
-                    if "velocities" in item:
-                        vel = item["velocities"]
-                        if isinstance(vel, (list, tuple)) and len(vel) > 0:
-                            velocities.append([float(v) for v in vel])
-                        elif vel is None or len(vel) == 0:
-                            velocities.append([])
-
-                    if "efforts" in item:
-                        eff = item["efforts"]
-                        if isinstance(eff, (list, tuple)) and len(eff) > 0:
-                            efforts.append([float(e) for e in eff])
-                        elif eff is None or len(eff) == 0:
-                            efforts.append([])
-
-                # Check if we have any valid data
-                has_positions = (
-                    any(len(p) > 0 for p in positions) if positions else False
-                )
-                has_velocities = (
-                    any(len(v) > 0 for v in velocities) if velocities else False
-                )
-                has_efforts = any(len(e) > 0 for e in efforts) if efforts else False
-
-                if has_positions:
-                    # Check if all positions have the same length
-                    non_empty_lengths = [len(p) for p in positions if len(p) > 0]
-                    if non_empty_lengths and len(set(non_empty_lengths)) == 1:
-                        # All have same length - create array
-                        if positions:
-                            # Replace empty lists with zeros for consistent shape
-                            first_len = len(positions[0]) if positions[0] else 1
-                            consistent_positions = [
-                                p if len(p) > 0 else [0.0] * first_len
-                                for p in positions
-                            ]
-                            group.create_dataset(
-                                "joint_positions", data=np.array(consistent_positions)
-                            )
-                        else:
-                            group.create_dataset("joint_positions", data=np.array([[]]))
-                    else:
-                        logger.warning(
-                            "Joint positions have inconsistent lengths, saving as variable-length"
-                        )
-                        # Save as variable-length dataset using h5py vlen dtype
-                        dt = h5py.vlen_dtype(np.float64)
-                        # Filter out empty positions
-                        valid_positions = [
-                            np.array(p, dtype=np.float64) for p in positions if p
-                        ]
-                        if valid_positions:
-                            group.create_dataset(
-                                "joint_positions", data=valid_positions, dtype=dt
-                            )
-
-                if has_velocities:
-                    non_empty_lengths = [len(v) for v in velocities if len(v) > 0]
-                    if non_empty_lengths and len(set(non_empty_lengths)) == 1:
-                        if velocities:
-                            first_len = len(velocities[0]) if velocities[0] else 1
-                            consistent_velocities = [
-                                v if len(v) > 0 else [0.0] * first_len
-                                for v in velocities
-                            ]
-                            group.create_dataset(
-                                "joint_velocities", data=np.array(consistent_velocities)
-                            )
-                        else:
-                            group.create_dataset(
-                                "joint_velocities", data=np.array([[]])
-                            )
-                    else:
-                        logger.warning(
-                            "Joint velocities have inconsistent lengths, saving as variable-length"
-                        )
-                        dt = h5py.vlen_dtype(np.float64)
-                        valid_velocities = [
-                            np.array(v, dtype=np.float64) for v in velocities if v
-                        ]
-                        if valid_velocities:
-                            group.create_dataset(
-                                "joint_velocities", data=valid_velocities, dtype=dt
-                            )
-
-                if has_efforts:
-                    non_empty_lengths = [len(e) for e in efforts if len(e) > 0]
-                    if non_empty_lengths and len(set(non_empty_lengths)) == 1:
-                        if efforts:
-                            first_len = len(efforts[0]) if efforts[0] else 1
-                            consistent_efforts = [
-                                e if len(e) > 0 else [0.0] * first_len for e in efforts
-                            ]
-                            group.create_dataset(
-                                "joint_efforts", data=np.array(consistent_efforts)
-                            )
-                        else:
-                            group.create_dataset("joint_efforts", data=np.array([[]]))
-                    else:
-                        logger.warning(
-                            "Joint efforts have inconsistent lengths, saving as variable-length"
-                        )
-                        dt = h5py.vlen_dtype(np.float64)
-                        valid_efforts = [
-                            np.array(e, dtype=np.float64) for e in efforts if e
-                        ]
-                        if valid_efforts:
-                            group.create_dataset(
-                                "joint_efforts", data=valid_efforts, dtype=dt
-                            )
+                for item_key, dataset_name in (
+                    ("positions", "joint_positions"),
+                    ("velocities", "joint_velocities"),
+                    ("efforts", "joint_efforts"),
+                ):
+                    self._save_joint_series(
+                        group, dataset_name, [item[item_key] or [] for item in data_list if item_key in item]
+                    )
 
                 if data_list and "names" in data_list[0]:
                     joint_names = data_list[0]["names"]
@@ -1173,9 +873,7 @@ class DataRecorder(Node):
                             and all(f.shape == frames[0].shape for f in frames)
                         )
                         if consistent:
-                            group.create_dataset(
-                                "points", data=np.stack(frames), compression="gzip"
-                            )
+                            _write_stacked(group, "points", frames)
                         else:
                             logger.warning(
                                 "Organized point cloud frames have inconsistent "
@@ -1233,15 +931,9 @@ class DataRecorder(Node):
                     group.create_dataset("data", data=json_data, dtype=dt)
 
         except Exception as e:
+            # Propagate: _save_recorded_data reports the save as failed and the samples stay in memory.
             logger.error(f"Error saving data type {data_type}: {e}")
-            try:
-                json_data = [
-                    json.dumps({"error": "save_failed", "original_error": str(e)})
-                ]
-                dt = h5py.string_dtype(encoding="utf-8")
-                group.create_dataset("error_data", data=json_data, dtype=dt)
-            except:
-                logger.error(f"Failed to save error data for {data_type}")
+            raise
 
     def _save_metadata_to_h5(self, group):
         try:
@@ -1251,39 +943,10 @@ class DataRecorder(Node):
                 if isinstance(value, (int, float, str, bool)):
                     metadata_group.attrs[key] = value
                 else:
-                    metadata_group.attrs[key] = json.dumps(value) if value else ""
+                    metadata_group.attrs[key] = json.dumps(value, default=str) if value else ""  # e.g. a YAML date
 
             logger.info("Saved metadata to H5 file")
 
         except Exception as e:
             logger.error(f"Error saving metadata: {e}")
-
-    def get_recording_status(self):
-        return {
-            "is_recording": self.is_recording,
-            "is_paused": self.is_paused,
-            "samples_recorded": len(self.timestamps),
-            "recording_duration": time.time()
-            - self.recording_metadata.get("start_time", time.time())
-            if self.is_recording
-            else 0,
-            "output_directory": self.output_directory,
-            "current_demo": self.current_demo_number,
-            "active_inputs": len(self.topic_subscribers.subscribers)
-            if self.topic_subscribers
-            else 0,
-        }
-
-    def cleanup(self):
-        try:
-            if self.is_recording:
-                self.stop_recording()
-
-            if self.h5_file:
-                self.h5_file.close()
-                self.h5_file = None
-
-            logger.info("DataRecorder cleanup complete")
-
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
+            raise
