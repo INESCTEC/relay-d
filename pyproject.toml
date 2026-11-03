@@ -23,7 +23,7 @@ dependencies = [
     "numpy>=1.24",
     "pyyaml>=6.0.3",
     "h5py>=3.15.1",
-    "opencv-python-headless>=4.8.0,<4.13",
+    "opencv-python-headless>=4.8.0,<5.1",
     "pyqt5>=5.15.11",
     "pyqtgraph>=0.13.7",
 ]
