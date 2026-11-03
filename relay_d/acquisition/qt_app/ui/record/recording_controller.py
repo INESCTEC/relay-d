@@ -6,7 +6,7 @@ from relay_d.utils.coloring_logger import logger
 from relay_d.utils.tf_topic import TfTopicSubscriptionError
 
 from ..review.demo_validator import CheckStatus
-from .data_recorder import start_demo
+from .demo_start import start_demo
 from ...utils.background import run_in_background
 from ...utils.custom_message_box import CustomMessageBox
 

@@ -6,7 +6,8 @@ from typing import Optional
 
 from ..qt_app.ui.config.yaml_parser import YamlParser
 from ..qt_app.ui.record.topic_subscribers import TopicSubscribers
-from ..qt_app.ui.record.data_recorder import DataRecorder, start_demo
+from ..qt_app.ui.record.data_recorder import DataRecorder
+from ..qt_app.ui.record.demo_start import start_demo
 from ..qt_app.ui.config.builder.config_check import check_config
 from ..qt_app.utils.stream_builder import StreamBuilder
 from relay_d.utils.tf_topic import TfTopicSubscriptionError
