@@ -21,31 +21,31 @@ def test_table_is_consistent():
 
 def test_defaults_without_a_file(settings_file):
     assert not settings_file.exists()
-    assert us.get("rec_default_frequency") == 30 and us.get("theme") == "light"
+    assert us.get("rec_default_max_buffer_mb") == 4096 and us.get("theme") == "light"
     assert us.values() == {**us.defaults()}
 
 
 def test_save_merges_keeps_unknown_keys_and_leaves_no_temp_file(settings_file):
     settings_file.write_text(json.dumps({"some_future_key": 1, "theme": "dark"}))
     us.reload()
-    result = us.save({"rec_default_frequency": 60})
+    result = us.save({"rec_default_max_buffer_mb": 60})
     on_disk = json.loads(settings_file.read_text())
-    assert on_disk == {"some_future_key": 1, "theme": "dark", "rec_default_frequency": 60}
-    assert result["rec_default_frequency"] == 60 and us.get("theme") == "dark"
+    assert on_disk == {"some_future_key": 1, "theme": "dark", "rec_default_max_buffer_mb": 60}
+    assert result["rec_default_max_buffer_mb"] == 60 and us.get("theme") == "dark"
     assert [p.name for p in settings_file.parent.iterdir()] == ["settings.json"]
 
 
 def test_invalid_values_are_rejected_on_save_and_ignored_on_load(settings_file):
     with pytest.raises(ValueError):
-        us.save({"rec_default_frequency": "fast"})
+        us.save({"rec_default_max_buffer_mb": "fast"})
     with pytest.raises(ValueError):
         us.save({"theme": "purple"})
     with pytest.raises(ValueError):
         us.save({"confirm_destructive": 1})  # an int is not a bool
     assert not settings_file.exists()
-    settings_file.write_text(json.dumps({"rec_default_frequency": "x", "theme": "dark"}))
+    settings_file.write_text(json.dumps({"rec_default_max_buffer_mb": "x", "theme": "dark"}))
     us.reload()
-    assert us.get("rec_default_frequency") == 30 and us.get("theme") == "dark"
+    assert us.get("rec_default_max_buffer_mb") == 4096 and us.get("theme") == "dark"
 
 
 def test_corrupt_or_wrong_file_means_defaults(settings_file):
@@ -77,11 +77,11 @@ def test_restart_keys_and_compression_kwargs(settings_file):
 
 
 def test_values_equal_to_the_default_are_not_stored(settings_file):
-    us.save({"rec_default_frequency": 60, "theme": "light", "infer_hz": 10.0})
-    assert json.loads(settings_file.read_text()) == {"rec_default_frequency": 60}
-    us.save({"rec_default_frequency": 30})  # back to the default: the key disappears
+    us.save({"rec_default_max_buffer_mb": 60, "theme": "light", "infer_hz": 10.0})
+    assert json.loads(settings_file.read_text()) == {"rec_default_max_buffer_mb": 60}
+    us.save({"rec_default_max_buffer_mb": 4096})  # back to the default: the key disappears
     assert json.loads(settings_file.read_text()) == {}
-    assert us.get("rec_default_frequency") == 30
+    assert us.get("rec_default_max_buffer_mb") == 4096
 
 
 def test_resetting_a_migrated_setting_does_not_bring_the_old_value_back(settings_file):

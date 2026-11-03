@@ -45,8 +45,6 @@ Changelog = "https://github.com/pascd/Relay-D/blob/main/CHANGELOG.md"
 # dispatcher targets >=0.4, e.g. 0.5.0). Install your robomimic source
 # checkout in editable mode BEFORE installing this extra — see README.md.
 robomimic = ["robomimic>=0.4"]
-# Only for scripts/extract_joint_limits.py.
-scripts = ["xmltodict"]
 # LeRobotDataset v3.0: convert to it (postprocess/lerobot_writer.py) and open it in the Review tab.
 # pyarrow 21+ needs NumPy 2 at import, and ROS Jazzy's Python ships NumPy 1.26 (pyarrow does not declare it, so pip would not warn).
 lerobot = ["pyarrow>=15.0,<21", "av>=12.0"]
@@ -76,6 +74,6 @@ include = ["relay_d*"]
 "relay_d.acquisition.qt_app.ui.config" = ["templates/*.yaml"]
 "relay_d.acquisition.qt_app" = ["resources/**/*", "resources.qrc"]
 "relay_d.acquisition.qt_app.ui.containers" = ["*.ui"]
-"relay_d.acquisition.qt_app.ui.postprocess.postprocess_configs" = ["*.json", "*.yaml"]
+"relay_d.acquisition.qt_app.ui.postprocess.postprocess_configs" = ["*.json"]
 "relay_d.acquisition.qt_app.ui.review" = ["*.rviz"]
 "relay_d.acquisition.qt_app.ui.styles" = ["*.qss"]

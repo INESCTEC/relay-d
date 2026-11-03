@@ -181,7 +181,7 @@ class ConfigPage:
         return
 
     def _warn_about_problems(self):
-        """Show what the shared config check finds (undefined inputs, limits count, ...). Warnings only: configs written
+        """Show what the shared config check finds (undefined inputs, removed normalize keys, ...). Warnings only: configs written
         by hand that worked before must still load."""
         problems = check_config(self.yaml_parser.yaml_data)
         if problems:
@@ -203,33 +203,7 @@ class ConfigPage:
             )
             return []
 
-        failures = []
-        for item in self.yaml_parser.get_input_data():
-            name = item["name"]
-            if item.get("is_tf"):
-                tf_topic = item.get("tf_topic", "/tf")
-                tf_static_topic = item.get("tf_static_topic", "/tf_static")
-                logger.info(
-                    f"Validating TF input '{name}': {item['parent_frame']} -> "
-                    f"{item['child_frame']} on {tf_topic}..."
-                )
-                if not topic_subscribers.is_tf_available(
-                    item["parent_frame"],
-                    item["child_frame"],
-                    tf_topic=tf_topic,
-                    tf_static_topic=tf_static_topic,
-                    timeout=item.get("tf_wait_timeout"),
-                ):
-                    failures.append(
-                        f"  {name}: TF {item['parent_frame']} -> "
-                        f"{item['child_frame']} not available on "
-                        f"tf_topic={tf_topic}"
-                    )
-            elif item.get("topic"):
-                logger.info(f"Validating input '{name}': topic {item['topic']}...")
-                if not topic_subscribers.is_topic_available(item["topic"]):
-                    failures.append(f"  {name}: topic {item['topic']} not found")
-        return failures
+        return topic_subscribers.unavailable_inputs(self.yaml_parser.get_input_data())
 
     def _validate_stream_specs(self):
         """Build a throwaway StreamBuilder against the currently-loaded
@@ -319,11 +293,11 @@ class ConfigPage:
         try:
             # Get input data
             input_data = self.yaml_parser.get_input_data()
-            output_data = self.yaml_parser.get_output_data()
+            output_names = list(self.yaml_parser.get_streams()) + list(self.yaml_parser.get_output_bridge_map())
 
             # Count inputs and outputs
             num_inputs = len(input_data) if input_data else 0
-            num_outputs = len(output_data) if output_data else 0
+            num_outputs = len(output_names)
 
             # Get input types
             input_types = set()
@@ -335,13 +309,7 @@ class ConfigPage:
                         input_types.add(base_type)
 
             # Get output types
-            output_types = set()
-            if output_data:
-                for item in output_data:
-                    name = item.get("name", "")
-                    if name:
-                        base_type = name.split("_")[0]
-                        output_types.add(base_type)
+            output_types = {name.split("_")[0] for name in output_names}
 
             # Update labels
             if hasattr(self.ui, "inputsCountLabel"):

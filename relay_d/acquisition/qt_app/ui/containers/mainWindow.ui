@@ -373,6 +373,45 @@
                </property>
               </widget>
              </item>
+             <item>
+              <widget class="QPushButton" name="btn_run">
+               <property name="minimumSize">
+                <size>
+                 <width>0</width>
+                 <height>50</height>
+                </size>
+               </property>
+               <property name="maximumSize">
+                <size>
+                 <width>16777215</width>
+                 <height>50</height>
+                </size>
+               </property>
+               <property name="font">
+                <font>
+                 <pointsize>14</pointsize>
+                 <weight>75</weight>
+                 <bold>true</bold>
+                </font>
+               </property>
+               <property name="toolTip">
+                <string>Run a Policy on the Robot</string>
+               </property>
+               <property name="text">
+                <string>   Run</string>
+               </property>
+               <property name="icon">
+                <iconset resource="../../resources.qrc">
+                 <normaloff>:/icons/resources/icons/play.png</normaloff>:/icons/resources/icons/play.png</iconset>
+               </property>
+               <property name="iconSize">
+                <size>
+                 <width>24</width>
+                 <height>24</height>
+                </size>
+               </property>
+              </widget>
+             </item>
             </layout>
            </widget>
           </item>
@@ -465,39 +504,6 @@
             <property name="icon">
              <iconset resource="../../resources.qrc">
               <normaloff>:/icons/resources/icons/play.png</normaloff>:/icons/resources/icons/play.png</iconset>
-            </property>
-            <property name="iconSize">
-             <size>
-              <width>24</width>
-              <height>24</height>
-             </size>
-            </property>
-           </widget>
-          </item>
-          <item>
-           <widget class="QPushButton" name="btn_pause_record">
-            <property name="minimumSize">
-             <size>
-              <width>0</width>
-              <height>50</height>
-             </size>
-            </property>
-            <property name="font">
-             <font>
-              <pointsize>14</pointsize>
-              <weight>75</weight>
-              <bold>true</bold>
-             </font>
-            </property>
-            <property name="toolTip">
-             <string>Pause Recording</string>
-            </property>
-            <property name="text">
-             <string>   Pause Record</string>
-            </property>
-            <property name="icon">
-             <iconset resource="../../resources.qrc">
-              <normaloff>:/icons/resources/icons/video-pause-button.png</normaloff>:/icons/resources/icons/video-pause-button.png</iconset>
             </property>
             <property name="iconSize">
              <size>
@@ -669,7 +675,6 @@
          <zorder>btn_import</zorder>
          <zorder>recordingLabel</zorder>
          <zorder>btn_start_record</zorder>
-         <zorder>btn_pause_record</zorder>
          <zorder>btn_stop_record</zorder>
          <zorder>widget_3</zorder>
         </widget>
@@ -715,6 +720,7 @@
          <widget class="QWidget" name="page_start"/>
          <widget class="QWidget" name="page_review"/>
          <widget class="QWidget" name="page_train"/>
+         <widget class="QWidget" name="page_run"/>
          <widget class="QWidget" name="page_data">
           <layout class="QVBoxLayout" name="verticalLayout_9">
            <property name="spacing">
@@ -985,216 +991,6 @@
               </item>
               <item>
                <spacer name="horizontalSpacer">
-                <property name="orientation">
-                 <enum>Qt::Horizontal</enum>
-                </property>
-                <property name="sizeHint" stdset="0">
-                 <size>
-                  <width>40</width>
-                  <height>20</height>
-                 </size>
-                </property>
-               </spacer>
-              </item>
-             </layout>
-            </widget>
-           </item>
-           <item>
-            <widget class="QWidget" name="dataViewWidget" native="true">
-             <property name="sizePolicy">
-              <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
-               <horstretch>0</horstretch>
-               <verstretch>0</verstretch>
-              </sizepolicy>
-             </property>
-             <layout class="QHBoxLayout" name="horizontalLayout_7">
-              <property name="spacing">
-               <number>12</number>
-              </property>
-              <property name="leftMargin">
-               <number>0</number>
-              </property>
-              <property name="topMargin">
-               <number>0</number>
-              </property>
-              <property name="rightMargin">
-               <number>0</number>
-              </property>
-              <property name="bottomMargin">
-               <number>0</number>
-              </property>
-              <item>
-               <widget class="QWidget" name="inputStructureWidget" native="true">
-                <layout class="QVBoxLayout" name="verticalLayout_10">
-                 <property name="spacing">
-                  <number>4</number>
-                 </property>
-                 <property name="leftMargin">
-                  <number>0</number>
-                 </property>
-                 <property name="topMargin">
-                  <number>0</number>
-                 </property>
-                 <property name="rightMargin">
-                  <number>0</number>
-                 </property>
-                 <property name="bottomMargin">
-                  <number>0</number>
-                 </property>
-                 <item>
-                  <widget class="QLabel" name="inputStructureLabel">
-                   <property name="text">
-                    <string>Input H5 Structure</string>
-                   </property>
-                   <property name="alignment">
-                    <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
-                   </property>
-                  </widget>
-                 </item>
-                 <item>
-                  <widget class="QTextBrowser" name="txt_input_structure">
-                   <property name="minimumSize">
-                    <size>
-                     <width>0</width>
-                     <height>200</height>
-                    </size>
-                   </property>
-                  </widget>
-                 </item>
-                </layout>
-               </widget>
-              </item>
-              <item>
-               <widget class="QWidget" name="outputPreviewWidget" native="true">
-                <layout class="QVBoxLayout" name="verticalLayout_11">
-                 <property name="spacing">
-                  <number>4</number>
-                 </property>
-                 <property name="leftMargin">
-                  <number>0</number>
-                 </property>
-                 <property name="topMargin">
-                  <number>0</number>
-                 </property>
-                 <property name="rightMargin">
-                  <number>0</number>
-                 </property>
-                 <property name="bottomMargin">
-                  <number>0</number>
-                 </property>
-                 <item>
-                  <widget class="QLabel" name="outputPreviewLabel">
-                   <property name="text">
-                    <string>Output Preview</string>
-                   </property>
-                   <property name="alignment">
-                    <set>Qt::AlignLeading|Qt::AlignLeft|Qt::AlignVCenter</set>
-                   </property>
-                  </widget>
-                 </item>
-                 <item>
-                  <widget class="QTextBrowser" name="txt_output_preview">
-                   <property name="minimumSize">
-                    <size>
-                     <width>0</width>
-                     <height>200</height>
-                    </size>
-                   </property>
-                  </widget>
-                 </item>
-                </layout>
-               </widget>
-              </item>
-             </layout>
-            </widget>
-           </item>
-           <item>
-            <widget class="QWidget" name="conversionControlsWidget" native="true">
-             <layout class="QHBoxLayout" name="horizontalLayout_8">
-              <property name="leftMargin">
-               <number>0</number>
-              </property>
-              <property name="topMargin">
-               <number>4</number>
-              </property>
-              <property name="rightMargin">
-               <number>0</number>
-              </property>
-              <property name="bottomMargin">
-               <number>0</number>
-              </property>
-              <item>
-               <spacer name="horizontalSpacer_2">
-                <property name="orientation">
-                 <enum>Qt::Horizontal</enum>
-                </property>
-                <property name="sizeHint" stdset="0">
-                 <size>
-                  <width>40</width>
-                  <height>20</height>
-                 </size>
-                </property>
-               </spacer>
-              </item>
-              <item>
-               <widget class="QPushButton" name="btn_clear_preview">
-                <property name="minimumSize">
-                 <size>
-                  <width>130</width>
-                  <height>38</height>
-                 </size>
-                </property>
-                <property name="font">
-                 <font>
-                  <weight>75</weight>
-                  <bold>true</bold>
-                 </font>
-                </property>
-                <property name="text">
-                 <string>Clear</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <widget class="QPushButton" name="btn_load_h5">
-                <property name="minimumSize">
-                 <size>
-                  <width>130</width>
-                  <height>38</height>
-                 </size>
-                </property>
-                <property name="font">
-                 <font>
-                  <weight>75</weight>
-                  <bold>true</bold>
-                 </font>
-                </property>
-                <property name="text">
-                 <string>Load H5 File</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <widget class="QPushButton" name="btn_convert_dataset">
-                <property name="minimumSize">
-                 <size>
-                  <width>160</width>
-                  <height>38</height>
-                 </size>
-                </property>
-                <property name="font">
-                 <font>
-                  <weight>75</weight>
-                  <bold>true</bold>
-                 </font>
-                </property>
-                <property name="text">
-                 <string>Convert Dataset</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <spacer name="horizontalSpacer_3">
                 <property name="orientation">
                  <enum>Qt::Horizontal</enum>
                 </property>
@@ -1518,7 +1314,7 @@ p, li { white-space: pre-wrap; }
 &lt;ol style=&quot;margin-top: 0px; margin-bottom: 0px; margin-left: 0px; margin-right: 0px; -qt-list-indent: 1;&quot;&gt;&lt;li style=&quot; font-family:'Segoe UI','sans-serif'; font-size:14px;&quot; style=&quot; margin-top:12px; margin-bottom:0px; margin-left:20px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-size:14px;&quot;&gt;Launch the Relay-D application&lt;/span&gt;&lt;/li&gt;
 &lt;li style=&quot; font-family:'Segoe UI','sans-serif'; font-size:14px;&quot; style=&quot; margin-top:0px; margin-bottom:0px; margin-left:20px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-size:14px;&quot;&gt;Import a configuration file via the &lt;/span&gt;&lt;span style=&quot; font-size:14px; font-weight:600;&quot;&gt;Import&lt;/span&gt;&lt;span style=&quot; font-size:14px;&quot;&gt; page&lt;/span&gt;&lt;/li&gt;
 &lt;li style=&quot; font-family:'Segoe UI','sans-serif'; font-size:14px;&quot; style=&quot; margin-top:0px; margin-bottom:0px; margin-left:20px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-size:14px;&quot;&gt;Go to &lt;/span&gt;&lt;span style=&quot; font-size:14px; font-weight:600;&quot;&gt;Start Recording&lt;/span&gt;&lt;span style=&quot; font-size:14px;&quot;&gt; to open the sensor/camera view&lt;/span&gt;&lt;/li&gt;
-&lt;li style=&quot; font-family:'Segoe UI','sans-serif'; font-size:14px;&quot; style=&quot; margin-top:0px; margin-bottom:0px; margin-left:20px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-size:14px;&quot;&gt;Use &lt;/span&gt;&lt;span style=&quot; font-size:14px; font-weight:600;&quot;&gt;Recording Controls&lt;/span&gt;&lt;span style=&quot; font-size:14px;&quot;&gt; in the sidebar to start, pause, and stop&lt;/span&gt;&lt;/li&gt;
+&lt;li style=&quot; font-family:'Segoe UI','sans-serif'; font-size:14px;&quot; style=&quot; margin-top:0px; margin-bottom:0px; margin-left:20px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-size:14px;&quot;&gt;Use &lt;/span&gt;&lt;span style=&quot; font-size:14px; font-weight:600;&quot;&gt;Recording Controls&lt;/span&gt;&lt;span style=&quot; font-size:14px;&quot;&gt; in the sidebar to start and stop&lt;/span&gt;&lt;/li&gt;
 &lt;li style=&quot; font-family:'Segoe UI','sans-serif'; font-size:14px;&quot; style=&quot; margin-top:0px; margin-bottom:12px; margin-left:20px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-size:14px;&quot;&gt;Use &lt;/span&gt;&lt;span style=&quot; font-size:14px; font-weight:600;&quot;&gt;Data Post Process&lt;/span&gt;&lt;span style=&quot; font-size:14px;&quot;&gt; to convert collected data &lt;/span&gt;&lt;/li&gt;&lt;/ol&gt;
 &lt;h2 style=&quot; margin-top:20px; margin-bottom:8px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;&quot;&gt;&lt;span style=&quot; font-family:'Segoe UI','sans-serif'; font-size:x-large; font-weight:600;&quot;&gt;System Requirements&lt;/span&gt;&lt;/h2&gt;
 &lt;p style=&quot; margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:160%;&quot;&gt;&lt;span style=&quot; font-family:'Segoe UI','sans-serif'; font-size:14px;&quot;&gt;Qt 5.12+ • 4 GB RAM min (8 GB recommended) • 1 GB disk space • Compatible recording hardware &lt;/span&gt;&lt;/p&gt;

@@ -1,28 +1,56 @@
+import copy
 import os
-import shutil
 
-from PyQt5.QtWidgets import QWidget, QButtonGroup
-from PyQt5.QtWidgets import QFileDialog
+from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QFont, QKeySequence
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QButtonGroup,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+)
 from datetime import datetime
-from relay_d.dispatch import save_dispatch_templates
 
 # Import utils
 from ..config.yaml_parser import YamlParser
 from ..postprocess.yaml_driven_converter import YAMLDrivenConverter
-from ..postprocess.h5_file_parser import h5FileParser
-from ..postprocess.robomimic_config_handler import (
-    RobomimicConfigHandler,
-    classify_observations,
-)
 from ..settings.config_manager import config
 from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
+from ...utils.background import run_in_background
 from ...utils.custom_message_box import CustomMessageBox
+from relay_d.acquisition.convert_cli import collect_inputs
 from ...utils.default_configs import generate_default_configs
 from ..postprocess.postprocess_config_loader import PostprocessConfigLoader
 from ..postprocess.postprocess_options import dataset_output_paths
-from ..postprocess.offline_config import load_offline_config
+from ..postprocess.offline_config import load_offline_config, write_dataset_files
 from ..postprocess.postprocess_options import PostprocessOptions
+
+PRECHECK_COLUMNS = ("Demo", "Samples", "Rate (Hz)", "Recorded with", "Result")
+# Per-item colours cannot come from the QSS; the mid-tones the Review page uses read on both themes.
+_OK_COLOR, _FAIL_COLOR = "#16A34A", "#DC2626"
+
+class _PrecheckTable(QTableWidget):
+    """The pre-check table; the Delete key removes the selected recordings from the conversion."""
+
+    delete_pressed = pyqtSignal()
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Delete):
+            self.delete_pressed.emit()
+        else:
+            super().keyPressEvent(event)
+
 
 class PostProcessPage(QWidget):
     def __init__(self, ui_instance, yaml_parser: YamlParser = None, settings_page=None):
@@ -32,17 +60,18 @@ class PostProcessPage(QWidget):
         # Config loaded on this page only (no live-ROS check, never shared with the
         # Record page); takes precedence over the shared parser while set.
         self._local_parser = None
-        # Format options (postprocess_config.yaml): loaded explicitly by the user, or
-        # auto-detected next to a loaded config. Neither -> built-in defaults.
+        # Format options (postprocess_config.yaml): each config load resets them to the one next
+        # to that config (auto-detected), else the defaults; a file the user picks applies until the next load.
         self._options_explicit = False
+        self._options_error = None  # a broken postprocess_config.yaml next to the config: refuse to convert, as the CLI and AppAPI do
         self.settings_page = settings_page
 
         self.h5_files = []
-        self.h5_parser = h5FileParser()
         self.output_format = ""
+        self._precheck_gen = 0  # bumped by every refresh: only the newest pre-check result is shown
+        self._report = None  # last pre-check report (None: not run / running)
 
-        self.config_loader = PostprocessConfigLoader()
-        self.yaml_converter = YAMLDrivenConverter(self.config_loader)
+        self.yaml_converter = YAMLDrivenConverter(PostprocessConfigLoader())
         self.format_buttons = {}
         self.format_names = {
             "btn_format_robomimic": "robomimic",
@@ -54,6 +83,7 @@ class PostProcessPage(QWidget):
         if self.yaml_parser is not None:
             self._sync_data_config_from_parser()
 
+        self._build_precheck_widgets()
         self.setup_connections()
         self.setup_format_buttons()
         self._update_config_label()
@@ -98,6 +128,7 @@ class PostProcessPage(QWidget):
             self.yaml_parser.load_yaml_file(file_path)
         if self._local_parser is None:
             self._sync_data_config_from_parser()
+            self.refresh_precheck()
 
     # ------------------------------------------------------------------
     # Config loaded on this page (works without any live ROS topics)
@@ -117,6 +148,7 @@ class PostProcessPage(QWidget):
         else:
             label.setText("No config loaded")
         self.ui.btn_clear_postprocess_config.setEnabled(self._local_parser is not None)
+        self.refresh_precheck()  # every config change passes here
 
     def _load_postprocess_config(self):
         """Load a config for post-processing only: no topic/TF availability check,
@@ -154,6 +186,7 @@ class PostProcessPage(QWidget):
         self._local_parser = None
         if self.yaml_parser is not None and self.yaml_parser.yaml_data:
             self._sync_data_config_from_parser()
+            self._auto_load_sibling_options(self.yaml_parser.get_current_config_path())
         else:
             self.yaml_converter.data_config = {}
         self._update_config_label()
@@ -170,6 +203,7 @@ class PostProcessPage(QWidget):
         else:
             self.ui.label_postprocess_options.setText("defaults")
         self.ui.btn_clear_postprocess_options.setEnabled(bool(source))
+        self.refresh_precheck()  # every options change passes here
 
     def _load_postprocess_options(self):
         try:
@@ -190,21 +224,23 @@ class PostProcessPage(QWidget):
                     "Options rejected:\n" + "\n".join(f"  {p}" for p in problems)
                 )
             else:
-                logger.warning(f"Ignoring {path}: {'; '.join(problems)}")
+                self._options_error = f"{path} is not usable:\n" + "\n".join(f"  {p}" for p in problems)
+                logger.error(self._options_error)
             return False
         warnings = [p for p in problems if p.startswith("warning:")]
         if warnings and explicit:
             CustomMessageBox.warning("\n".join(w[len("warning: "):] for w in warnings))
         self.yaml_converter.options = options
         self._options_explicit = explicit
+        self._options_error = None
         self._update_options_label()
         logger.info(f"PostProcessPage: using format options from {path}")
         return True
 
     def _auto_load_sibling_options(self, config_path: str):
-        """Use a postprocess_config.yaml next to the loaded config, unless the user chose one."""
-        if self._options_explicit:
-            return
+        """A loaded config brings its options: the postprocess_config.yaml next to it, else the defaults
+        (as relay-d-convert and AppAPI)."""
+        self._clear_postprocess_options()
         sibling = PostprocessOptions.find_sibling(config_path)
         if sibling:
             self.load_postprocess_options_from_path(sibling, explicit=False)
@@ -212,6 +248,7 @@ class PostProcessPage(QWidget):
     def _clear_postprocess_options(self):
         self.yaml_converter.options = PostprocessOptions()
         self._options_explicit = False
+        self._options_error = None
         self._update_options_label()
 
     # ------------------------------------------------------------------
@@ -227,7 +264,6 @@ class PostProcessPage(QWidget):
             config:
               input:  { ... }
               output: { robot0_eef_pos: robot0_eef/translations, ... }
-              metadata: { env_name: ..., n_actions: 7, ... }
         """
         parser = self._active_parser()
         if parser is None:
@@ -260,9 +296,15 @@ class PostProcessPage(QWidget):
     def setup_connections(self):
         """Setup all button connections"""
         ui = self.ui
-        ui.btn_convert_dataset.clicked.connect(self.convert_dataset)
-        ui.btn_load_h5.clicked.connect(self._select_files_to_convert)
-        ui.btn_clear_preview.clicked.connect(self.clear_h5_preview)
+        self.btn_convert.clicked.connect(self.convert_dataset)
+        self.btn_add_files.clicked.connect(self._select_files_to_convert)
+        self.btn_add_folder.clicked.connect(self._select_folder_to_convert)
+        self.btn_clear_files.clicked.connect(lambda: self.set_files([]))
+        self.btn_remove_files.clicked.connect(self._remove_selected_files)
+        self.table_precheck.delete_pressed.connect(self._remove_selected_files)
+        self.table_precheck.itemSelectionChanged.connect(
+            lambda: self.btn_remove_files.setEnabled(bool(self._selected_files()))
+        )
         ui.btn_generate_postprocess_configs.clicked.connect(lambda: generate_default_configs(ui))
         ui.btn_load_postprocess_config.clicked.connect(self._load_postprocess_config)
         ui.btn_clear_postprocess_config.clicked.connect(self._clear_postprocess_config)
@@ -271,42 +313,22 @@ class PostProcessPage(QWidget):
 
     def setup_format_buttons(self):
         """Setup format selection buttons defined in .ui file"""
-        formats = self.config_loader.get_all_format_names()
-        logger.info(f"Available formats: {formats}")
-
         # Create button group for exclusive selection
         self.format_button_group = QButtonGroup()
         self.format_button_group.setExclusive(False)
 
-        # Setup each format button
         for button_name, format_name in self.format_names.items():
             button = getattr(self.ui, button_name, None)
-
-            if button is not None:
-                format_info = self.config_loader.get_format_info(format_name)
-                button.setCheckable(True)
-
-                if format_info is not None:
-                    button.setToolTip(format_info.get("description", ""))
-                    button.clicked.connect(
-                        lambda checked, name=format_name: self._select_output_format(
-                            name
-                        )
-                    )
-                    self.format_button_group.addButton(button)
-                    self.format_buttons[format_name] = button
-
-                    if format_name == user_settings.get("postprocess_default_format"):  # setting
-                        button.setChecked(True)
-                        self.output_format = format_name
-                        self.show_output_structure_preview(format_name)
-                else:
-                    logger.warning(f"Could not get format info for: {format_name}")
-                    button.setEnabled(False)
-            else:
+            if button is None:
                 logger.warning(f"Button {button_name} not found in UI")
-
-        logger.info(f"Setup {len(self.format_buttons)} format buttons")
+                continue
+            button.setCheckable(True)
+            button.clicked.connect(lambda checked, name=format_name: self._select_output_format(name))
+            self.format_button_group.addButton(button)
+            self.format_buttons[format_name] = button
+            if format_name == user_settings.get("postprocess_default_format"):  # setting
+                button.setChecked(True)
+                self.output_format = format_name
 
     def _select_output_format(self, format_name):
         """Single-choice toggle: select `format_name`, or deselect it if it already is.
@@ -321,13 +343,12 @@ class PostProcessPage(QWidget):
         if self.output_format == format_name:
             self.output_format = ""
             self._sync_format_buttons()
-            self.clear_output_preview()
             logger.info(f"Deselected format: {format_name}")
         else:
             self.output_format = format_name
             self._sync_format_buttons()
-            self.show_output_structure_preview(format_name)
             logger.info(f"Selected output format: {format_name}")
+        self.refresh_precheck()
 
     def _sync_format_buttons(self):
         """Check exactly the button of the selected format (none if nothing is selected)."""
@@ -336,49 +357,231 @@ class PostProcessPage(QWidget):
             button.setChecked(name == self.output_format)
             button.blockSignals(blocked)
 
-    def clear_output_preview(self):
-        self.ui.txt_output_preview.clear()
-
-    def show_output_structure_preview(self, format_name):
-        self.ui.txt_output_preview.setHtml(self.config_loader.generate_html_structure_preview(format_name))
-        self.ui.txt_output_preview.show()
-
     # ------------------------------------------------------------------
     # File selection
     # ------------------------------------------------------------------
 
-    def _select_files_to_convert(self):
-
-        logger.info("Opening file browser")
-
-        # Get the same folder where datasets are saved by default, for better UX. Fall back to home if not set.
+    def _recordings_dir(self):
+        """Where recordings are saved (Settings page), for the file dialogs; else home."""
         save_folder = self.settings_page.get_hdf5_save_folder() if self.settings_page else ""
-        processed_dir = os.path.join(save_folder, "recorded_data") if save_folder else os.path.expanduser("~")
+        return os.path.join(save_folder, "recorded_data") if save_folder else os.path.expanduser("~")
 
+    def _select_files_to_convert(self):
         fn, _ = QFileDialog.getOpenFileNames(
-            parent=None,
-            caption="Select H5 Files",
-            filter="H5 files (*.h5)",
-            directory=processed_dir,
+            parent=None, caption="Add recordings", filter="H5 files (*.h5)", directory=self._recordings_dir()
+        )
+        if fn:
+            self.add_inputs(fn)
+
+    def _select_folder_to_convert(self):
+        folder = QFileDialog.getExistingDirectory(None, "Add every recording under a folder", self._recordings_dir())
+        if folder:
+            self.add_inputs([folder])
+
+    def add_inputs(self, paths):
+        """Add files and folders (searched recursively for *.h5, as relay-d-convert --input) to the recordings."""
+        try:
+            self.set_files(collect_inputs(self.h5_files + list(paths)))
+        except FileNotFoundError as e:
+            CustomMessageBox.error(f"Not found: {e}")
+
+    def _selected_files(self):
+        rows = {i.row() for i in self.table_precheck.selectedIndexes()}
+        return {self.table_precheck.item(r, 0).data(Qt.UserRole) for r in rows if self.table_precheck.item(r, 0)}
+
+    def _remove_selected_files(self):
+        """Leave the selected rows' files out of the conversion (a file holding several demos goes as a whole)."""
+        selected = self._selected_files()
+        if selected:
+            self.set_files([f for f in self.h5_files if f not in selected])
+
+    def set_files(self, files):
+        self.h5_files = list(files)
+        logger.info(f"Recordings to convert: {len(self.h5_files)} files")
+        self.refresh_precheck()
+
+    # ------------------------------------------------------------------
+    # Pre-check (what conversion would do, without writing anything)
+    # ------------------------------------------------------------------
+
+    def _build_precheck_widgets(self):
+        """Recordings row, pre-check table, output preview and Convert, under the .ui's config/options/format rows."""
+        layout = self.ui.verticalLayout_9
+
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        row.addWidget(QLabel("Recordings:"))
+        self.label_recordings = QLabel()
+        row.addWidget(self.label_recordings, 1)
+        self.btn_add_files = QPushButton("Add files...")
+        self.btn_add_folder = QPushButton("Add folder...")
+        self.btn_remove_files = QPushButton("Remove selected")
+        self.btn_remove_files.setToolTip("Leave the selected recordings out of this conversion (Delete key). Nothing is deleted from disk.")
+        self.btn_remove_files.setEnabled(False)
+        self.btn_clear_files = QPushButton("Clear")
+        for b in (self.btn_add_files, self.btn_add_folder, self.btn_remove_files, self.btn_clear_files):
+            b.setMinimumHeight(36)
+            row.addWidget(b)
+        layout.addLayout(row)
+
+        self.label_precheck_error = QLabel()
+        self.label_precheck_error.setObjectName("precheckError")
+        self.label_precheck_error.setWordWrap(True)
+        self.label_precheck_error.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.label_precheck_error.hide()
+        layout.addWidget(self.label_precheck_error)
+
+        self.table_precheck = _PrecheckTable(0, len(PRECHECK_COLUMNS))
+        self.table_precheck.setHorizontalHeaderLabels(PRECHECK_COLUMNS)
+        self.table_precheck.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table_precheck.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table_precheck.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table_precheck.verticalHeader().hide()
+        header = self.table_precheck.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(len(PRECHECK_COLUMNS) - 1, QHeaderView.Stretch)  # long reasons wrap instead of being cut
+        self.table_precheck.setWordWrap(True)
+        precheck_box = QGroupBox("Pre-check")
+        QVBoxLayout(precheck_box).addWidget(self.table_precheck)
+
+        self.output_box = QGroupBox("Output")
+        self.txt_output = QPlainTextEdit()
+        self.txt_output.setReadOnly(True)
+        self.txt_output.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.txt_output.setFont(QFont("monospace"))
+        QVBoxLayout(self.output_box).addWidget(self.txt_output)
+
+        side = QWidget()
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(0, 14, 0, 0)
+        self.label_summary = QLabel()
+        self.label_summary.setWordWrap(True)
+        self.label_convert_reason = QLabel()
+        self.label_convert_reason.setObjectName("pageHint")
+        self.label_convert_reason.setWordWrap(True)
+        self.btn_convert = QPushButton("Convert")
+        self.btn_convert.setMinimumHeight(38)
+        bold = self.btn_convert.font()
+        bold.setBold(True)
+        self.btn_convert.setFont(bold)
+        side_layout.addWidget(self.label_summary)
+        side_layout.addWidget(self.label_convert_reason)
+        side_layout.addStretch(1)
+        side_layout.addWidget(self.btn_convert)
+        side.setMinimumWidth(180)
+
+        bottom = QSplitter(Qt.Horizontal)
+        bottom.addWidget(self.output_box)
+        bottom.addWidget(side)
+        bottom.setStretchFactor(0, 4)
+        bottom.setStretchFactor(1, 1)
+        split = QSplitter(Qt.Vertical)
+        split.addWidget(precheck_box)
+        split.addWidget(bottom)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setChildrenCollapsible(False)
+        layout.addWidget(split, 1)
+
+    def _blocked_before_check(self):
+        """Why there is nothing to pre-check yet ("" when there is)."""
+        if not self.output_format:
+            return "Select an output format."
+        if not self.h5_files:
+            return "Add recordings to convert."
+        if self._options_error:
+            return self._options_error
+        if not self.yaml_converter.data_config.get("output"):
+            return "No configuration loaded: load one on the Config page, or use 'Load Config...' here."
+        return ""
+
+    def refresh_precheck(self):
+        """Re-run the pre-check in the background; a refresh started later replaces the result of an earlier one."""
+        self._precheck_gen += 1
+        gen = self._precheck_gen
+        self._report = None
+        if self._blocked_before_check():
+            self._show_report()
+            return
+        # The pre-check sets per-batch state on the converter: give it its own copy, so a running
+        # check never mixes with another one or with a conversion.
+        conv = copy.copy(self.yaml_converter)
+        conv.data_config = copy.deepcopy(self.yaml_converter.data_config)
+        fmt, files = self.output_format, list(self.h5_files)
+        self._show_report(checking=True)
+        run_in_background(
+            self.ui.page_data, lambda: conv.precheck(fmt, files), lambda r, e: self._on_precheck_done(gen, r, e)
         )
 
-        if not fn:
-            logger.info("No file selected by user.")
-            return
+    def _on_precheck_done(self, gen, report, error):
+        if gen != self._precheck_gen:
+            return  # stale: inputs changed while it ran
+        if error is not None:
+            logger.error(f"Pre-check failed: {error}")
+            report = {"error": f"Pre-check failed: {error}", "demos": [], "output": [], "converted": 0, "total": 0}
+        self._report = report
+        self._show_report()
 
-        self.h5_files = list(fn)
-        logger.info(f"Files loaded: {self.h5_files}. Total files: {len(self.h5_files)}")
-        self.show_h5_preview(self.h5_parser.convert_h5_to_html(self.h5_files[0]))
+    def _convert_block_reason(self, checking=False):
+        """Why Convert is disabled ("" when it is enabled)."""
+        if reason := self._blocked_before_check():
+            return reason
+        if checking or self._report is None:
+            return "Checking the recordings..."
+        if self._report.get("error"):
+            return self._report["error"]
+        if not self._report.get("converted"):
+            return "No demo would be converted: see the Result column."
+        return ""
 
-    def show_h5_preview(self, html_string):
-        self.ui.txt_input_structure.clear()
-        self.ui.txt_input_structure.setHtml(html_string)
+    def _show_report(self, checking=False):
+        report = self._report or {}
+        demos = report.get("demos") or []
+        n_files = len(self.h5_files)
+        files = f"{n_files} file{'s' * (n_files != 1)}"
+        demos_text = f"{report.get('total')} demo{'s' * (report.get('total') != 1)}"
+        self.label_recordings.setText(f"{demos_text} in {files}" if "total" in report else files)
 
-    def clear_h5_preview(self):
-        self.ui.txt_input_structure.clear()
-        self.h5_files = []
-        CustomMessageBox.info("Cleared H5 file preview and reset loaded files.")
-        return
+        error = report.get("error")
+        self.label_precheck_error.setText(error or "")
+        self.label_precheck_error.setVisible(bool(error))
+
+        self.table_precheck.setRowCount(len(demos))
+        for row, d in enumerate(demos):
+            name = d.get("demo", "")
+            rate, rec_hz = d.get("rate_hz"), d.get("recorded_hz")
+            cells = (
+                name,
+                str(d.get("samples", "")),
+                f"{rate:.1f}" if rate else "-",
+                (d.get("recorded_with") or "-") + (f" ({rec_hz:g} Hz)" if rec_hz else ""),
+                "\u2714 converts" if d.get("ok") else f"\u2716 {d.get('reason', '')}",
+            )
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setToolTip(d.get("file", "") if col == 0 else text)
+                if col == 0:
+                    item.setData(Qt.UserRole, d.get("file", ""))  # a row stands for its recording file
+                if col == len(cells) - 1:
+                    item.setForeground(QBrush(QColor(_OK_COLOR if d.get("ok") else _FAIL_COLOR)))
+                self.table_precheck.setItem(row, col, item)
+        self.table_precheck.resizeRowsToContents()
+
+        fmt = {"robomimic": "Robomimic", "lerobot": "LeRobot"}.get(self.output_format, self.output_format)
+        self.output_box.setTitle(f"Output ({fmt})" if fmt else "Output")
+        output = report.get("output") or []
+        width = max((len(str(name)) for name, _ in output), default=0)
+        self.txt_output.setPlainText("\n".join(f"{str(name):<{width}}  {detail}" for name, detail in output))
+        self.label_summary.setText(
+            f"{report['converted']} of {demos_text} will be converted" if "total" in report else ""
+        )
+
+        reason = self._convert_block_reason(checking)
+        converted = report.get("converted") or 0
+        self.btn_convert.setEnabled(not reason)
+        self.btn_convert.setText(f"Convert {converted} demo{'s' * (converted != 1)}" if not reason else "Convert")
+        self.btn_convert.setToolTip(reason)
+        self.label_convert_reason.setText("See the error above." if error and reason == error else reason)
 
     # ------------------------------------------------------------------
     # Conversion
@@ -399,6 +602,10 @@ class PostProcessPage(QWidget):
             CustomMessageBox.warning("Please select at least one H5 file to convert.")
             return
 
+        if self._options_error:
+            CustomMessageBox.error(self._options_error + "\n\nFix it, or load another options file with 'Load Options...'.")
+            return
+
         # Guard: ensure bridge map is populated before converting
         bridge_entries = len(self.yaml_converter.data_config.get("output", {}))
         if bridge_entries == 0:
@@ -410,10 +617,10 @@ class PostProcessPage(QWidget):
 
         logger.info(f"Converting dataset to {self.output_format} format.")
 
-        # The Recordings folder setting, else ~/.RelayDApp
+        # The Recordings folder setting, else ~/lfd_recordings (the recorder's and AppAPI's default too)
         save_folder = self.settings_page.get_hdf5_save_folder() if self.settings_page else ""
         if not save_folder:
-            save_folder = os.path.expanduser("~/.RelayDApp")
+            save_folder = os.path.expanduser("~/lfd_recordings")
             logger.warning(f"The recordings folder is not set (Settings page). Defaulting to {save_folder}")
         output_dir, combined_output_path = dataset_output_paths(save_folder, self.output_format, datetime.now())
         os.makedirs(output_dir, exist_ok=True)
@@ -424,68 +631,27 @@ class PostProcessPage(QWidget):
             combined_output_path,
         )
 
-        # Populate the training config's observation modalities from the
-        # actual converted data and save it alongside the dataset, for
-        # future reference.
+        # Keep the configs used next to the dataset, plus the dispatcher files.
         post_error = None
         if success:
             try:
-                # Copy the acquisition_config used to build the dataset into the output folder for reference
-                if(not self._active_parser().save_yaml_file(file_path=f"{output_dir}/acquisition_config.yaml")):
-                    raise RuntimeError("could not copy acquisition_config.yaml to the output folder")
-
-                # Keep the format options used for this dataset next to the config
-                if self.yaml_converter.options.source:
-                    shutil.copy2(
-                        self.yaml_converter.options.source,
-                        os.path.join(output_dir, "postprocess_config.yaml"),
-                    )
-
-                # The robomimic training config only applies to the robomimic format
-                if self.output_format != "lerobot":
-                    # Get the train config path from the format config and populate it with the actual train dir and observation modalities
-                    train_config_path = self.config_loader.get_output_train_config(
-                        self.output_format,
-                        self._active_parser().get_train_model_name(self.yaml_converter.options),
-                    )
-                    handler = RobomimicConfigHandler(train_config_path)
-                    handler.set_train_dir(f"~/Documents/robomimic_trains/{os.path.basename(output_dir)}")
-
-                    # Classigy observations based on the actual converted data and populate the config
-                    classification = classify_observations(
-                        self.yaml_converter.data_config,
-                        self.yaml_converter.get_last_shape_cache(),
-                    )
-                    handler.set_observation_modalities(**classification)
-                    handler.save(
-                        os.path.join(output_dir, f"{self.output_format}_config.json")
-                    )
-
-                # The dispatcher files (robomimic and LeRobot policies both run through lfd-inference-node):
-                # obs_config.yaml from the acquired config, an action_config to adapt, and the inference script
-                action_dispatcher_folder = os.path.join(output_dir, "action_dispatcher")
-                os.makedirs(action_dispatcher_folder, exist_ok=True)
-                parser = self._active_parser()
-                parser.save_yaml_file(
-                    file_path=os.path.join(action_dispatcher_folder, "obs_config.yaml"), data=parser.get_obs_config()
-                )
-                save_dispatch_templates(action_dispatcher_folder)
-
+                write_dataset_files(output_dir, self._active_parser(), self.yaml_converter.options.source)
             except Exception as e:
                 post_error = str(e) or type(e).__name__
                 logger.error(
-                    f"Failed to write populated {self.output_format} training config: {e}"
+                    f"Failed to write the config copies / action_dispatcher files: {e}"
                 )
 
         if success:
             logger.info("Dataset successfully converted and validated!")
             if post_error:
                 CustomMessageBox.warning(
-                    "The dataset was converted, but some extra files (training config / "
+                    "The dataset was converted, but some extra files (config copies / "
                     f"action_dispatcher files) could not be written:\n\n{post_error}"
                 )
             CustomMessageBox.info(
-                f"Dataset successfully converted to {self.output_format} format!\n\nOutput file: {combined_output_path}",
+                f"Dataset converted to {self.output_format} format.\n\n{self.yaml_converter.conversion_summary()}"
+                f"\n\nOutput file: {combined_output_path}",
             )
         else:
             logger.error("Dataset conversion failed")

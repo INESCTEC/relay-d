@@ -59,6 +59,12 @@ class DemoValidationResult:
         )
 
 
+def first_demo(f):
+    """(name, group) of the first group under data/ (a recording holds one demo), or ("", None)."""
+    names = list(f["data"].keys()) if "data" in f else []
+    return (names[0], f["data"][names[0]]) if names else ("", None)
+
+
 class DemoValidator:
     """Runs a fixed set of viability checks against a single demo's HDF5 group."""
 
@@ -88,7 +94,7 @@ class DemoValidator:
 
         try:
             with h5py.File(h5_path, "r") as f:
-                demo_name, demo_group = self._find_demo_group(f)
+                demo_name, demo_group = first_demo(f)
                 if demo_group is None:
                     result.checks.append(
                         CheckResult(
@@ -112,15 +118,6 @@ class DemoValidator:
 
         result.overall_status = self._aggregate(result.checks)
         return result
-
-    def _find_demo_group(self, f):
-        if "data" not in f:
-            return "", None
-        names = list(f["data"].keys())
-        if not names:
-            return "", None
-        demo_name = names[0]
-        return demo_name, f["data"][demo_name]
 
     def _aggregate(self, checks) -> CheckStatus:
         worst = CheckStatus.PASS

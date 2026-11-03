@@ -36,7 +36,6 @@ from ...utils.custom_message_box import CustomMessageBox
 from ..page_style import add_page_header, page_layout
 from ..settings.config_manager import config
 
-_FROM_FOLDER = "From the folder's config"  # robomimic: use robomimic_config.json / postprocess options
 _REFRESH_MS = 2000  # run table refresh
 
 
@@ -185,7 +184,7 @@ class TrainPage:
         self.combo_policy.clear()
         if ds is not None:
             if ds.format == launcher.ROBOMIMIC:
-                self.combo_policy.addItems([_FROM_FOLDER, *launcher.ROBOMIMIC_POLICIES])
+                self.combo_policy.addItems(launcher.ROBOMIMIC_POLICIES)
             else:
                 self.combo_policy.addItems(launcher.LEROBOT_POLICIES)
                 i = launcher.LEROBOT_POLICIES.index("smolvla")
@@ -211,7 +210,7 @@ class TrainPage:
 
     def _policy(self):
         text = self.combo_policy.currentText()
-        return None if text in ("", _FROM_FOLDER) else text
+        return text or None
 
     def _on_policy_changed(self):
         for widget, label in self._param_widgets.values():

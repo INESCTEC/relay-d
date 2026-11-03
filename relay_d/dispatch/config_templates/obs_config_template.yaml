@@ -28,10 +28,9 @@ config:
   # ===========================================================================
   # Topic inputs carry their own timestamp (msg.header.stamp), or the arrival
   # time if the message has no header (e.g. std_msgs/Bool, Float64). TF inputs
-  # use the TransformStamped's header.stamp from the lookup. Static inputs
-  # never carry a real timestamp and are always treated as "now".
+  # use the TransformStamped's header.stamp from the lookup.
   #
-  # When an observation is built from 2+ distinct live (non-static) inputs,
+  # When an observation is built from 2+ distinct inputs,
   # their timestamps must fall within `threshold` seconds of each other or
   # the observation is skipped this cycle (sample-and-hold — it keeps its
   # last value until inputs realign). A warning is logged once per
@@ -133,16 +132,6 @@ config:
     #                                 # supported here (same restriction as the
     #                                 # acquisition-side config_template.yaml).
 
-    # --- Static (constant) inputs — no topic required ---
-    # Use when a topic is not available in the deployment system but the model
-    # was trained expecting that observation. The value never changes at runtime.
-    # Reference in observations as: <name>.data[:] (list) or <name>.data (scalar).
-    #
-    # gripper_state:
-    #   static: [1.0]       # list form → use gripper_state.data[:]
-    # some_flag:
-    #   static: 0.0         # scalar form → use some_flag.data
-
     # --- TF inputs (parent_frame + child_frame) ---
     # tf_eef:
       # parent_frame: base
@@ -181,26 +170,9 @@ config:
   #   rot6d.i0 .. rot6d.i5                         (first 2 cols of R, col-major)
   #   rot_matrix.r00 .. rot_matrix.r22             (full 3x3, row-major)
   #
-  # NORMALIZATION:
-  #   Plain list form → values passed through unchanged (no normalization).
-  #   Dict form → optional linear mapping from real-world range to model range.
-  #
-  #   Plain list (no normalization):
-  #     my_obs:
-  #       - input.field[:]
-  #
-  #   Dict form with normalization:
-  #     my_obs:
-  #       specs:
-  #         - input.field[:]
-  #       normalize: true
-  #       normalized_range: [-1.0, 1.0]   # target range (default [-1, 1])
-  #       limits:
-  #         - {lower_lim: -3.14, upper_lim: 3.14}   # one per element, OR
-  #         - {lower_lim: -2.09, upper_lim: 2.09}   #   one entry → broadcast to all
-  #
-  #   Key names match action_config.yaml (lower_lim / upper_lim).
-  #   Normalization and action denormalization are exact inverses — same limits apply.
+  # NORMALIZATION: none. Values are passed to the model as read; robomimic and
+  #   LeRobot normalize them with the checkpoint's stats. An obs with
+  #   normalize / normalized_range / limits is refused at startup.
   #
   # ROTATION FORMAT (dict form only):
   #   rotation_format: rpy
@@ -208,9 +180,7 @@ config:
   #     converts it to (roll, pitch, yaw) — ZYX radians, same convention as the
   #     <tf>.euler.* paths and action_config.yaml's euler_to_quat.
   #
-  #     Conversion happens BEFORE normalization, so the observation is 3
-  #     elements wide (not 4) and `limits` takes 3 entries — one per axis —
-  #     or 1 to broadcast.
+  #     The observation is 3 elements wide (not 4).
   #
   #     Unlike the <tf_input>.euler.roll shortcut, which only exists for TF
   #     inputs, rotation_format works for ANY input that carries a quaternion:
@@ -231,34 +201,16 @@ config:
     # ZYX convention matches the euler_to_quat transform in action_config.yaml, so the
     # model sees and outputs Euler angles in the same convention.
     #
-    # Plain (no normalization):
     # robot0_eef_euler:
     #   - tf_eef.euler.roll
     #   - tf_eef.euler.pitch
     #   - tf_eef.euler.yaw
-    #
-    # With per-element normalization (recommended when limits differ per axis):
-    # robot0_eef_euler:
-    #   specs:
-    #     - tf_eef.euler.roll
-    #     - tf_eef.euler.pitch
-    #     - tf_eef.euler.yaw
-    #   normalize: true
-    #   normalized_range: [-1.0, 1.0]
-    #   limits:
-    #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # roll  (±180°)
-    #     - {lower_lim: -1.5708, upper_lim: 1.5708}   # pitch (±90°, avoids gimbal lock zone)
-    #     - {lower_lim: -3.1416, upper_lim: 3.1416}   # yaw   (±180°)
-    #
-    # NOTE: if the model also outputs Euler angles (action side), use the same limits
-    # in action_config.yaml → euler_to_quat entry so normalization and denormalization
-    # are exact inverses.
 
     # --- Quaternion -> roll/pitch/yaw via rotation_format (ANY input) ---
     # Same result as the euler.* block above, but works for non-TF inputs too.
-    # The 4 quaternion specs collapse to 3 values, so limits has 3 entries.
+    # The 4 quaternion specs collapse to 3 values.
     #
-    # From a PoseStamped topic (limits: same per-axis ranges as the euler.* example above):
+    # From a PoseStamped topic:
     # ee_rotation_rpy:
     #   specs:
     #     - ee_pose.pose.orientation.x
@@ -266,12 +218,6 @@ config:
     #     - ee_pose.pose.orientation.z
     #     - ee_pose.pose.orientation.w
     #   rotation_format: rpy
-    #   normalize: true
-    #   normalized_range: [-1.0, 1.0]
-    #   limits:
-    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # roll
-    #     - {lower_lim: -1.57079633, upper_lim: 1.57079633}   # pitch
-    #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # yaw
     #
     # A TF input works the same way (tf_eef.rotation.x / .y / .z / .w): the result
     # equals listing tf_eef.euler.roll / .pitch / .yaw.
@@ -309,35 +255,15 @@ config:
     #   - tf_eef.euler.pitch
     #   - tf_eef.euler.yaw
 
-    # --- Joint positions — plain list (no normalization) ---
+    # --- Joint positions ---
     # robot0_joint_pos:
     #   - joint_1.position[:]
 
-    # --- Joint positions — with per-element normalization ---
-    # robot0_joint_pos:
-    #   specs:
-    #     - joint_1.position[:]
-    #   normalize: true
-    #   normalized_range: [-1.0, 1.0]
-    #   limits:                                        # one entry per joint
-    #     - {lower_lim: -2.9671, upper_lim: 2.9671}   # iiwa_joint_1  (±170°)
-    #     - {lower_lim: -2.0944, upper_lim: 2.0944}   # iiwa_joint_2  (±120°)
-    #     - {lower_lim: -2.9671, upper_lim: 2.9671}   # iiwa_joint_3  (±170°)
-    #     - {lower_lim: -2.0944, upper_lim: 2.0944}   # iiwa_joint_4  (±120°)
-    #     - {lower_lim: -2.9671, upper_lim: 2.9671}   # iiwa_joint_5  (±170°)
-    #     - {lower_lim: -2.0944, upper_lim: 2.0944}   # iiwa_joint_6  (±120°)
-    #     - {lower_lim: -3.0543, upper_lim: 3.0543}   # iiwa_joint_7  (±175°)
-
-    # --- EEF position — with broadcast normalization (same range for x, y, z) ---
+    # --- EEF position ---
     # robot0_eef_pos:
-    #   specs:
-    #     - tf_eef.translation.x
-    #     - tf_eef.translation.y
-    #     - tf_eef.translation.z
-    #   normalize: true
-    #   normalized_range: [-1.0, 1.0]
-    #   limits:
-    #     - {lower_lim: -2.0, upper_lim: 2.0}    # one entry → applied to x, y, and z
+    #   - tf_eef.translation.x
+    #   - tf_eef.translation.y
+    #   - tf_eef.translation.z
 
     # --- Joint velocities ---
     # robot0_joint_vel:
@@ -374,7 +300,7 @@ config:
     # Each side is an ordinary scalar spec (optionally sin()/cos()-wrapped) and
     # the two sides may reference different inputs. The operator (+ - * /) must
     # have spaces around it. Mixes freely with ordinary specs, and works in the
-    # plain list form (no normalize/limits) as shown here.
+    # plain list form as shown here.
     #
     # object:
     #   - tf_object.translation.x            # (the object pose specs from the example above ...)
@@ -391,9 +317,7 @@ config:
     # Rules and gotchas:
     #   - One operation per spec: "a.x - b.x - c.x" is rejected at startup.
     #   - Slices are not allowed as operands: "a.position[:] - b.position[:]".
-    #   - Numeric literals are not supported — use a static input as a constant:
-    #       input:  z_offset: {static: 0.1}
-    #       spec:   tf_object.translation.z - z_offset.data
+    #   - Numeric literals are not supported: both operands are input fields.
     #   - Both operand inputs count towards the sync check for this observation
     #     (see config.sync above), so an obs that used to depend on one input
     #     may now sample-and-hold when the two inputs' stamps drift apart.
@@ -444,7 +368,7 @@ config:
     #   - force_z.data
 
     # --- Camera / organized-pointcloud passthrough obs ---
-    # No specs, no normalize/rotation_format — the decoded array is used
+    # No specs, no rotation_format — the decoded array is used
     # exactly as received (uint8 (H,W,3) for rgb, native dtype (H,W) for
     # depth, float32 (H,W,fields) for an organized pointcloud). `source` must
     # name an `input:` entry above resolving to sensor_msgs/Image or an

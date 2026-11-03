@@ -3,7 +3,7 @@ obs_builder.py
 --------------
 Builds the observation dict for model inference by subscribing to ROS2 topics
 and performing TF lookups, as configured in obs_config.yaml. The config syntax
-(inputs, observation specs, normalization, rotation_format, passthrough
+(inputs, observation specs, rotation_format, passthrough
 `source:` entries, sync threshold) is documented, with examples, in
 config_templates/obs_config_template.yaml: that file is the reference.
 
@@ -15,8 +15,6 @@ import operator
 import re
 import threading
 import time
-import types
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -28,44 +26,16 @@ from tf2_ros import Buffer
 from rosidl_runtime_py.utilities import get_message
 from relay_d.utils.config_loader import load_yaml_config
 from relay_d.utils.numerics import (
+    enriched_tf,
     inputs_in_sync,
-    normalize,
     quat_to_euler,
-    quat_to_rot_matrix,
     read_scalar,
+    stamp_to_sec,
     strip_trig,
 )
 from relay_d.utils.qos import subscription_qos
 from relay_d.utils.ros_media_codec import decode_image, decode_organized_pointcloud
 from relay_d.utils.tf_topic import _TfTopicListener, get_or_create_tf_buffer
-
-
-# ---------------------------------------------------------------------------
-# Normalization
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _NormConfig:
-    """Per-stream normalization parameters.
-
-    limits: list of (lower_lim, upper_lim) tuples — one per element, or a single
-            entry that is broadcast to every element in the stream.
-    """
-    limits: List[Tuple[float, float]]
-    norm_min: float = -1.0
-    norm_max: float =  1.0
-
-
-def _apply_normalization(arr: np.ndarray, nc: _NormConfig) -> np.ndarray:
-    """Linearly map each element from its real-world range to normalized_range.
-
-    Symmetric inverse of action_dispatcher._apply_limits.
-    """
-    out = np.empty_like(arr)
-    for i, v in enumerate(arr):
-        lo, hi = nc.limits[min(i, len(nc.limits) - 1)]
-        out[i] = normalize(v, lo, hi, nc.norm_min, nc.norm_max)
-    return out
 
 
 def _get_specs(stream_def) -> List[str]:
@@ -88,64 +58,6 @@ _BIN_OPS = {
 # what keeps this from matching ordinary dotted field paths (they never
 # contain whitespace).
 _BINOP_RE = re.compile(r"^(.+?)\s+([+\-*/])\s+(.+)$")
-
-
-# ---------------------------------------------------------------------------
-# Input synchronization
-# ---------------------------------------------------------------------------
-
-def _stamp_to_seconds(stamp) -> float:
-    """builtin_interfaces/Time (sec, nanosec) -> float seconds."""
-    return stamp.sec + stamp.nanosec * 1e-9
-
-
-# ---------------------------------------------------------------------------
-# Quaternion helpers
-# ---------------------------------------------------------------------------
-
-def _quat_to_euler(x: float, y: float, z: float, w: float):
-    """Quaternion (x,y,z,w) -> (roll, pitch, yaw) radians, ZYX convention."""
-    return tuple(quat_to_euler([x, y, z, w]))
-
-
-# ---------------------------------------------------------------------------
-# TF enriched wrapper
-# ---------------------------------------------------------------------------
-
-def _make_enriched_tf(tf_stamped) -> types.SimpleNamespace:
-    """
-    Wrap a TransformStamped so that attrgetter works for all supported TF specs:
-      translation.x/y/z
-      rotation.x/y/z/w
-      euler.roll/pitch/yaw         — ZYX radians
-      rot6d.i0..i5                 — first two columns of R, column-major
-      rot_matrix.r00..r22          — full 3x3, row-major
-    """
-    t = tf_stamped.transform.translation
-    r = tf_stamped.transform.rotation
-    qx, qy, qz, qw = r.x, r.y, r.z, r.w
-
-    roll, pitch, yaw = _quat_to_euler(qx, qy, qz, qw)
-    euler = types.SimpleNamespace(roll=roll, pitch=pitch, yaw=yaw)
-
-    R = quat_to_rot_matrix(qx, qy, qz, qw)
-    rot_matrix = types.SimpleNamespace(
-        r00=R[0, 0], r01=R[0, 1], r02=R[0, 2],
-        r10=R[1, 0], r11=R[1, 1], r12=R[1, 2],
-        r20=R[2, 0], r21=R[2, 1], r22=R[2, 2],
-    )
-    rot6d_vals = list(R[:, 0]) + list(R[:, 1])
-    rot6d = types.SimpleNamespace(**{f"i{i}": float(v) for i, v in enumerate(rot6d_vals)})
-
-    return types.SimpleNamespace(
-        transform=types.SimpleNamespace(
-            translation=t,
-            rotation=r,
-            euler=euler,
-            rot_matrix=rot_matrix,
-            rot6d=rot6d,
-        )
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -196,9 +108,15 @@ class ObsBuilder(Node):
     """
 
     def __init__(self, obs_config_path: str):
-        super().__init__("obs_builder")
-
         cfg = load_yaml_config(obs_config_path)["config"]
+        for name, spec in cfg.get("input", {}).items():
+            if "static" in spec:  # checked before the node exists: refused even without rclpy.init()
+                raise ValueError(
+                    f"input '{name}': 'static' inputs were removed: the recorder never wrote them, so no model "
+                    f"was trained on one. Remove it from obs_config.yaml (and from the observations that use it)."
+                )
+
+        super().__init__("obs_builder")
 
         self._input_cfg: Dict[str, dict]      = cfg.get("input", {})
         self._obs_cfg:   Dict[str, List[str]] = cfg.get("observations", {})
@@ -221,28 +139,15 @@ class ObsBuilder(Node):
 
         # Classify inputs
         self._tf_inputs: set                      = set()
-        self._static_inputs: set                  = set()
         self._joint_filters: Dict[str, List[str]] = {}
         for name, spec in self._input_cfg.items():
             if "parent_frame" in spec and "child_frame" in spec:
                 self._tf_inputs.add(name)
             if "joint_names" in spec:
                 self._joint_filters[name] = spec["joint_names"]
-            if "static" in spec:
-                self._static_inputs.add(name)
 
-        # Pre-populate static inputs — always available, never overwritten by callbacks
-        for name in self._static_inputs:
-            val = self._input_cfg[name]["static"]
-            if isinstance(val, (int, float)):
-                arr = np.array([float(val)], dtype=np.float32)
-            else:
-                arr = np.array(val, dtype=np.float32)
-            self._latest_inputs[name] = types.SimpleNamespace(data=arr)
-
-        # Build per-obs extractor lists and normalization configs
+        # Build per-obs extractor lists
         self._extractors:      Dict[str, List[_Entry]]          = {}
-        self._norm_params:     Dict[str, Optional[_NormConfig]] = {}
         self._rotation_format: Dict[str, Optional[str]]         = {}
         self._obs_input_names: Dict[str, set]                   = {}
         self._passthrough_obs: Dict[str, str]                   = {}  # obs_name -> input_name
@@ -307,8 +212,8 @@ class ObsBuilder(Node):
     def _build_extractors(self) -> None:
         for obs_name, stream_def in self._obs_cfg.items():
             # Passthrough obs: {source: <input_name>} — no specs, no
-            # normalization/rotation-format. Deliberately kept OUT of
-            # self._extractors/_norm_params/_rotation_format entirely (those
+            # rotation-format. Deliberately kept OUT of
+            # self._extractors/_rotation_format entirely (those
             # all assume a flat float row); handled by its own pass in
             # _topic_callback/_evaluate_all instead.
             if isinstance(stream_def, dict) and "source" in stream_def:
@@ -321,25 +226,16 @@ class ObsBuilder(Node):
                 self._passthrough_obs[obs_name] = input_name
                 continue
 
-            # Parse normalization config (dict form only)
             if isinstance(stream_def, list):
-                self._norm_params[obs_name] = None
                 rot_fmt = None
             else:
-                if stream_def.get("normalize", False):
-                    norm_min, norm_max = stream_def.get("normalized_range", [-1.0, 1.0])
-                    limits = [
-                        (float(l["lower_lim"]), float(l["upper_lim"]))
-                        for l in stream_def.get("limits", [])
-                    ]
-                    if not limits:
-                        raise ValueError(
-                            f"obs '{obs_name}': normalize=true but 'limits' is "
-                            f"empty or missing in obs_config.yaml"
-                        )
-                    self._norm_params[obs_name] = _NormConfig(limits, norm_min, norm_max)
-                else:
-                    self._norm_params[obs_name] = None
+                old = [k for k in ("normalize", "normalized_range", "limits") if k in stream_def]
+                if old:  # an old checkpoint trained on normalized obs would act wrongly on raw ones
+                    raise ValueError(
+                        f"obs '{obs_name}': Relay-D no longer normalizes observations "
+                        f"(robomimic/LeRobot do it with the checkpoint's stats). Remove "
+                        f"{', '.join(old)} from obs_config.yaml, then re-convert and retrain."
+                    )
 
                 # rotation_format (dict form only)
                 rot_fmt = stream_def.get("rotation_format")
@@ -390,9 +286,7 @@ class ObsBuilder(Node):
                     real_inputs.update((payload[1], payload[5]))
                 else:
                     real_inputs.add(inp_name)
-            self._obs_input_names[obs_name] = {
-                n for n in real_inputs if n not in self._static_inputs
-            }
+            self._obs_input_names[obs_name] = real_inputs
 
     def _parse_atomic(self, obs_name: str, raw_spec: str, spec: str, math_op) -> _Entry:
         """Parse one atomic '<input>.<field_path>' or '<input>.<field_path>[:]'.
@@ -481,14 +375,6 @@ class ObsBuilder(Node):
                 f"(w LAST, not first); a wrong order silently yields wrong angles."
             )
 
-        nc = self._norm_params.get(obs_name)
-        if nc is not None and len(nc.limits) not in (1, 3):
-            raise ValueError(
-                f"obs '{obs_name}': rotation_format: rpy produces 3 values "
-                f"(roll, pitch, yaw) but 'limits' has {len(nc.limits)} entries — "
-                f"provide 3 (one per axis) or 1 (broadcast to all)."
-            )
-
     # ------------------------------------------------------------------
     # Subscription setup with auto type discovery
     # ------------------------------------------------------------------
@@ -496,7 +382,7 @@ class ObsBuilder(Node):
     def _setup_subscriptions(self) -> None:
         topic_map = {name: tlist for name, tlist in self.get_topic_names_and_types()}
         for input_name, spec in self._input_cfg.items():
-            if input_name in self._tf_inputs or input_name in self._static_inputs:
+            if input_name in self._tf_inputs:
                 continue
             topic = spec["topic"]
             if topic in topic_map and topic_map[topic]:
@@ -540,7 +426,7 @@ class ObsBuilder(Node):
 
     def _decode_passthrough(self, input_name: str, msg: Any) -> Optional[np.ndarray]:
         """Decode a camera/pointcloud message for a passthrough obs into a
-        plain numpy array (no flatten/normalize) via the shared codec module,
+        plain numpy array (no flatten) via the shared codec module,
         so a live obs matches what a trained model saw during postprocessing
         (relay_d/acquisition/qt_app/ui/postprocess/yaml_driven_converter.py's
         bridge-map obs). Returns None (and warns once) on anything it can't
@@ -576,9 +462,9 @@ class ObsBuilder(Node):
         # Capture timestamp before any wrapping (e.g. _JointStateView) hides
         # the original message's header.
         if hasattr(msg, "header"):
-            ts = _stamp_to_seconds(msg.header.stamp)
+            ts = stamp_to_sec(msg.header.stamp)
         else:
-            ts = _stamp_to_seconds(self.get_clock().now().to_msg())
+            ts = stamp_to_sec(self.get_clock().now().to_msg())
 
         if input_name in self._passthrough_sources:
             decoded = self._decode_passthrough(input_name, msg)
@@ -625,11 +511,11 @@ class ObsBuilder(Node):
                     spec["child_frame"],
                     rclpy.time.Time(),
                 )
-                updates[name] = _make_enriched_tf(tf)
-                ts = _stamp_to_seconds(tf.header.stamp)
+                updates[name] = enriched_tf(tf)
+                ts = stamp_to_sec(tf.header.stamp)
                 # A chain of only static transforms comes back stamped 0 and never changes:
-                # treat it as always fresh (like a `static:` input) instead of stale forever.
-                ts_updates[name] = ts if ts != 0.0 else _stamp_to_seconds(self.get_clock().now().to_msg())
+                # treat it as always fresh instead of stale forever.
+                ts_updates[name] = ts if ts != 0.0 else stamp_to_sec(self.get_clock().now().to_msg())
             except Exception as exc:
                 if name not in self._tf_warned:
                     self._tf_warned.add(name)
@@ -651,12 +537,9 @@ class ObsBuilder(Node):
     # ------------------------------------------------------------------
 
     def _evaluate_all(self) -> None:
-        now = _stamp_to_seconds(self.get_clock().now().to_msg())
         with self._lock:
             snapshot = dict(self._latest_inputs)
             ts_snapshot = dict(self._input_timestamps)
-        for name in self._static_inputs:
-            ts_snapshot[name] = now
 
         new_vals: Dict[str, np.ndarray] = {}
 
@@ -719,25 +602,12 @@ class ObsBuilder(Node):
 
             if ok:
                 if self._rotation_format.get(obs_name) == "rpy":
-                    # 4 raw quaternion floats -> (roll, pitch, yaw), BEFORE
-                    # normalization, so `limits` describes the Euler ranges.
-                    row = [float(v) for v in _quat_to_euler(*row)]
-                arr = np.array(row, dtype=np.float32)
-                nc = self._norm_params.get(obs_name)
-                if nc is not None:
-                    if len(nc.limits) not in (1, len(arr)):
-                        # Never reuse the last limit for the rest: leave the obs unset so pre-flight fails.
-                        self.get_logger().error(
-                            f"obs '{obs_name}': 'limits' needs 1 entry or one per value ({len(arr)}), "
-                            f"got {len(nc.limits)}.",
-                            throttle_duration_sec=5.0,
-                        )
-                        continue
-                    arr = _apply_normalization(arr, nc)
-                new_vals[obs_name] = arr
+                    # 4 raw quaternion floats -> (roll, pitch, yaw)
+                    row = [float(v) for v in quat_to_euler(row)]
+                new_vals[obs_name] = np.array(row, dtype=np.float32)
 
         # Passthrough obs (camera/organized-pointcloud): the decoded array is
-        # used as-is — no flatten, no float32 cast, no normalization/rotation.
+        # used as-is — no flatten, no float32 cast, no rotation.
         for obs_name, input_name in self._passthrough_obs.items():
             if not inputs_in_sync({input_name}, ts_snapshot, self._sync_threshold):
                 self._warn_desync(obs_name, {input_name}, ts_snapshot)
@@ -809,19 +679,11 @@ class ObsBuilder(Node):
         deadline = time.monotonic() + timeout
         report: dict = {}
 
-        # Static inputs — always available
-        for name in self._static_inputs:
-            report[name] = {
-                "ok": True,
-                "kind": "static",
-                "detail": str(self._input_cfg[name]["static"]),
-            }
-
         # Topic inputs — probe ROS graph with retries
         topic_inputs = {
             name: self._input_cfg[name]["topic"]
             for name in self._input_cfg
-            if name not in self._tf_inputs and name not in self._static_inputs
+            if name not in self._tf_inputs
         }
         pending_topics = set(topic_inputs)
 

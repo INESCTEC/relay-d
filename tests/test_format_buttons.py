@@ -48,11 +48,7 @@ def test_only_one_format_button_is_checked_at_a_time(page):
     assert _state(p, ui) == ("robomimic", True, False)
 
 
-def test_preview_follows_the_selected_format(page):
-    p, ui, _ = page
-    ui.btn_format_lerobot.click()
-    assert "lerobot" in ui.txt_output_preview.toPlainText().lower()
-    ui.btn_format_robomimic.click()
-    assert "robomimic" in ui.txt_output_preview.toPlainText().lower()
-    ui.btn_format_robomimic.click()  # deselect clears the preview
-    assert ui.txt_output_preview.toPlainText() == ""
+def test_output_preview_is_gone(page):
+    _, ui, _ = page
+    assert not hasattr(ui, "outputPreviewWidget")
+    assert not hasattr(ui, "txt_input_structure")  # replaced by the pre-check table

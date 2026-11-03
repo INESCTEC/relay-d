@@ -1,35 +1,31 @@
 """Conversion-format options, kept apart from the acquisition config.
 
 The acquisition config says what to record and how streams/actions are built.
-Choices that only matter when converting to a particular format (robomimic env
-metadata, the robomimic training-config model, train/val/test split fractions,
-the LeRobot task text, ...) live in an optional ``postprocess_config.yaml``::
+Choices that only matter when converting to a particular format (train/val
+split fractions, the LeRobot task text, ...) live in an optional
+``postprocess_config.yaml``::
 
     postprocess:
       robomimic:
-        training_model: bc_rnn_gmm
-        splits: {train_frac: 0.8, val_frac: 0.2, test_frac: 0.0}
-        metadata: {env_name: Lift, env_version: 1.5.1, type: 1, env_kwargs: {...}}
+        splits: {train_frac: 0.8, val_frac: 0.2}
       lerobot:
         task: "lift the box"
         robot_type: iiwa
         state_streams: [eef_translation, robot_joint_pos]
 
-Lookup order for every key: this file, then the legacy location inside the
-acquisition config (with a one-time deprecation warning), then a default.
-No Qt or ROS needed.
+Every key not set here takes its default. Removed keys (here or in the
+acquisition config) are refused with what to do instead. No Qt or ROS needed.
 """
 
 from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
 from relay_d.utils import user_settings
-from relay_d.utils.coloring_logger import logger
 
 OPTIONS_FILENAME = "postprocess_config.yaml"
 
@@ -47,17 +43,27 @@ def dataset_output_paths(save_folder: str, fmt: str, now: datetime) -> Tuple[str
     return output_dir, os.path.join(output_dir, f"dataset_{int(now.timestamp())}{suffix}{extension}")
 
 
-_warned_legacy: Set[str] = set()
+# Removed keys -> why and what to do. A config that still has one is refused, never silently ignored.
+_SPLITS_MOVED = "move it to postprocess_config.yaml under robomimic.splits"
+_TEST_SPLIT = "the test split was removed (robomimic never trains or validates on it); delete it"
+REMOVED_ACQUISITION_KEYS = {
+    "metadata": "robomimic env metadata is no longer written (env_args is a fixed stub); "
+                "put recording_frequency at the top level of config and delete 'metadata'",
+    "training_model": "choose the policy on the Train tab (or relay-d-train --policy) and delete it",
+    "train_frac": _SPLITS_MOVED,
+    "val_frac": _SPLITS_MOVED,
+    "test_frac": _TEST_SPLIT,
+    "lerobot": "move it to postprocess_config.yaml under 'lerobot'",
+}
+REMOVED_OPTIONS = {
+    "metadata": "robomimic env metadata is no longer written (env_args is a fixed stub); delete it",
+    "training_model": "choose the policy on the Train tab (or relay-d-train --policy) and delete it",
+}
 
 
-def _warn_legacy(key: str, new_location: str) -> None:
-    if key in _warned_legacy:
-        return
-    _warned_legacy.add(key)
-    logger.warning(
-        f"'{key}' in the acquisition config is deprecated; move it to "
-        f"{OPTIONS_FILENAME} under '{new_location}'."
-    )
+def removed_key_errors(acq_config: Optional[Dict]) -> List[str]:
+    """One error per removed key still in the acquisition config's ``config`` section."""
+    return [f"'{k}' was removed: {why}." for k, why in REMOVED_ACQUISITION_KEYS.items() if k in (acq_config or {})]
 
 
 class PostprocessOptions:
@@ -89,6 +95,12 @@ class PostprocessOptions:
                 problems.append(f"'postprocess.{fmt}' must be a mapping.")
         if problems:
             return None, problems
+        robomimic = section.get("robomimic", {})
+        problems = [f"'robomimic.{k}' was removed: {why}." for k, why in REMOVED_OPTIONS.items() if k in robomimic]
+        if "test_frac" in (robomimic.get("splits") or {}):
+            problems.append(f"'robomimic.splits.test_frac' was removed: {_TEST_SPLIT}.")
+        if problems:
+            return None, problems
         known = {"robomimic", "lerobot"}
         warnings = [
             f"warning: unknown format section 'postprocess.{k}' (known: {sorted(known)})"
@@ -113,54 +125,19 @@ class PostprocessOptions:
         value = self._data.get(fmt)
         return value if isinstance(value, dict) else {}
 
-    def robomimic_metadata(self, acq_config: Optional[Dict] = None) -> Dict:
-        """Environment metadata embedded as robomimic ``env_args``."""
-        meta = self._section("robomimic").get("metadata")
-        if isinstance(meta, dict) and meta:
-            return meta
-        legacy = (acq_config or {}).get("metadata")
-        if isinstance(legacy, dict) and legacy:
-            _warn_legacy("metadata", "robomimic.metadata")
-            return legacy
-        return {}
-
-    def training_model(self, acq_config: Optional[Dict] = None) -> str:
-        model = self._section("robomimic").get("training_model")
-        if model:
-            return str(model)
-        legacy = (acq_config or {}).get("training_model")
-        if legacy:
-            _warn_legacy("training_model", "robomimic.training_model")
-            return str(legacy)
-        default = user_settings.get("postprocess_default_training_model")  # the Settings table owns the default
-        logger.info(f"No 'training_model' set; using the default '{default}'.")
-        return default
-
     @staticmethod
     def _default_splits() -> Dict[str, float]:
-        """Defaults from the user settings (train/val; the rest is eval)."""
-        train, val = float(user_settings.get("split_train")), float(user_settings.get("split_val"))
-        return {"train_frac": train, "val_frac": val, "test_frac": round(max(0.0, 1.0 - train - val), 6)}
+        """Defaults from the user settings (train/val; any rest also trains)."""
+        return {"train_frac": float(user_settings.get("split_train")), "val_frac": float(user_settings.get("split_val"))}
 
-    def splits(self, acq_config: Optional[Dict] = None) -> Dict[str, float]:
-        """train/val/test fractions for the robomimic ``mask`` group."""
+    def splits(self) -> Dict[str, float]:
+        """train/val fractions for the robomimic ``mask`` group."""
         out = self._default_splits()
         file_splits = self._section("robomimic").get("splits")
-        file_splits = file_splits if isinstance(file_splits, dict) else {}
-        for key in list(out):
-            if key in file_splits:
-                out[key] = file_splits[key]
-            elif acq_config and key in acq_config:
-                _warn_legacy(key, "robomimic.splits")
-                out[key] = acq_config[key]
+        if isinstance(file_splits, dict):
+            out.update({k: file_splits[k] for k in out if k in file_splits})
         return out
 
-    def lerobot(self, acq_config: Optional[Dict] = None) -> Dict[str, Any]:
+    def lerobot(self) -> Dict[str, Any]:
         """LeRobot options: ``task``, ``robot_type``, ``state_streams``."""
-        legacy = (acq_config or {}).get("lerobot")
-        merged: Dict[str, Any] = {}
-        if isinstance(legacy, dict) and legacy:
-            _warn_legacy("lerobot", "lerobot")
-            merged.update(legacy)
-        merged.update({k: v for k, v in self._section("lerobot").items() if v is not None})
-        return merged
+        return {k: v for k, v in self._section("lerobot").items() if v is not None}

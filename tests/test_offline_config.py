@@ -40,6 +40,14 @@ def test_warnings_for_missing_output_and_fps(tmp_path):
     assert any("recording_frequency" in p for p in problems)
 
 
+@pytest.mark.parametrize("key", ["metadata", "training_model", "test_frac"])
+def test_removed_keys_are_rejected(tmp_path, key):
+    cfg = json.loads(json.dumps(DATA_CONFIG))
+    cfg[key] = {"recording_frequency": 10} if key == "metadata" else 0.1
+    parser, problems = load_offline_config(_write_cfg(tmp_path / "c.yaml", cfg))
+    assert parser is None and any(f"'{key}'" in p and "removed" in p for p in problems)
+
+
 def test_malformed_stream_spec_is_rejected(tmp_path):
     cfg = json.loads(json.dumps(DATA_CONFIG))
     cfg["output"]["streams"]["bad"] = ["a.x - b.y - c.z"]  # arithmetic allows exactly two operands

@@ -14,6 +14,7 @@ import types as _types
 import numpy as np
 
 from relay_d.utils.coloring_logger import logger
+from relay_d.utils.numerics import enriched_tf, read_scalar, strip_trig
 
 try:
     from sensor_msgs.msg import CompressedImage, Image, PointCloud2
@@ -23,29 +24,10 @@ except ImportError:  # pragma: no cover - keeps this module importable without R
     _UNSUPPORTED_STREAM_MSG_TYPES = ()
 
 
-def fill_none_gaps(data_list):
-    """Forward-fill then back-fill None entries so all streams have equal length.
-
-    Forward-fill handles Nones in the middle/end; back-fill covers leading Nones
-    that arise when a stream's inputs haven't produced a valid row yet.
-    Returns the original list unchanged when all entries are None.
-    """
-    if not any(item is not None for item in data_list):
-        return data_list
-    filled = list(data_list)
-    last_valid = None
-    for i, item in enumerate(filled):
-        if item is not None:
-            last_valid = item
-        elif last_valid is not None:
-            filled[i] = last_valid
-    last_valid = None
-    for i in range(len(filled) - 1, -1, -1):
-        if filled[i] is not None:
-            last_valid = filled[i]
-        elif last_valid is not None:
-            filled[i] = last_valid
-    return filled
+# Same spec grammar as relay_d/dispatch/obs_builder.py, so a recorded stream has the width and values
+# the live obs will have: "<operand> <op> <operand>" needs spaces around the operator.
+_BINOP_RE = re.compile(r"^(.+?)\s+([+\-*/])\s+(.+)$")
+_BIN_OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
 
 
 class StreamBuilder:
@@ -87,10 +69,9 @@ class StreamBuilder:
             for extractor in extractors:
                 if extractor[0] == "simple":
                     names.add(extractor[1])
-                else:  # "binary"
-                    _kind, _op, (in_a, _ga), (in_b, _gb) = extractor
-                    names.add(in_a)
-                    names.add(in_b)
+                elif extractor[0] == "binary":
+                    names.add(extractor[2][0])
+                    names.add(extractor[3][0])
         return names
 
     def _build_stream_extractors(self):
@@ -115,97 +96,72 @@ class StreamBuilder:
                 self._joint_name_filters[entry["name"]] = frozenset(names)
                 logger.info(f"Joint filter for '{entry['name']}': {list(names)}")
 
-        # Matches "<operand> <op> <operand>" with a single +/- surrounded by
-        # whitespace. Operand chars exclude space/+/-, so ROS-style identifiers,
-        # dotted field paths and a trailing [:] are captured but the operator is
-        # not, making the split unambiguous.
-        binary_re = re.compile(
-            r"^(?P<a>[\w.\[\]:]+)\s+(?P<op>[+\-])\s+(?P<b>[\w.\[\]:]+)$"
-        )
-        binary_ops = {"+": operator.add, "-": operator.sub}
+        def _error(msg):
+            logger.error(msg)
+            self.build_errors.append(msg)
 
-        def _parse_operand(operand):
-            """Resolve one dotted operand to (input_name, getter, is_slice).
-
-            Returns None (and logs) on an operand with no dot separator so the
-            caller can skip the whole spec.
-            """
+        def _parse_operand(operand, spec):
+            """Resolve one dotted operand to (input_name, getter, is_slice), or None (logged)."""
             operand = operand.strip()
-            try:
-                first_dot = operand.index(".")
-            except ValueError:
-                msg = f"Stream spec operand '{operand}' has no dot separator — skipped"
-                logger.error(msg)
-                self.build_errors.append(msg)
+            if "." not in operand:
+                _error(f"Stream spec '{spec}': operand '{operand}' has no dot separator — skipped")
                 return None
-            input_name = operand[:first_dot]
-            raw_field = operand[first_dot + 1:]
+            input_name, raw_field = operand.split(".", 1)
             is_slice = raw_field.endswith("[:]")
             field_path = raw_field[:-3] if is_slice else raw_field
+            if any(c in field_path for c in "+-*/"):
+                _error(
+                    f"Stream spec '{spec}': arithmetic operators must have spaces "
+                    f"around them (e.g. 'a.x - b.x') — skipped"
+                )
+                return None
             if input_name in self._tf_input_names:
                 field_path = "transform." + field_path
             return input_name, operator.attrgetter(field_path), is_slice
 
         streams = self.yaml_parser.get_streams()
         for stream_name, specs in streams.items():
-            if isinstance(specs, dict):  # dict form — extract spec list, ignore normalize/limits
+            if isinstance(specs, dict):  # dict form — extract spec list, ignore rotation_format
                 specs = specs.get("specs", [])
             extractor_list = []
             for spec in specs:
-                # Detect sin(...) / cos(...) wrappers, e.g. sin(joint_1.position[:])
-                math_op = None
-                inner_spec = spec.strip()
-                if inner_spec.startswith(("sin(", "cos(")) and inner_spec.endswith(")"):
-                    func_name = inner_spec[:3]
-                    inner_spec = inner_spec[4:-1].strip()
-                    math_op = np.sin if func_name == "sin" else np.cos
+                # sin(...)/cos(...) enclosing the whole spec, e.g. sin(joint_1.position[:]) or sin(a.x - b.x)
+                math_op, inner_spec = strip_trig(spec.strip())
 
-                # Binary arithmetic spec: <operand> +|- <operand>
-                bin_match = binary_re.match(inner_spec)
-                if bin_match:
-                    if math_op is not None:
-                        msg = (
-                            f"Stream spec '{spec}' combines sin/cos with arithmetic "
-                            f"— unsupported, skipped"
-                        )
-                        logger.error(msg)
-                        self.build_errors.append(msg)
-                        continue
-                    parsed_a = _parse_operand(bin_match.group("a"))
-                    parsed_b = _parse_operand(bin_match.group("b"))
-                    if parsed_a is None or parsed_b is None:
-                        continue  # _parse_operand already logged
-                    in_a, get_a, slice_a = parsed_a
-                    in_b, get_b, slice_b = parsed_b
-                    if slice_a or slice_b:
-                        msg = (
-                            f"Stream spec '{spec}': arithmetic operands must be scalars "
-                            f"([:] not allowed) — skipped"
-                        )
-                        logger.error(msg)
-                        self.build_errors.append(msg)
-                        continue
-                    op_func = binary_ops[bin_match.group("op")]
-                    extractor_list.append(
-                        ("binary", op_func, (in_a, get_a), (in_b, get_b))
-                    )
+                if inner_spec.startswith("zero:"):
+                    try:
+                        extractor_list.append(("zero", int(inner_spec[5:])))
+                    except ValueError:
+                        _error(f"Stream spec '{spec}': zero:N needs an integer N — skipped")
                     continue
 
-                # Guard against a +/- operator without surrounding spaces, which
-                # would otherwise mis-parse as a single garbage field path.
-                if ("+" in inner_spec or "-" in inner_spec):
-                    msg = (
-                        f"Stream spec '{spec}': arithmetic operators must have spaces "
-                        f"around them (e.g. 'a.x - b.x') — skipped"
-                    )
-                    logger.error(msg)
-                    self.build_errors.append(msg)
+                # Binary arithmetic spec: <operand> +|-|*|/ <operand>, each side may have its own sin/cos
+                bin_match = _BINOP_RE.match(inner_spec)
+                if bin_match:
+                    sides = []
+                    for side in (bin_match.group(1).strip(), bin_match.group(3).strip()):
+                        if _BINOP_RE.match(side):
+                            _error(f"Stream spec '{spec}': only one arithmetic operation per spec — skipped")
+                            break
+                        side_op, side_spec = strip_trig(side)
+                        parsed = _parse_operand(side_spec, spec)
+                        if parsed is None:
+                            break
+                        if parsed[2]:
+                            _error(
+                                f"Stream spec '{spec}': arithmetic operands must be scalars "
+                                f"([:] not allowed) — skipped"
+                            )
+                            break
+                        sides.append((parsed[0], parsed[1], side_op))
+                    if len(sides) == 2:
+                        extractor_list.append(("binary", _BIN_OPS[bin_match.group(2)], sides[0], sides[1], math_op))
                     continue
 
                 # Simple single-operand spec.
-                parsed = _parse_operand(inner_spec)
+                parsed = _parse_operand(inner_spec, spec)
                 if parsed is None:
-                    continue  # _parse_operand already logged the no-dot error
+                    continue
                 input_name, getter, is_slice = parsed
                 extractor_list.append(("simple", input_name, getter, is_slice, math_op))
             if not extractor_list:
@@ -269,57 +225,50 @@ class StreamBuilder:
             f"See the 'output.streams' comment block in config_template.yaml."
         )
 
+    def _input(self, stream_name, input_name, all_data):
+        """The message of ``input_name`` ready for the getters, or None (no data / unsupported type)."""
+        msg = all_data.get(input_name)
+        if msg is None:
+            return None
+        if isinstance(msg, _UNSUPPORTED_STREAM_MSG_TYPES):
+            self._warn_unsupported_type(stream_name, input_name, msg)
+            return None
+        if input_name in self._tf_input_names:
+            return enriched_tf(msg)  # euler.* / rot6d.* / rot_matrix.*, as obs_builder sees TF
+        return self.apply_joint_filter(input_name, msg)
+
     def evaluate(self, all_data: dict):
         for stream_name, extractors in self._stream_extractors.items():
             row = []
             ok = True
             for extractor in extractors:
-                if extractor[0] == "simple":
-                    _kind, input_name, getter, is_slice, math_op = extractor
-                    msg = all_data.get(input_name)
-                    if msg is None:
-                        ok = False
-                        break
-                    if isinstance(msg, _UNSUPPORTED_STREAM_MSG_TYPES):
-                        self._warn_unsupported_type(stream_name, input_name, msg)
-                        ok = False
-                        break
-                    msg = self.apply_joint_filter(input_name, msg)
-                    try:
-                        val = getter(msg)
+                try:
+                    if extractor[0] == "zero":
+                        row.extend([0.0] * extractor[1])
+                    elif extractor[0] == "simple":
+                        _kind, input_name, getter, is_slice, math_op = extractor
+                        msg = self._input(stream_name, input_name, all_data)
+                        if msg is None:
+                            ok = False
+                            break
                         if is_slice:
+                            val = getter(msg)
                             vals = list(val) if isinstance(val, _array.array) else list(val[:])
-                            if math_op is not None:
-                                vals = [float(math_op(v)) for v in vals]
-                            row.extend(vals)
+                            row.extend(float(math_op(v)) if math_op is not None else float(v) for v in vals)
                         else:
-                            v = float(val)
-                            row.append(float(math_op(v)) if math_op is not None else v)
-                    except (AttributeError, TypeError, IndexError, ValueError):  # e.g. a short joint array: hold the last row
-                        ok = False
-                        break
-                else:  # "binary": op_func(operand_a, operand_b), both scalars
-                    _kind, op_func, (in_a, get_a), (in_b, get_b) = extractor
-                    msg_a = all_data.get(in_a)
-                    msg_b = all_data.get(in_b)
-                    if msg_a is None or msg_b is None:
-                        ok = False
-                        break
-                    if isinstance(msg_a, _UNSUPPORTED_STREAM_MSG_TYPES):
-                        self._warn_unsupported_type(stream_name, in_a, msg_a)
-                        ok = False
-                        break
-                    if isinstance(msg_b, _UNSUPPORTED_STREAM_MSG_TYPES):
-                        self._warn_unsupported_type(stream_name, in_b, msg_b)
-                        ok = False
-                        break
-                    msg_a = self.apply_joint_filter(in_a, msg_a)
-                    msg_b = self.apply_joint_filter(in_b, msg_b)
-                    try:
-                        row.append(float(op_func(float(get_a(msg_a)), float(get_b(msg_b)))))
-                    except (AttributeError, TypeError, IndexError, ValueError):  # e.g. a short joint array: hold the last row
-                        ok = False
-                        break
+                            row.append(read_scalar(getter, msg, math_op))
+                    else:  # "binary": outer_op(side_op(a) <op> side_op(b)), both scalars
+                        _kind, op_func, (in_a, get_a, op_a), (in_b, get_b, op_b), math_op = extractor
+                        msg_a = self._input(stream_name, in_a, all_data)
+                        msg_b = self._input(stream_name, in_b, all_data)
+                        if msg_a is None or msg_b is None:
+                            ok = False
+                            break
+                        v = float(op_func(read_scalar(get_a, msg_a, op_a), read_scalar(get_b, msg_b, op_b)))
+                        row.append(float(math_op(v)) if math_op is not None else v)
+                except (AttributeError, TypeError, IndexError, ValueError, ZeroDivisionError):  # e.g. a short joint array: hold the last row
+                    ok = False
+                    break
             buf = self._stream_buffers.setdefault(stream_name, [])
             if ok:
                 self._stream_last_valid[stream_name] = row
@@ -335,8 +284,8 @@ class StreamBuilder:
         """Return {stream_name: (N, M) float32 array} for every stream with data."""
         result = {}
         for stream_name, rows in self._stream_buffers.items():
-            filled_rows = fill_none_gaps(rows)
-            valid = [r for r in filled_rows if r is not None]
-            if valid:
-                result[stream_name] = np.array(valid, dtype=np.float32)
+            # evaluate() already holds the last row; only the rows before the first valid one are None
+            first = next((r for r in rows if r is not None), None)
+            if first is not None:
+                result[stream_name] = np.array([first if r is None else r for r in rows], dtype=np.float32)
         return result

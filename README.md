@@ -24,14 +24,14 @@ This project is currently **in progress**: it is actively being developed and co
 ## 2. Technology stack
 
 - **Language:** Python ≥ 3.12
-- **Frameworks and libraries:** ROS 2 Jazzy (`rclpy`, `tf2_ros`), PyQt5 (`RelayDApp` GUI), PyTorch, [Robomimic](https://robomimic.github.io/) (optional, imitation-learning backend), OpenCV, h5py
+- **Frameworks and libraries:** ROS 2 Jazzy (`rclpy`, `tf2_ros`), PyQt5 (`RelayDApp` GUI), PyTorch (installed with robomimic / LeRobot), [Robomimic](https://robomimic.github.io/) (optional, imitation-learning backend), OpenCV, h5py
 - **Other tools:** pip/setuptools packaging, GitHub Actions (CI)
 
 Relay-D is a plain pip package (not a colcon/ament package) intended to run standalone inside a Python environment where ROS 2 Jazzy has already been sourced — it is not a ROS 2 node package in its own right, but it depends on a sourced ROS 2 environment at runtime.
 
 It is composed of two subsystems that interoperate directly:
 
-- **`relay_d.acquisition`** — the `RelayDApp` GUI: records robot sensor data (topics + TF) to HDF5 per a YAML config, and converts recordings to Robomimic format. Also exposes a headless `AppAPI` for programmatic recording.
+- **`relay_d.acquisition`** — the `RelayDApp` GUI: records robot sensor data (topics + TF) to HDF5 per a YAML config, and converts recordings to Robomimic format. Also exposes a headless `AppAPI` for programmatic recording that runs the same code as the GUI (same config checks, same start/stop, same conversion and files).
 - **`relay_d.dispatch`** — the `lfd-inference-node` CLI: runs a trained LfD policy live on the robot. Also exposes a programmatic `InferenceSession` API.
 - **`relay_d.utils`** — small utilities shared by both subsystems (currently the colored console logger).
 
@@ -62,8 +62,6 @@ See [Architecture diagrams](#6-architecture-diagrams) for how these pieces fit t
 in the Python that runs the node: `robomimic` (above) for `.pth` checkpoints, or `lerobot` (`pip install 'lerobot[training]'`,
 plus `'lerobot[diffusion]'` for Diffusion and `'lerobot[smolvla]'` for SmolVLA) for LeRobot checkpoints. See "Running inference on the robot".
 
-**Optional extra** — `pip install ".[scripts]"`: `xmltodict`, used by `scripts/extract_joint_limits.py` to parse URDF XML.
-
 **Optional extra** — `pip install ".[lerobot]"` (only needed to convert recordings to the [LeRobotDataset](https://huggingface.co/docs/lerobot/main/en/lerobot-dataset-v3) format):
 
 | Package | Used for |
@@ -87,7 +85,7 @@ These must come from a sourced ROS 2 Jazzy environment (see [Installation](#4-in
 | `tf2_ros`, `tf2_msgs` | transform lookups |
 | `geometry_msgs`, `std_msgs`, `sensor_msgs`, `sensor_msgs_py`, `trajectory_msgs`, `builtin_interfaces` | ROS 2 message types |
 | `rosidl_runtime_py` | introspecting ROS 2 message/service definitions |
-| `xacro` | resolving robot description macros (used by `scripts/extract_joint_limits.py`) |
+| `xacro` | resolving robot description macros (used by `scripts/extract_joint_limits.py`, which prints URDF joint limits for the `limits:` clamp of an `action_config.yaml` entry, in real units) |
 
 ### Other system libraries
 
@@ -142,7 +140,7 @@ This is a plain pip package (not a colcon/ament package) — no `colcon build` s
 RelayDApp
 ```
 
-Three pages: **Config** (load/validate your YAML), **Record** (start/pause/stop, live sensor feeds), **Post-process** (convert raw recordings to Robomimic or LeRobot format; a config can be loaded here without the robot running).
+Three pages: **Config** (load/validate your YAML), **Record** (start/stop, live sensor feeds), **Post-process** (convert raw recordings to Robomimic or LeRobot format; a config can be loaded here without the robot running).
 
 Everything lands in the recordings folder (Settings), named by what it holds:
 
@@ -159,11 +157,11 @@ On the **Config** page, the **Build from ROS** tab writes `acquisition_config.ya
 
 1. **Sources**: topics of the live graph (filter, double-click to add; or type a topic the graph does not show yet) and TF frames (a parent and a child, any connected pair).
 2. **Inputs**: output group, modality (`depth`, `scan`), `joint_names` (**Read joint names from the topic** takes them from one live message), gap filling. The first word of an input name (`image_`, `joint_`, `pose_`, `tf_`, ...) picks its live view on the Record page, and is suggested for you.
-3. **Observations**: tick message fields to fill the specs of a stream (`joint_1.position[:]`, `tf_eef.translation.x`; edit the text for arithmetic, `sin()/cos()` or a single element), normalize with limits typed in or filled from a URDF (file, or the latched `/robot_description`), roll/pitch/yaw for quaternions. Images and point clouds are added as camera observations.
+3. **Observations**: tick message fields to fill the specs of a stream (`joint_1.position[:]`, `tf_eef.translation.x`; edit the text for arithmetic, `sin()/cos()` or a single element), roll/pitch/yaw for quaternions. Values stay in real units: robomimic and LeRobot normalize with the dataset's stats. Images and point clouds are added as camera observations.
 4. **Actions**: tick the streams that form the action, in order, with optional delta.  5. **Recording**: name, frequency, buffer, sync.
 6. **Review**: the YAML, the problems found (errors block saving) and **Save and use now**, which loads it like any hand-written file. **Edit loaded config** brings an existing file back into the builder.
 
-The headless `AppAPI`, `relay-d-convert` and the other tools still take a ready-made config file. Robomimic environment metadata, the LeRobot task and the training model stay in `postprocess_config.yaml`.
+The headless `AppAPI`, `relay-d-convert` and the other tools still take a ready-made config file. The train / validation split and the LeRobot options (task, robot type, video settings) stay in `postprocess_config.yaml`; the robomimic policy is chosen on the Train tab.
 
 ### Converting recordings without the GUI
 
@@ -178,9 +176,16 @@ relay-d-convert --config acquisition_config.yaml --format robomimic \
 ```
 
 No ROS or display is needed. `--input` takes `.h5` files and/or directories (searched recursively).
-Format options (robomimic env metadata and training model, LeRobot task, ...) are read from
+Format options (train / validation split, LeRobot task, ...) are read from
 `--options` or a `postprocess_config.yaml` next to the config; see
-`relay_d/acquisition/qt_app/ui/config/templates/postprocess_config_template.yaml`. `python scripts/convert_dataset.py` is the same tool.
+`relay_d/acquisition/qt_app/ui/config/templates/postprocess_config_template.yaml`. A broken options file stops the conversion (CLI, `AppAPI`
+and the Post-process page alike), and all three write the same dataset and the same files next to it.
+`relay-d-convert --check` (no `--output` needed) and the Post-process page run the same pre-check before anything is written: for each
+demo its sample count, recorded rate, the config it was recorded with, and whether it converts or why not; and the layout that will be
+written (robomimic keys and shapes, action columns, masks; LeRobot features, fps, task). A configured stream that is in none of the
+selected recordings stops the conversion and names the streams the recordings do have and the config they were recorded with; a demo
+recorded with another config or `recording_frequency` is skipped with that config named. The page adds recordings by file or by folder
+(recursive, like `--input`), drops selected ones with **Remove selected** or the Delete key (nothing is deleted from disk), and its Convert button says how many demos will be converted.
 
 ### Running inference on the robot
 
@@ -196,17 +201,28 @@ lfd-inference-node --checkpoint path/to/run/output/checkpoints/last/pretrained_m
     --obs-config path/to/obs_config.yaml --action-config path/to/action_config.yaml --device cpu
 ```
 
-Data Post Process writes `action_dispatcher/` next to every dataset (robomimic or LeRobot): `obs_config.yaml` made from your acquisition
+Data Post Process, `relay-d-convert` and `AppAPI` write `acquisition_config.yaml`, `postprocess_config.yaml` (when one was used) and `action_dispatcher/` next to every dataset (next to the `.h5`, or beside the LeRobot dataset folder): `obs_config.yaml` made from your acquisition
 config, an `action_config.yaml` template to adapt, and an `inference_script.py`.
 
 For LeRobot the node feeds the policy what the dataset had: the vector observations side by side as `observation.state` (in the order of
 the dataset's `meta/info.json`, found through the checkpoint's `train_config.json`; `--state-keys a,b` overrides it) and each camera as
 `observation.images.<name>` (BGR to RGB, scaled to [0, 1]). LeRobot normalizes with the statistics saved in the checkpoint. The node runs at the rate
-the policy was trained at (the dataset's fps, i.e. the `recording_frequency`) unless `--hz` says otherwise, and warns when they differ: each
+the policy was trained at (the `recording_frequency`, stored in the LeRobot dataset's fps or in the robomimic checkpoint) unless `--hz` says otherwise, and warns when they differ: each
 predicted action is one step of the demos, so another rate makes the robot move faster or slower than you showed it. For the same reason a
-demo whose recorded rate is more than 10% off `recording_frequency` fails the after-recording check and is left out of LeRobot datasets.
-robomimic checkpoints do not store a rate: pass `--hz` equal to the recording frequency. The Python that
+demo whose recorded rate is more than 10% off `recording_frequency` fails the after-recording check and is left out of robomimic and LeRobot datasets.
+robomimic checkpoints trained on data converted before this release have no rate: pass `--hz` equal to the recording frequency. The Python that
 runs the node needs `lerobot`; LeRobot 0.6 needs torch < 2.12, so it usually lives in its own virtual environment with ROS 2 sourced.
+
+At startup the node checks `action_config.yaml` against the model: an index past the model's action stops it, and action columns no entry
+sends are listed in a warning. `--dry-run` runs the whole loop on the live robot's sensors but logs every command and stop instead of
+sending it (config errors still stop startup): use it for the first run of a new checkpoint or action config.
+
+The **Run** tab does the same from the GUI: choose the checkpoint and the dataset's `action_dispatcher/` folder (or the Post-process output
+folder holding it), keep **Dry run** checked for a first look, and press **Start**; the log shows the node's output. **STOP** sends Ctrl+C,
+so the node sends each entry's `stop:`, cancels any action goal still running, and closes; closing Relay-D stops a running policy the same way.
+The node runs in its own process group, so Ctrl+C in the terminal that started Relay-D stops it once, through Relay-D. A model error ends
+the run with exit code 1 (shown as Failed). The node also sends the stop on SIGTERM. `InferenceSession` used from Python has the same
+defaults as the node (`device`: the `infer_device` setting; `run(hz=None)`: the policy's rate, else `infer_hz`).
 
 See `relay_d/dispatch/inference_node.py` and `relay_d/dispatch/config_templates/*.yaml` for the full set of options and config syntax.
 
@@ -236,7 +252,8 @@ to test it. LeRobot pins its own torch range (0.6.x needs torch below 2.12), so 
 environment: `pip install 'lerobot[training]'` (plus `'lerobot[diffusion]'` for Diffusion, `'lerobot[smolvla]'` for SmolVLA; the
 **Set up lerobot environment** button installs all three, press it again to add SmolVLA to an older environment). All LeRobot policies
 need at least one camera in the dataset. Policies: robomimic `bc_rnn_gmm`, `bc_transformer_gmm`, `diffusion_policy`; LeRobot `act`,
-`diffusion` (trained from scratch) and `smolvla`. Anything else goes in "Extra arguments".
+`diffusion` (trained from scratch) and `smolvla`. The policy is chosen only here (`--policy`; robomimic default `bc_rnn_gmm`, or the
+`robomimic_config.json` an older Post-process saved in the folder). Anything else goes in "Extra arguments".
 
 **SmolVLA** is a small vision-language-action model (about 450M parameters) pretrained on many community robot datasets: Relay-D
 fine-tunes it from `lerobot/smolvla_base` instead of training from zero, so it usually needs fewer demos. It follows the dataset's task
@@ -250,18 +267,11 @@ Without a display (SSH) the run starts in the background and logs to `train.log`
 The **Settings** tab (tabs: General, Recording, Review, Post-process, Training, Inference) edits
 `~/.relayd_settings.json`. The same file is read by the command-line tools, so a value saved there is the
 default of `relay-d-train`, `relay-d-convert` (video quality, file sizes, splits), `lfd-inference-node`
-(`--device`, `--hz` when the policy has no rate of its own, `--max-obs-age`, `--obs-wait`, `--backend`) and the headless `AppAPI`. Precedence is
-**acquisition YAML > setting > built-in default**, and a command-line flag beats all of them. Settings marked
+(`--device`, `--hz` when the policy has no rate of its own, `--max-obs-age`, `--obs-wait`, `--backend`) and the headless `AppAPI`. What changes the recorded data (`recording_frequency`, sync) comes only from the
+acquisition YAML; for the rest a command-line flag beats the setting, which beats the built-in default. Settings marked
 "(restart)" apply the next time Relay-D starts; the others apply immediately. The list of settings, with their
 defaults and tooltips, is the table `SETTINGS` in `relay_d/utils/user_settings.py`; `RELAYD_SETTINGS_FILE`
 points the tools at another file, and `RELAYD_LOG_LEVEL` overrides the log-level setting.
-
-### Reviewing a LeRobot dataset
-
-The **Review** tab also opens LeRobot v3.0 datasets (needs `pyarrow`, from `pip install ".[lerobot]"`): choose the
-Post-process output folder or the dataset folder. You get the episode list with checks (frame counts, ordering,
-NaN, missing videos), a camera selector with a frame slider, and the `observation.state` / `action` curves
-(joint names from `info.json`, time axis in seconds). It is view-only: no delete and no rviz playback.
 
 ### Package layout
 
@@ -272,7 +282,7 @@ relay_d/
 ├── training/           # start/follow robomimic and LeRobot training runs (relay-d-train, Train tab)
 └── acquisition/        # RelayDApp GUI + AppAPI (data recording + Robomimic/LeRobot conversion)
     └── qt_app/ui/config/templates/   # default acquisition + post-process config templates
-scripts/                # standalone CLIs (convert_dataset.py, extract_joint_limits.py, reprocess_recorded_data.py)
+scripts/                # standalone CLIs (extract_joint_limits.py, reprocess_recorded_data.py)
 ```
 
 ---

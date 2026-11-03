@@ -19,13 +19,3 @@ def test_parse_joint_limits_order_filter_and_errors():
     with pytest.raises(ValueError):
         parse_joint_limits("not xml")
 
-
-def test_limits_for_position_velocity_and_errors():
-    from relay_d.acquisition.qt_app.ui.config.builder.urdf_limits import limits_for
-
-    joints = parse_joint_limits(URDF)
-    assert limits_for("position", joints, ["j2", "j1"]) == [{"lower_lim": 0.0, "upper_lim": 0.1}, {"lower_lim": -1.5, "upper_lim": 1.5}]
-    assert limits_for("velocity", joints, ["j1"]) == [{"lower_lim": -2.0, "upper_lim": 2.0}]
-    for args in (("position", ["nope"]), ("acceleration", ["j1"])):
-        with pytest.raises(ValueError):
-            limits_for(args[0], joints, args[1])

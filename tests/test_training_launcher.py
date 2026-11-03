@@ -235,16 +235,24 @@ def test_run_falls_back_to_background_when_every_terminal_fails(folder, tmp_path
 
 def test_the_config_files_of_the_selected_dataset_are_used(tmp_path):
     """relay-d-convert writes <output>_acquisition_config.yaml, so one folder can hold several datasets."""
-    for name, model in (("a", "bc_rnn_gmm"), ("b", "diffusion_policy")):
+    for name in ("a", "b"):
         _robomimic_file(tmp_path / f"{name}.h5")
-        (tmp_path / f"{name}_postprocess_config.yaml").write_text(f"postprocess:\n  robomimic:\n    training_model: {model}\n")
+        (tmp_path / f"{name}_acquisition_config.yaml").write_text("config: {}\n")
     by_name = {d.path.stem: d for d in launcher.find_datasets(tmp_path)}
-    assert launcher._robomimic_policy(by_name["b"], None) == "diffusion_policy"  # not the alphabetically first file
-    assert launcher._robomimic_policy(by_name["a"], None) == "bc_rnn_gmm"
-    (tmp_path / "postprocess_config.yaml").write_text("postprocess:\n  robomimic:\n    training_model: bc_transformer_gmm\n")
+    assert launcher._config_file(by_name["b"], "acquisition_config.yaml").name == "b_acquisition_config.yaml"
+    assert launcher._config_file(by_name["a"], "acquisition_config.yaml").name == "a_acquisition_config.yaml"
+    (tmp_path / "acquisition_config.yaml").write_text("config: {}\n")
     _robomimic_file(tmp_path / "c.h5")
     c = next(d for d in launcher.find_datasets(tmp_path) if d.path.stem == "c")
-    assert launcher._robomimic_policy(c, None) == "bc_transformer_gmm"  # no c_* file: the plain one the GUI writes
+    assert launcher._config_file(c, "acquisition_config.yaml").name == "acquisition_config.yaml"  # the plain one the GUI writes
+
+
+def test_robomimic_policy_is_chosen_on_the_train_tab_not_by_postprocess_options(folder):
+    """robomimic.training_model was removed: a stray one in the folder changes nothing; no policy = the first template."""
+    (folder / "postprocess_config.yaml").write_text("postprocess:\n  robomimic:\n    training_model: diffusion_policy\n")
+    ds = _robomimic(folder)
+    assert launcher._robomimic_policy(ds, None) == launcher.ROBOMIMIC_POLICIES[0]
+    assert launcher._robomimic_policy(ds, "diffusion_policy") == "diffusion_policy"
 
 
 def test_ctrl_c_in_the_training_window_ends_the_run_and_closes_the_window(folder, tmp_path):

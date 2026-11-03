@@ -1,7 +1,7 @@
 """Config page > "Build from ROS": build an acquisition config from the live ROS 2 graph (topics, TF frames, message fields).
 
 The edited state is a ``ConfigDraft``; the pure modules next to this file do the work (``ros_catalog`` lists what the graph
-offers, ``config_check`` validates, ``urdf_limits`` fills normalization limits). This file only turns them into widgets.
+offers, ``config_check`` validates). This file only turns them into widgets.
 Steps are sub-tabs: Sources, Inputs, Observations, Actions, Recording, Review.
 """
 
@@ -34,7 +34,7 @@ from PyQt5.QtWidgets import (
 
 from relay_d.utils.coloring_logger import logger
 from ....utils.custom_message_box import CustomMessageBox
-from . import ros_catalog, urdf_limits
+from . import ros_catalog
 from .config_check import ERROR, Problem, check_config, has_errors, stream_build_errors, stream_width
 from .draft import ConfigDraft, InputDraft, StreamDraft, suggest_input_name
 
@@ -211,7 +211,7 @@ class BuilderPage(QWidget):
     def _build_inputs(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        self.table_inputs = _table(["Name", "Source", "Output map", "Modality", "Joint names", "Fill gaps"], stretch=1)
+        self.table_inputs = _table(["Name", "Source", "Modality", "Joint names", "Fill gaps"], stretch=1)
         self.table_inputs.itemChanged.connect(self._input_edited)
         lay.addWidget(self.table_inputs, 1)
         row = QHBoxLayout()
@@ -219,7 +219,7 @@ class BuilderPage(QWidget):
         row.addWidget(_button("Remove input", self.remove_selected_input))
         row.addStretch(1)
         lay.addLayout(row)
-        note = QLabel("Output map: HDF5 group name, if not the input name. Modality: depth for depth images, scan for laser scans (empty = rgb).")
+        note = QLabel("Modality: depth for depth images, scan for laser scans (empty = rgb).")
         note.setWordWrap(True)
         lay.addWidget(note)
         return w
@@ -230,7 +230,7 @@ class BuilderPage(QWidget):
         table.setRowCount(len(self.draft.inputs))
         for r, inp in enumerate(self.draft.inputs.values()):
             source = f"TF {inp.parent_frame} -> {inp.child_frame}" if inp.kind == "tf" else inp.topic
-            cells = [_item(inp.name), _item(source), _item(inp.output_map, True), _item(inp.modality, True), _item(", ".join(inp.joint_names), True)]
+            cells = [_item(inp.name), _item(source), _item(inp.modality, True), _item(", ".join(inp.joint_names), True)]
             gaps = QTableWidgetItem()
             gaps.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
             gaps.setCheckState(Qt.Checked if inp.fill_gaps else Qt.Unchecked)
@@ -243,12 +243,10 @@ class BuilderPage(QWidget):
         text = item.text().strip()
         col = item.column()
         if col == 2:
-            inp.output_map = text
-        elif col == 3:
             inp.modality = text
-        elif col == 4:
+        elif col == 3:
             inp.joint_names = [n.strip() for n in text.split(",") if n.strip()]
-        elif col == 5:
+        elif col == 4:
             inp.fill_gaps = item.checkState() == Qt.Checked
 
     def _selected_input(self):
@@ -277,11 +275,10 @@ class BuilderPage(QWidget):
         inp.joint_names = names
         self.refresh_inputs()
 
-    def peek(self, topic, msg_type, on_msg, latched=False):
+    def peek(self, topic, msg_type, on_msg):
         """Call ``on_msg(message)`` with the next message on ``topic``, or ``on_msg(None)`` after a few seconds.
 
         Uses the GUI node (already spun by the app's timer), so nothing blocks and no second spin runs.
-        ``latched``: also get the last message published before (``/robot_description``).
         """
         node = self._get_node()
         if node is None:
@@ -289,9 +286,9 @@ class BuilderPage(QWidget):
             return
         box = {}
         try:
-            from rclpy.qos import QoSDurabilityPolicy, QoSProfile, ReliabilityPolicy
+            from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-            qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL) if latched else QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
             sub = node.create_subscription(self._loader(msg_type), topic, lambda m: box.setdefault("msg", m), qos)
         except Exception as e:
             logger.warning(f"Could not subscribe to {topic}: {e}")
@@ -338,26 +335,12 @@ class BuilderPage(QWidget):
         self.text_specs = QPlainTextEdit()
         self.text_specs.setPlaceholderText("One spec per line, e.g. joint_1.position[:]  or  tf_eef.translation.x  or  a.x - b.x")
         self.text_specs.setMaximumHeight(80)
-        self.text_specs.textChanged.connect(self._resize_limits)
         form.addRow("Name", self.edit_stream_name)
         form.addRow("Specs", self.text_specs)
         lay.addLayout(form)
         row = QHBoxLayout()
-        self.check_normalize = QCheckBox("Normalize to [-1, 1] (needs limits)")
-        self.check_normalize.toggled.connect(lambda _on: self._resize_limits())
         self.check_rpy = QCheckBox("Quaternion to roll / pitch / yaw (4 specs: x y z w)")
-        row.addWidget(self.check_normalize)
         row.addWidget(self.check_rpy)
-        row.addStretch(1)
-        lay.addLayout(row)
-        self.table_limits = _table(["Lower", "Upper"], select_rows=False)
-        self.table_limits.setMaximumHeight(130)
-        self.table_limits.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table_limits.setVisible(False)  # shown once "Normalize" is ticked
-        lay.addWidget(self.table_limits)
-        row = QHBoxLayout()
-        row.addWidget(_button("Fill limits from URDF file...", self.fill_limits_from_file))
-        row.addWidget(_button("Fill limits from /robot_description", self.fill_limits_from_topic))
         row.addStretch(1)
         row.addWidget(_button("Add stream", self.add_stream))
         lay.addLayout(row)
@@ -423,43 +406,15 @@ class BuilderPage(QWidget):
     def _inputs_dict(self):
         return self.draft.to_config()["config"]["input"]
 
-    def _resize_limits(self):
-        width = stream_width(self._specs(), self._inputs_dict()) if self.check_normalize.isChecked() else 0
-        rows = width if width else (1 if self.check_normalize.isChecked() else 0)
-        old = [(self.table_limits.item(r, 0), self.table_limits.item(r, 1)) for r in range(self.table_limits.rowCount())]
-        self.table_limits.setRowCount(rows)
-        for r in range(rows):
-            for c in (0, 1):
-                keep = old[r][c].text() if r < len(old) and old[r][c] else ""
-                self.table_limits.setItem(r, c, _item(keep, True))
-        self.table_limits.setVisible(rows > 0)
-
-    def _limits(self):
-        out = []
-        for r in range(self.table_limits.rowCount()):
-            lo, hi = (self.table_limits.item(r, c).text().strip() for c in (0, 1))
-            try:
-                out.append({"lower_lim": float(lo), "upper_lim": float(hi)})
-            except ValueError:
-                raise ValueError(f"limit row {r + 1} needs two numbers (lower, upper)") from None
-        return out
-
     def add_stream(self):
         name, specs = self.edit_stream_name.text().strip(), self._specs()
         if not name or not specs:
             CustomMessageBox.warning("A stream needs a name and at least one spec.")
             return None
-        try:
-            limits = self._limits() if self.check_normalize.isChecked() else []
-        except ValueError as e:
-            CustomMessageBox.warning(str(e))
-            return None
-        stream = StreamDraft(name=name, specs=specs, normalize=self.check_normalize.isChecked(), limits=limits,
-                             rotation_format="rpy" if self.check_rpy.isChecked() else "quat", explicit_dict=self.check_normalize.isChecked())
+        stream = StreamDraft(name=name, specs=specs, rotation_format="rpy" if self.check_rpy.isChecked() else "quat")
         self.draft.streams[name] = stream
         self.edit_stream_name.clear()
         self.text_specs.clear()
-        self.check_normalize.setChecked(False)
         self.check_rpy.setChecked(False)
         self._fill_fields()
         self.refresh_observations()
@@ -500,46 +455,6 @@ class BuilderPage(QWidget):
             self.list_obs.addItem(f"{s.name}: {width if width is not None else '?'} values  <-  {', '.join(s.specs)}")
         for key, (inp, kind) in self.draft.cameras.items():
             self.list_obs.addItem(f"{key}: {kind[:-1]} of {inp}")
-
-    # URDF limits for the stream being built
-
-    def _fill_limits(self, xml):
-        specs = self._specs()
-        try:
-            if len(specs) != 1 or not specs[0].endswith("[:]"):
-                raise ValueError("limits from a URDF need exactly one spec like joint_1.position[:]")
-            input_name, field = specs[0][:-3].split(".", 1)
-            names = self.draft.inputs[input_name].joint_names
-            if not names:
-                raise ValueError(f"'{input_name}' has no joint_names: read them on the Inputs step first")
-            limits = urdf_limits.limits_for(field, urdf_limits.parse_joint_limits(xml, names), names)
-        except (ValueError, KeyError) as e:
-            CustomMessageBox.warning(f"Could not fill the limits: {e}")
-            return
-        self.check_normalize.setChecked(True)
-        self._resize_limits()
-        for r, lim in enumerate(limits):
-            self.table_limits.item(r, 0).setText(f"{lim['lower_lim']:.6g}")
-            self.table_limits.item(r, 1).setText(f"{lim['upper_lim']:.6g}")
-
-    def fill_limits_from_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Robot description", self._dialog_dir(), "URDF / xacro (*.urdf *.xacro *.xml)")
-        if path:
-            from ...review.robot_description_resolver import RobotDescriptionError, resolve_from_file
-
-            try:
-                self._fill_limits(resolve_from_file(path))
-            except RobotDescriptionError as e:
-                CustomMessageBox.warning(str(e))
-
-    def fill_limits_from_topic(self):
-        def done(msg):
-            if msg is None:
-                CustomMessageBox.warning(f"No /robot_description received within {_PEEK_SECONDS:.0f} s. Is robot_state_publisher running?")
-            else:
-                self._fill_limits(msg.data)
-
-        self.peek("/robot_description", "std_msgs/msg/String", done, latched=True)
 
     # ------------------------------------------------------------------ 4 Actions
 
@@ -622,7 +537,8 @@ class BuilderPage(QWidget):
         for widget in (self.edit_dataset, self.spin_freq, self.spin_buffer, self.spin_tol, self.combo_sync):
             widget.blockSignals(True)
         self.edit_dataset.setText(self.draft.dataset_name)
-        self.spin_freq.setValue(self.draft.recording_frequency or 30)
+        self.draft.recording_frequency = self.draft.recording_frequency or 30  # the value on screen is the one written
+        self.spin_freq.setValue(self.draft.recording_frequency)
         self.spin_buffer.setValue(self.draft.max_buffer_mb or 0)
         self.spin_tol.setValue(self.draft.sync_tolerance_sec or 0)
         self.combo_sync.setCurrentText(self.draft.sync_mode)

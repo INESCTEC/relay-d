@@ -1,12 +1,9 @@
 """
-YAML-driven dataset conversion engine
-Reads conversion configs and applies transformation rules to convert datasets
-to the Robomimic 1.0 format using a two-step bridge mapping strategy.
+YAML-driven dataset conversion: recorded HDF5 demos -> robomimic HDF5 or LeRobotDataset v3.0.
 
-Bridge Mapping (two-step lookup):
-  Step A: robomimic.yaml defines required observations (e.g. robot0_eef_pos)
-  Step B: data_config.yaml `output` section maps logical keys to recorded HDF5 paths
-          (e.g. robot0_eef_pos -> robot0_eef/translations)
+Numeric obs and actions come from each demo's `streams/` group (`output.streams`); other
+`output:` entries (the bridge map) point an obs key at a recorded HDF5 path,
+e.g. agentview_image -> camera_rgb/images.
 """
 
 import h5py
@@ -14,8 +11,10 @@ import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Set
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils import user_settings
-from relay_d.utils.numerics import RATE_TOLERANCE, median_rate, normalize, quat_to_euler
-from .postprocess_options import PostprocessOptions
+from relay_d.utils.numerics import RATE_TOLERANCE, median_rate, quat_to_euler
+from relay_d.acquisition.qt_app.ui.config.builder.config_check import normalization_error, stream_width
+from .postprocess_options import FORMAT_SUFFIX, PostprocessOptions, removed_key_errors
+from .robomimic_config_handler import explicit_modalities
 import re
 import json
 import os
@@ -24,108 +23,27 @@ import yaml
 
 
 def _parse_stream_entry(stream_val):
-    """Return (spec_list, normalize, norm_range, limits, rotation_format).
+    """Return (spec_list, rotation_format).
 
     Accepts plain-list form (list of strings) or dict form:
       specs: [...]
-      normalize: true
-      normalized_range: [-1.0, 1.0]
-      limits:
-        - {lower_lim: ..., upper_lim: ...}   # one per column, or one entry → broadcast
       rotation_format: quat | rpy            # quat (default) or roll-pitch-yaw radians
     """
     if isinstance(stream_val, dict):
-        return (
-            stream_val.get("specs", []),
-            stream_val.get("normalize", False),
-            stream_val.get("normalized_range", [-1.0, 1.0]),
-            stream_val.get("limits", None),
-            str(stream_val.get("rotation_format", "quat")).lower(),
-        )
-    return stream_val, False, None, None, "quat"
+        return stream_val.get("specs", []), str(stream_val.get("rotation_format", "quat")).lower()
+    return stream_val, "quat"
 
 
-def _apply_normalization(
-    data: "np.ndarray",
-    limits: List[Dict],
-    norm_range: List[float],
-) -> "np.ndarray":
-    """Normalize each column of *data* using per-element limits.
-
-    If *limits* has a single entry it is broadcast to every column.
-    Columns whose span is zero are left unchanged.
+def _stream_output_width(data_config: Dict, stream_name: str) -> Optional[int]:
     """
-    lo, hi = norm_range
-    n_cols = data.shape[1] if data.ndim == 2 else 1
-
-    if data.ndim == 2 and n_cols == 0:
-        logger.warning(
-            "Normalization skipped: stream has 0 columns — data was recorded before "
-            "the dict-form fix. Re-record to get proper data."
-        )
-        return data
-
-    if len(limits) == 1:
-        limits = limits * n_cols
-
-    if data.ndim == 2 and len(limits) != n_cols:
-        raise ValueError(
-            f"_apply_normalization: {len(limits)} limits but data has {n_cols} columns. "
-            f"Trim the limits list in acquisition_config.yaml to match the recorded columns "
-            f"(tip: use --joints with extract_joint_limits.py to filter to only the joints "
-            f"listed in joint_names)."
-        )
-
-    out = data.copy()
-    for i, lim in enumerate(limits):
-        lower = float(lim["lower_lim"])
-        upper = float(lim["upper_lim"])
-        if data.ndim == 2:
-            out[:, i] = normalize(data[:, i], lower, upper, lo, hi)
-        else:
-            out = normalize(data, lower, upper, lo, hi)
-    return out
-
-
-def _infer_spec_width(data_config: Dict, stream_name: str) -> int:
-    """
-    Column width for a single stream, derived purely from its configured
-    specs (no recorded data needed):
-      - slice spec ([:]): width = len(joint_names) for that input, or 1
-      - sin/cos wrapper:  same rule applied to the inner spec
-      - scalar spec:      width = 1
-
-    Returns 0 if the stream has no configured specs at all (e.g. it isn't
-    an `output.streams` entry).
+    Post-conversion column width for a stream from its configured specs (config_check.stream_width:
+    None if a ``[:]`` slice has no joint_names), except a stream with rotation_format: rpy outputs
+    3 columns (roll, pitch, yaw) from its 4 quaternion specs.
     """
     streams = data_config.get("output", {}).get("streams", {})
-    inputs = data_config.get("input", {})
-
-    spec_list, *_ = _parse_stream_entry(streams.get(stream_name, []))
-
-    width = 0
-    for spec in spec_list:
-        inner = spec.strip()
-        if inner.startswith(("sin(", "cos(")) and inner.endswith(")"):
-            inner = inner[4:-1].strip()
-        if inner.endswith("[:]"):
-            input_name = inner.split(".")[0]
-            jnames = inputs.get(input_name, {}).get("joint_names", [])
-            width += len(jnames) if jnames else 1
-        else:
-            width += 1
-    return width
-
-
-def _stream_output_width(data_config: Dict, stream_name: str) -> int:
-    """
-    Post-conversion column width for a stream: same as _infer_spec_width, except
-    a stream with rotation_format: rpy outputs 3 columns (roll, pitch, yaw) from
-    its 4 quaternion specs.
-    """
-    width = _infer_spec_width(data_config, stream_name)
-    streams = data_config.get("output", {}).get("streams", {})
-    *_, rot_fmt = _parse_stream_entry(streams.get(stream_name, []))
+    spec_list, rot_fmt = _parse_stream_entry(streams.get(stream_name, []))
+    inputs = {n: v for n, v in (data_config.get("input") or {}).items() if isinstance(v, dict)}
+    width = stream_width([str(x) for x in spec_list], inputs)
     if rot_fmt == "rpy":
         if width != 4:
             raise ValueError(
@@ -136,33 +54,15 @@ def _stream_output_width(data_config: Dict, stream_name: str) -> int:
     return width
 
 
-def _infer_n_actions(data_config: Dict) -> int:
-    """
-    Derive the total action width from actions_to_extract + stream specs.
-    See _stream_output_width for the per-stream width rule.
-    """
-    to_extract = data_config.get("actions_to_extract", [])
-    total = sum(_stream_output_width(data_config, name) for name in to_extract)
-    return total if total > 0 else 1
-
-
 def _action_part(part: np.ndarray, key: str, stream_configs: dict, delta_actions: list) -> np.ndarray:
-    """One `actions_to_extract` entry as (N, width) columns: its stream's rotation format and
-    normalization, then the target of step t: the delta to t+1 if listed in `delta_actions`, else
-    the value at t+1 (the value at t is the current state, which would teach the policy to stand still).
-    Shared by both conversion paths."""
+    """One `actions_to_extract` entry as (N, width) columns: its stream's rotation format,
+    then the target of step t: the delta to t+1 if listed in `delta_actions`, else the value at t+1
+    (the value at t is the current state, which would teach the policy to stand still).
+    Shared by both output formats."""
     part = part if part.ndim > 1 else part[:, np.newaxis]
-    _, normalize, norm_range, limits, rot_fmt = _parse_stream_entry(stream_configs.get(key, []))
-    if normalize and limits and key in delta_actions:
-        # A delta of normalized values has no offset: the dispatcher's denormalize (which adds lower_lim) cannot undo it.
-        raise ValueError(
-            f"stream '{key}' is both normalized and in delta_actions: the dispatcher cannot turn that back into "
-            f"real units. Add a second stream over the same specs without `normalize` and use it as the action."
-        )
+    _, rot_fmt = _parse_stream_entry(stream_configs.get(key, []))
     part = _apply_rotation_format(part, rot_fmt, key)
-    if normalize and limits:
-        part = _apply_normalization(part, limits, norm_range)
-    return _compute_delta(part) if key in delta_actions else _next_obs(part)
+    return _compute_delta(part) if key in delta_actions else _next_step(part)
 
 
 def _compute_delta(data: np.ndarray) -> np.ndarray:
@@ -224,30 +124,93 @@ def _check_length(data: np.ndarray, num_samples: int, key: str) -> None:
         raise ValueError(f"'{key}' has {len(data)} rows but the demo has {num_samples} timesteps")
 
 
-def _next_obs(obs: np.ndarray) -> np.ndarray:
-    """next_obs[t] = obs[t+1]; the last step repeats itself so the length stays N."""
+def _demo_metadata(demo_data: h5py.Group) -> Tuple[Optional[float], Optional[str]]:
+    """(recording_frequency, yaml_config file name) the recorder stored in data/<demo>/metadata, None where absent."""
+    meta = demo_data.get("metadata")
+    attrs = meta.attrs if isinstance(meta, h5py.Group) else {}
+    try:
+        hz = float(attrs["recording_frequency"]) if "recording_frequency" in attrs else None
+    except (TypeError, ValueError):
+        hz = None
+    config = attrs.get("yaml_config")
+    config = config.decode() if isinstance(config, bytes) else config
+    return hz, (os.path.basename(str(config)) or None) if config else None
+
+
+def _names_text(names: List[str]) -> str:
+    """'(7) a.0..3, b.0..2' from LeRobot column names (a.0, a.1, ..., b)."""
+    groups: Dict[str, int] = {}
+    for name in names:
+        key, _, idx = name.rpartition(".")
+        key = key if key and idx.isdigit() else name
+        groups[key] = groups.get(key, 0) + 1
+    parts = [k if k in names else f"{k}.0..{n - 1}" for k, n in groups.items()]
+    return f"({len(names)}) " + ", ".join(parts)
+
+
+def _splits_error(train, val) -> Optional[str]:
+    """Why robomimic.splits cannot make the masks, None if they can."""
+    for name, frac in (("train", train), ("val", val)):
+        if not isinstance(frac, (int, float)) or isinstance(frac, bool) or not 0 <= frac <= 1:
+            return f"robomimic.splits: '{name}' must be a number between 0 and 1, got {frac!r}"
+    if train == 0:  # every robomimic template trains on the "train" mask: no mask, no training
+        return "robomimic.splits: 'train' must be more than 0"
+    if train + val > 1 + 1e-9:
+        return f"robomimic.splits: train ({train}) + val ({val}) is more than 1"
+    return None
+
+
+def _split_counts(total: int, train: float, val: float) -> Tuple[int, int]:
+    """(train, valid) demo counts; demos left over by rounding or train + val < 1 also train."""
+    # At least one training demo when training is asked for (round() would give 0 for few demos).
+    train_count = max(1, round(total * train)) if train > 0 and total else 0
+    val_count = min(round(total * val), total - train_count)
+    if train_count:
+        train_count = total - val_count
+    return train_count, val_count
+
+
+def _next_step(obs: np.ndarray) -> np.ndarray:
+    """value[t+1]; the last step repeats itself so the length stays N."""
     return np.concatenate([obs[1:], obs[-1:]], axis=0)
 
 
-def _stack_states(obs: Dict[str, Any], num_samples: int) -> np.ndarray:
-    """``states``: every float (N, M) obs array side by side in order; images (uint8) and 1-D arrays are skipped."""
-    parts = [v for v in obs.values() if isinstance(v, np.ndarray) and v.dtype != np.uint8 and v.ndim == 2]
-    return np.concatenate(parts, axis=1) if parts else np.zeros((num_samples, 1), dtype=np.float32)
+# robomimic's train.py always reads env_args from the dataset; with rollout disabled it only needs these fields
+# (type 1 = robosuite keeps robomimic's depth processing as before). Each conversion adds
+# env_kwargs.control_freq = recording_frequency: robomimic copies env_args into the checkpoint (env_metadata),
+# where inference reads the rate the policy was trained at.
+ENV_ARGS = {"env_name": "relay_d", "type": 1, "env_kwargs": {}}
+
+FPS_REQUIRED = "A positive 'recording_frequency' is required in the config (used as the fps)."
 
 
 def natural_key(path: str) -> List:
-    """Sort key for file names with numbers: rec_2.h5 before rec_10.h5."""
-    parts = re.split(r"(\d+)", os.path.basename(path))
+    """Sort key for paths with numbers: rec_2.h5 before rec_10.h5. The whole path counts, so same-named
+    files of several session folders keep a fixed order (folder first)."""
+    parts = re.split(r"(\d+)", path)
     return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
+def _is_converted_robomimic(path: str) -> bool:
+    """True (and logged) for a robomimic dataset written by a conversion (it has a ``mask`` group): not a recording."""
+    try:
+        with h5py.File(path, "r") as f:
+            converted = "mask" in f
+    except OSError:
+        return False  # reported as unreadable by the conversion loop
+    if converted:
+        logger.warning(f"Skipping {path}: it is a converted robomimic dataset, not a recording.")
+    return converted
+
+
+def _recordings(input_files: List[str]) -> List[str]:
+    """The input files in conversion order, without converted robomimic datasets."""
+    return [f for f in sorted(input_files, key=natural_key) if not _is_converted_robomimic(f)]
 
 
 class DataTransformEngine:
     """
-    Engine for applying transformation rules based on YAML config.
-
-    Accepts:
-      config      – parsed robomimic.yaml
-      data_config – parsed data_config.yaml (the `config` sub-key)
+    Bridge map (obs key -> recorded HDF5 path) of a data_config (the `config` sub-key).
     """
 
     def __init__(self, data_config: Optional[Dict] = None):
@@ -281,28 +244,6 @@ class DataTransformEngine:
         )
         return bridge_map
 
-    def _discover_eef_key(self) -> Optional[str]:
-        """Discover the EEF position key from bridge map (e.g., robot0_eef_pos)."""
-        candidates = [
-            key for key in self.bridge_map if key.endswith("_pos") and "eef" in key.lower()
-        ]
-        if len(candidates) > 1:
-            logger.warning(
-                f"Multiple candidate eef keys found {candidates}; using '{candidates[0]}'."
-            )
-        return candidates[0] if candidates else None
-
-    def _discover_joint_key(self) -> Optional[str]:
-        """Discover the joint position key from bridge map (e.g., robot0_joint_pos)."""
-        candidates = [
-            key for key in self.bridge_map if key.endswith("_pos") and "joint" in key.lower()
-        ]
-        if len(candidates) > 1:
-            logger.warning(
-                f"Multiple candidate joint keys found {candidates}; using '{candidates[0]}'."
-            )
-        return candidates[0] if candidates else None
-
     # ------------------------------------------------------------------
     # Path resolution
     # ------------------------------------------------------------------
@@ -317,74 +258,7 @@ class DataTransformEngine:
         Returns:
             Recorded path e.g. "robot0_eef/translations", or None if unmapped.
         """
-        if logical_key in self.bridge_map:
-            return self.bridge_map[logical_key]
-
-        # Fuzzy: try stripping known suffixes to find a parent key
-        for suffix in ("_pos", "_quat", "_vel", "_image"):
-            if logical_key.endswith(suffix):
-                stripped = logical_key[: -len(suffix)]
-                if stripped in self.bridge_map:
-                    return self.bridge_map[stripped]
-
-        logger.debug(f"No bridge mapping found for logical key: '{logical_key}'")
-        return None
-
-    # ------------------------------------------------------------------
-    # next_obs generation
-    # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Action generation
-    # ------------------------------------------------------------------
-
-    def generate_actions(
-        self,
-        input_data: h5py.Group,
-        obs_dict: Dict[str, np.ndarray],
-        num_samples: int,
-    ) -> np.ndarray:
-        """
-        Build the actions array (N, n_actions) from keys in actions_to_extract.
-
-        Each key's raw recorded value is used as-is (no per-name transform);
-        normalization is applied per-column only when that stream's own
-        `output.streams` entry configures `normalize`/`limits`.
-        """
-        actions_to_extract = self.data_config.get("actions_to_extract", [])
-        if not actions_to_extract:
-            n_actions = _infer_n_actions(self.data_config)
-            return np.zeros((num_samples, n_actions), dtype=np.float32)
-
-        delta_actions = self.data_config.get("delta_actions", [])
-        stream_configs = self.data_config.get("output", {}).get("streams", {})
-        action_parts: List[np.ndarray] = []
-
-        for key in actions_to_extract:
-            # A missing action column would silently change the action size (or train on zeros),
-            # so fail the demo instead of skipping the key.
-            path = self.resolve_path(key)
-            if not path:
-                raise ValueError(f"actions_to_extract key '{key}' not found in bridge_map")
-
-            data = self._get_nested_data(input_data, path)
-            if data is None:
-                raise ValueError(f"actions_to_extract key '{key}': path '{path}' not found in data")
-
-            raw_data = np.array(data, dtype=np.float32)
-            if len(raw_data) == 0:
-                raise ValueError(f"actions_to_extract key '{key}': dataset '{path}' is empty")
-
-            _check_length(raw_data, num_samples, key)
-            action_parts.append(_action_part(raw_data, key, stream_configs, delta_actions))
-
-        actions = np.concatenate(action_parts, axis=1)
-
-        return actions
-
-    # ------------------------------------------------------------------
-    # Rewards / dones / states
-    # ------------------------------------------------------------------
+        return self.bridge_map.get(logical_key)
 
     # ------------------------------------------------------------------
     # HDF5 nested data reader
@@ -432,19 +306,17 @@ class YAMLDrivenConverter:
         self._shape_cache: Dict[str, Tuple[Tuple[int, ...], Any]] = {}
         # Short human-readable reason for the last failed conversion (shown by the GUI).
         self.last_error: Optional[str] = None
-        # Per-format conversion options (postprocess_config.yaml). Without one, keys
-        # fall back to their legacy place in data_config (with a deprecation warning).
+        # Per-format conversion options (postprocess_config.yaml); defaults without one.
         self.options: PostprocessOptions = PostprocessOptions()
-        # Image next_obs are only used by robomimic; LeRobot conversion switches this off
-        # because a full copy of every camera stream is expensive for large frames.
-        self._need_next_obs: bool = True
+        # Demos of the last conversion: how many were written, and "file::demo" of each one dropped.
+        self.converted_demos: int = 0
+        self.skipped_demos: List[str] = []
         # Bridge-map keys with zero data anywhere in the current batch and no
         # way to infer a shape for them — excluded from output entirely.
         self._excluded_keys: Set[str] = set()
-        # Per-batch: logical_key -> "rgb"|"depth"|"scan", from data_config's
-        # `input` section's `modality` field. Only keys with an EXPLICIT
-        # modality are present here — plain rgb (the common case) is instead
-        # detected from the real recorded dtype (uint8).
+        # Per-batch: output key -> "rgb"|"depth"|"scan", from the `modality` of the
+        # input it reads. Only keys with an EXPLICIT modality are present here —
+        # plain rgb (the common case) is instead detected from the real recorded dtype (uint8).
         self._modality_map: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
@@ -488,20 +360,33 @@ class YAMLDrivenConverter:
         (zero-fill widths, excluded keys). Returns (engine, sorted_files), or
         None if the format config is missing.
         """
-        fmt_config = self.config_loader.get_config(format_name)
-        if not fmt_config:
-            logger.error(f"Format config not found: '{format_name}'")
+        if format_name not in FORMAT_SUFFIX:
+            self.last_error = f"Unknown format: '{format_name}'"
+            logger.error(self.last_error)
             return None
 
         if data_config:
             self.data_config = data_config
+        if removed := removed_key_errors(self.data_config):
+            self.last_error = " ".join(removed)
+            logger.error(self.last_error)
+            return None
+        if not self.data_config.get("actions_to_extract"):
+            self.last_error = "actions_to_extract is empty: the config names no stream to use as the action."
+            logger.error(self.last_error)
+            return None
+        for name, entry in (self.data_config.get("output", {}).get("streams") or {}).items():
+            if msg := normalization_error(name, entry):
+                self.last_error = msg
+                logger.error(msg)
+                return None
 
-        sorted_files = sorted(input_files, key=natural_key)
+        sorted_files = _recordings(input_files)
 
         # bridge_map/required_observations depend only on data_config, which is
         # identical for every demo in this batch — build the engine once.
         engine = DataTransformEngine(self.data_config)
-        self._modality_map = self._build_modality_map()
+        self._modality_map = explicit_modalities(self.data_config)
 
         # Real-data shape/dtype cache: for every observation the config asks
         # for, find the first demo in the whole batch where it actually
@@ -512,30 +397,48 @@ class YAMLDrivenConverter:
         self._shape_cache, unresolved = self._prescan_shapes(
             sorted_files, engine, required_keys
         )
-        self._excluded_keys = set()
+        if missing := sorted(k for k in unresolved if k in streams_cfg):
+            # a config these recordings were not made with: every demo would get zero columns
+            have, configs = self._recorded_streams(sorted_files)
+            self.last_error = (
+                f"Configured stream(s) {', '.join(missing)} are in none of the selected recordings; "
+                f"they have {', '.join(sorted(have)) or 'no streams'}"
+                + (f" (recorded with {', '.join(sorted(configs))})" if configs else "")
+                + ". Load the config these demos were recorded with."
+            )
+            logger.error(self.last_error)
+            return None
+        self._excluded_keys = set(unresolved)
         for key in sorted(unresolved):
-            if key in streams_cfg:
-                width = _stream_output_width(self.data_config, key) or 1
-                self._shape_cache[key] = ((width,), np.float32)
-                logger.warning(
-                    f"Stream '{key}' has no recorded data anywhere in this batch; "
-                    f"zero-filling every demo using its configured spec width ({width})."
-                )
-            else:
-                self._excluded_keys.add(key)
-                logger.error(
-                    f"Observation '{key}' has no recorded data anywhere in this batch "
-                    f"and no inferable width; excluding it from the converted dataset."
-                )
+            logger.error(
+                f"Observation '{key}' has no recorded data anywhere in this batch "
+                f"and no inferable width; excluding it from the converted dataset."
+            )
 
         return engine, sorted_files
+
+    def _recorded_streams(self, files: List[str]) -> Tuple[Set[str], Set[str]]:
+        """Stream names and recorded-with config names found in these recordings (for the mismatch message)."""
+        streams: Set[str] = set()
+        configs: Set[str] = set()
+        for path in files:
+            try:
+                with h5py.File(path, "r") as f:
+                    for name in self._find_demo_groups(f):
+                        demo = f["data"][name]
+                        if isinstance(demo.get("streams"), h5py.Group):
+                            streams.update(demo["streams"].keys())
+                        if config := _demo_metadata(demo)[1]:
+                            configs.add(config)
+            except OSError:
+                continue
+        return streams, configs
 
     def convert_multiple_files(
         self,
         format_name: str,
         input_files: List[str],
         output_path: str,
-        env_metadata: Optional[Dict] = None,
         data_config: Optional[Dict] = None,
     ) -> bool:
         """
@@ -545,7 +448,6 @@ class YAMLDrivenConverter:
             format_name:  Target format key (e.g. "robomimic")
             input_files:  List of input HDF5 file paths
             output_path:  Destination HDF5 path
-            env_metadata: Optional metadata override dict
             data_config:  Optional data_config override (the `config` sub-dict)
 
         Returns:
@@ -554,6 +456,7 @@ class YAMLDrivenConverter:
             dropped and the remaining ones are still converted.
         """
         self.last_error = None
+        self.converted_demos, self.skipped_demos = 0, []
         if format_name == "lerobot":
             return self.convert_to_lerobot(
                 input_files, output_path, data_config=data_config
@@ -563,11 +466,7 @@ class YAMLDrivenConverter:
         if prepared is None:
             return False
         engine, sorted_files = prepared
-
-        # Metadata: prefer explicit arg, then postprocess_config.yaml, then the legacy
-        # `metadata` key of data_config, then empty
-        meta = env_metadata if env_metadata else self.options.robomimic_metadata(self.data_config)
-        env_args = self._build_env_args(meta)
+        freq = float(self.data_config.get("recording_frequency") or 0)  # required by the config check; 0 = no rate check
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
@@ -595,6 +494,11 @@ class YAMLDrivenConverter:
                                 if not isinstance(demo_data, h5py.Group):
                                     continue
 
+                                if reason := self._demo_problem(demo_data, engine, freq):
+                                    logger.error(f"Skipped {file_path}::{raw_demo_name}: {reason}")
+                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
+                                    continue
+
                                 out_name = f"demo_{counter}"
                                 converted = self._convert_single_demo(
                                     demo_data, engine, out_name
@@ -610,6 +514,7 @@ class YAMLDrivenConverter:
                                         if out_name in data_grp:
                                             del data_grp[out_name]
                                         logger.error(f"Skipped {file_path}::{raw_demo_name}: {e}")
+                                        self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
                                         continue
                                     processed.append(out_name)
                                     total_demos += converted["num_samples"]
@@ -622,6 +527,7 @@ class YAMLDrivenConverter:
                                     logger.warning(
                                         f"Skipped {file_path}::{raw_demo_name} (conversion failed)"
                                     )
+                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
 
                     except Exception as e:
                         fname = os.path.basename(file_path)
@@ -638,14 +544,11 @@ class YAMLDrivenConverter:
                 # Robomimic requires `total` = number of demos (not total timesteps)
                 data_grp.attrs["total"] = counter
                 # env_args MUST be a JSON string (Robomimic ObsUtils requirement)
+                env_args = {**ENV_ARGS, "env_kwargs": {"control_freq": freq}} if freq > 0 else ENV_ARGS
                 data_grp.attrs["env_args"] = json.dumps(env_args)
 
-                mask_grp = out_f.create_group("mask")
-                splits = self.options.splits(self.data_config)
-                train_frac = splits["train_frac"]
-                val_frac = splits["val_frac"]
-                test_frac = splits["test_frac"]
-                if not self._create_data_mask(mask_grp, processed, train=train_frac, val=val_frac, test=test_frac):
+                splits = self.options.splits()
+                if not self._create_data_mask(out_f.create_group("mask"), processed, splits["train_frac"], splits["val_frac"]):
                     self._discard_output(output_path)
                     return False
 
@@ -653,6 +556,7 @@ class YAMLDrivenConverter:
                 logger.warning(
                     f"Skipped {len(skipped)} file(s) (corrupted or unreadable): {skipped}"
                 )
+            self.converted_demos = counter
             logger.info(
                 f"Successfully wrote {counter} demos ({total_demos} timesteps) -> {output_path}"
             )
@@ -688,7 +592,7 @@ class YAMLDrivenConverter:
         Convert recorded HDF5 files into a LeRobotDataset v3.0 directory.
 
         Uses the same acquisition config as the robomimic conversion:
-          - actions            <- `actions_to_extract` (as in generate_actions)
+          - actions            <- `actions_to_extract` (as for robomimic)
           - observation.state  <- numeric `output.streams`, concatenated in
                                   declaration order (or `lerobot.state_streams`)
           - observation.images.<key> <- uint8 image obs from bridge-map entries
@@ -704,14 +608,15 @@ class YAMLDrivenConverter:
         from .lerobot_writer import (
             LeRobotDatasetWriter,
             LeRobotDependencyError,
+            LeRobotFatalError,
             LeRobotWriterError,
             check_dependencies,
         )
 
         self.last_error = None
+        self.converted_demos, self.skipped_demos = 0, []
         prepared = self._prepare_batch("lerobot", input_files, data_config)
         if prepared is None:
-            self.last_error = "The 'lerobot' format config was not found."
             return False
         engine, sorted_files = prepared
 
@@ -746,33 +651,15 @@ class YAMLDrivenConverter:
             logger.error(self.last_error)
             return False
 
-        lerobot_cfg = self.options.lerobot(self.data_config)
+        lerobot_cfg = self.options.lerobot()
         fps = self._lerobot_fps()
         if fps is None:
-            self.last_error = (
-                "A positive 'recording_frequency' is required in the config (used as the fps)."
-            )
+            self.last_error = FPS_REQUIRED
             return False
-        task_text = (
-            task
-            or lerobot_cfg.get("task")
-            or self.data_config.get("dataset_name")
-            or "unspecified task"
-        )
-
-        streams_cfg = self.data_config.get("output", {}).get("streams", {})
-        for name, entry in streams_cfg.items():
-            _, normalize, _, _, _ = _parse_stream_entry(entry)
-            if normalize:
-                logger.warning(
-                    f"Stream '{name}' has normalize=true: the LeRobot dataset will contain "
-                    f"normalized values. LeRobot computes its own stats (meta/stats.json) and "
-                    f"normalizes at training time, so normalize is usually left off."
-                )
+        task_text = self._lerobot_task(task)
 
         written = 0
         skipped: List[str] = []
-        self._need_next_obs = False
         try:
             with LeRobotDatasetWriter(
                 output_dir, fps=fps, robot_type=lerobot_cfg.get("robot_type"),
@@ -798,14 +685,9 @@ class YAMLDrivenConverter:
                                 demo_data = in_data_grp.get(raw_demo_name)
                                 if not isinstance(demo_data, h5py.Group):
                                     continue
-                                ts = demo_data.get("timestamps")
-                                rate = median_rate(ts[:]) if isinstance(ts, h5py.Dataset) else None
-                                if rate is not None and abs(rate - fps) > RATE_TOLERANCE * fps:
-                                    # fps is the episode's time base: a policy trained on it would move rate/fps faster
-                                    logger.error(
-                                        f"Skipped {file_path}::{raw_demo_name}: recorded at {rate:.1f} Hz, but the dataset "
-                                        f"fps is {fps}. Set recording_frequency to a rate this PC keeps up with and record again."
-                                    )
+                                if reason := self._demo_problem(demo_data, engine, fps):
+                                    logger.error(f"Skipped {file_path}::{raw_demo_name}: {reason}")
+                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
                                     continue
                                 demo = self._convert_single_demo(
                                     demo_data, engine, f"lerobot_ep_{written}"
@@ -814,6 +696,7 @@ class YAMLDrivenConverter:
                                     logger.warning(
                                         f"Skipped {file_path}::{raw_demo_name} (conversion failed)"
                                     )
+                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
                                     continue
                                 try:
                                     state, state_names, images = self._lerobot_split_obs(
@@ -829,19 +712,20 @@ class YAMLDrivenConverter:
                                             demo["actions"].shape[1]
                                         ),
                                     )
-                                except LeRobotDependencyError:
-                                    raise  # fatal: every episode would fail the same way
+                                except LeRobotFatalError:
+                                    raise  # missing library or aborted dataset: every later episode would be wrong too
                                 except LeRobotWriterError as e:
                                     logger.error(
                                         f"Skipped {file_path}::{raw_demo_name}: {e}"
                                     )
+                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
                                     continue
                                 written += 1
                                 logger.info(
                                     f"Converted {file_path}::{raw_demo_name} -> "
                                     f"episode {written - 1} ({demo['num_samples']} frames)"
                                 )
-                    except LeRobotDependencyError:
+                    except LeRobotFatalError:
                         raise
                     except Exception as e:  # skip a broken file: reaching the writer would delete the whole output
                         fname = os.path.basename(file_path)
@@ -856,6 +740,7 @@ class YAMLDrivenConverter:
                 logger.warning(
                     f"Skipped {len(skipped)} file(s) (corrupted or unreadable): {skipped}"
                 )
+            self.converted_demos = written
             logger.info(f"Successfully wrote {written} episodes -> {output_dir}")
             return True
 
@@ -868,14 +753,173 @@ class YAMLDrivenConverter:
             logger.error(f"Fatal error during LeRobot conversion: {e}")
             traceback.print_exc()
             return False
-        finally:
-            self._need_next_obs = True
+
+    def conversion_summary(self) -> str:
+        """One line for the GUI / CLI: how many demos of the last conversion were written."""
+        total = self.converted_demos + len(self.skipped_demos)
+        text = f"Converted {self.converted_demos} of {total} demos"
+        return text + (f" ({len(self.skipped_demos)} skipped, see log)" if self.skipped_demos else "")
+
+    # ------------------------------------------------------------------
+    # Pre-check: what a conversion would do, nothing written
+    # ------------------------------------------------------------------
+
+    def precheck(self, format_name: str, input_files: List[str]) -> Dict[str, Any]:
+        """
+        What converting ``input_files`` to ``format_name`` would do, without writing anything (no LeRobot/PyAV needed):
+        the batch error the conversion would stop with, each demo's verdict from the same `_demo_problem` the
+        conversion runs, and the output layout from the real config + recorded shapes.
+        """
+        self.last_error = None
+        report: Dict[str, Any] = {"format": format_name, "error": None, "demos": [], "output": [],
+                                  "converted": 0, "total": 0}
+        prepared = self._prepare_batch(format_name, input_files)
+        engine, files = prepared if prepared else (None, _recordings(input_files))
+        freq = float(self.data_config.get("recording_frequency") or 0)
+        if prepared and format_name == "lerobot":
+            freq = self._lerobot_fps() or 0
+            self.last_error = None if freq else FPS_REQUIRED
+        elif prepared:
+            splits = self.options.splits()
+            self.last_error = _splits_error(splits["train_frac"], splits["val_frac"])
+        report["error"] = self.last_error
+
+        for path in files:
+            if not path.endswith(".h5"):
+                continue  # as the conversion: a skipped file, not a demo
+            try:
+                with h5py.File(path, "r") as f:
+                    for name in sorted(self._find_demo_groups(f)):
+                        demo = f["data"][name]
+                        ts = demo.get("timestamps")
+                        ts = ts[:] if isinstance(ts, h5py.Dataset) else None
+                        streams = demo.get("streams")
+                        first = next(iter(streams.values()), None) if isinstance(streams, h5py.Group) else None
+                        recorded_hz, config = _demo_metadata(demo)
+                        if report["error"]:
+                            reason = self._rate_problem(demo, freq) or "not converted (batch error)"
+                        else:
+                            reason = self._demo_problem(demo, engine, freq)
+                        report["demos"].append({
+                            "file": path, "demo": name,
+                            "samples": len(ts) if ts is not None else (len(first) if first is not None else 0),
+                            "rate_hz": median_rate(ts) if ts is not None else None,
+                            "recorded_with": config, "recorded_hz": recorded_hz,
+                            "ok": not reason, "reason": reason,
+                        })
+            except OSError as e:
+                logger.warning(f"Pre-check: could not read {path}: {e}")
+
+        report["total"] = len(report["demos"])
+        report["converted"] = sum(d["ok"] for d in report["demos"])
+        if not report["error"]:
+            report["output"] = self._output_preview(format_name, engine, report["converted"], freq)
+        return report
+
+    def _output_preview(self, format_name: str, engine: DataTransformEngine, demos: int, freq: float) -> List[List[str]]:
+        """[name, detail] rows of what the conversion writes, from the shape cache of _prepare_batch."""
+        streams_cfg = self.data_config.get("output", {}).get("streams", {})
+        obs: Dict[str, Tuple[Tuple[int, ...], np.dtype]] = {}  # key -> (feature shape, dtype) as written
+        for key, entry in streams_cfg.items():
+            shape = self._shape_cache[key][0]
+            obs[key] = ((3,) if _parse_stream_entry(entry)[1] == "rpy" else shape, np.dtype(np.float32))
+        for key in sorted(engine.bridge_map):
+            if key not in self._excluded_keys and key not in obs:
+                shape, dtype = self._shape_cache[key]
+                kept = np.dtype(dtype) == np.uint8 or key in self._modality_map  # else read as float32
+                obs[key] = (shape, np.dtype(dtype) if kept else np.dtype(np.float32))
+        widths = [(k, (obs[k][0] or (1,))[0] if k in obs else 0) for k in self.data_config.get("actions_to_extract", [])]
+        dim = sum(w for _, w in widths)
+        cols, start = [], 0
+        for key, w in widths:
+            cols.append(f"{key}[{start}]" if w == 1 else f"{key}[{start}:{start + w}]")
+            start += w
+        actions = f"({dim}) = " + ", ".join(cols)
+
+        if format_name == "lerobot":
+            from .lerobot_writer import LeRobotWriterError
+
+            cfg = self.options.lerobot()
+            fake = {"num_samples": 1, "obs": {k: np.zeros((1,) + s, d) for k, (s, d) in obs.items()}}
+            try:  # the converter's own split, on one zero row per key
+                _, state_names, images = self._lerobot_split_obs(fake, cfg.get("state_streams"))
+                state = _names_text(state_names)
+            except LeRobotWriterError as e:
+                state, images = str(e), {}
+            action_names = self._lerobot_action_names(dim)
+            return ([["observation.state", state]]
+                    + [[k, f"video 3x{a.shape[1]}x{a.shape[2]}"] for k, a in images.items()]
+                    + [["action", _names_text(action_names) if action_names else actions], ["fps", f"{freq:g}"],
+                       ["task", self._lerobot_task()], ["robot_type", str(cfg.get("robot_type") or "-")],
+                       ["episodes", str(demos)]])
+
+        rows = [[f"data/demo_N/obs/{k}", f"(N{''.join(f', {x}' for x in s)}) {d}"] for k, (s, d) in obs.items()]
+        splits = self.options.splits()
+        train, val = _split_counts(demos, splits["train_frac"], splits["val_frac"])
+        return rows + [
+            ["data/demo_N/actions", actions.replace("(", "(N, ", 1)],
+            ["data/demo_N/rewards, dones", "(N,) float32, 1 at the last step"],
+            ["mask/train, mask/valid",
+             f"{train} / {val} demos (train_frac {splits['train_frac']:g}, val_frac {splits['val_frac']:g})"],
+            ["env_args", f"control_freq {freq:g}" if freq else "no control_freq"],
+        ]
+
+    @staticmethod
+    def _rate_problem(demo_data: h5py.Group, freq: float) -> str:
+        """Why the demo's rate is unusable ("" if fine): more than RATE_TOLERANCE off ``freq`` means the policy, run at
+        ``freq``, would move rate/freq faster than shown. A demo without timestamps (or freq 0) is not checked."""
+        ts = demo_data.get("timestamps")
+        rate = median_rate(ts[:]) if freq > 0 and isinstance(ts, h5py.Dataset) else None
+        if rate is None or abs(rate - freq) <= RATE_TOLERANCE * freq:
+            return ""
+        recorded_hz, config = _demo_metadata(demo_data)
+        if recorded_hz is not None and recorded_hz != freq:
+            return (f"recorded at {recorded_hz:g} Hz with {config or 'another config'}; the loaded config says "
+                    f"{freq:g} Hz: load the config these demos were recorded with")
+        return (f"recorded at {rate:.1f} Hz, but recording_frequency is {freq:g}: this PC could not keep up. "
+                f"Set recording_frequency to a rate this PC keeps up with and record again.")
+
+    def _demo_problem(self, demo_data: h5py.Group, engine: DataTransformEngine, freq: float) -> str:
+        """Why this demo would be skipped, "" if it converts. The one set of per-demo rules, used by the conversion
+        loops and by precheck(); reads dataset shapes only (and the timestamps), never the arrays."""
+        if reason := self._rate_problem(demo_data, freq):
+            return reason
+        streams_grp = demo_data.get("streams")
+        if not isinstance(streams_grp, h5py.Group):
+            return "no 'streams' group (not recorded by Relay-D?)"
+        streams_cfg = self.data_config.get("output", {}).get("streams", {})
+        present = [k for k in streams_cfg if k in streams_grp]
+        if not present or not len(streams_grp[present[0]]):
+            return "no data in the configured streams"
+        n = len(streams_grp[present[0]])
+        actions = self.data_config.get("actions_to_extract", [])
+        for key in actions:
+            if key not in streams_grp:  # zero actions would train on zeros: the demo is skipped
+                return f"no {key} (action stream)"
+        try:  # the recorder writes one row per timestamp: another length means lost or extra frames
+            for key in dict.fromkeys(present + list(actions)):
+                _check_length(streams_grp[key], n, key)
+            for key in sorted(engine.bridge_map):
+                if key in self._excluded_keys or key in streams_cfg:
+                    continue
+                ds = engine._get_nested_data(demo_data, engine.resolve_path(key) or "")
+                if ds is not None:
+                    _check_length(ds, n, key)
+                    continue
+                shape, dtype = self._shape_cache[key]
+                if np.dtype(dtype) == np.uint8 or len(shape) >= 2 or key in self._modality_map:
+                    # black frames would teach the policy to act blind (a missing numeric obs is zero-filled)
+                    return f"no {'point cloud' if self._modality_map.get(key) == 'scan' else 'camera'} {key}"
+        except ValueError as e:
+            return str(e)
+        return ""
+
+    def _lerobot_task(self, task: Optional[str] = None) -> str:
+        return task or self.options.lerobot().get("task") or self.data_config.get("dataset_name") or "unspecified task"
 
     def _lerobot_fps(self) -> Optional[int]:
-        """fps from `recording_frequency` (top level or under `metadata`)."""
+        """fps from `recording_frequency`."""
         raw = self.data_config.get("recording_frequency")
-        if raw is None:
-            raw = (self.data_config.get("metadata") or {}).get("recording_frequency")
         try:
             value = float(raw)
         except (TypeError, ValueError):
@@ -969,7 +1013,7 @@ class YAMLDrivenConverter:
         """
         Stream-based conversion path.
         Reads pre-computed stream datasets from raw HDF5 `streams/` group and
-        maps them directly to obs/next_obs. Actions are assembled from
+        maps them directly to obs. Actions are assembled from
         `actions_to_extract` stream names.
         """
         try:
@@ -996,32 +1040,17 @@ class YAMLDrivenConverter:
             demo: Dict = {
                 "num_samples": num_samples,
                 "obs": {},
-                "next_obs": {},
                 "actions": None,
                 "rewards": None,
                 "dones": None,
-                "states": None,
             }
 
             stream_configs = self.data_config.get("output", {}).get("streams", {})
             for stream_name in stream_names:
-                _, normalize, norm_range, limits, rot_fmt = _parse_stream_entry(
-                    stream_configs.get(stream_name, [])
-                )
+                _, rot_fmt = _parse_stream_entry(stream_configs.get(stream_name, []))
                 if stream_name in streams_grp:
-                    dataset = streams_grp[stream_name]
-                    # Defensive guard: a stream should never legitimately carry
-                    # uint8 image data (output.streams is numeric-only — see
-                    # StreamBuilder), but if a misconfigured spec ever put one
-                    # here, preserve its dtype instead of corrupting it with an
-                    # unconditional float32 cast + rotation/normalization math.
-                    is_image = dataset.dtype == np.uint8
-                    data = np.array(dataset) if is_image else np.array(dataset, dtype=np.float32)
-                    data = data[:num_samples]
-                    if not is_image:
-                        data = _apply_rotation_format(data, rot_fmt, stream_name)
-                        if normalize and limits:
-                            data = _apply_normalization(data, limits, norm_range)
+                    data = np.array(streams_grp[stream_name], dtype=np.float32)
+                    data = _apply_rotation_format(data, rot_fmt, stream_name)
                 else:
                     cached = self._shape_cache.get(stream_name)
                     if cached is None:
@@ -1042,38 +1071,19 @@ class YAMLDrivenConverter:
                     data = np.zeros((num_samples,) + feat_shape, dtype=dtype)
 
                 demo["obs"][stream_name] = data
-                demo["next_obs"][stream_name] = _next_obs(data)
 
             actions_to_extract = self.data_config.get("actions_to_extract", [])
             delta_actions = self.data_config.get("delta_actions", [])
             action_parts = []
-            for stream_name in actions_to_extract:
-                if stream_name in streams_grp:
-                    part = np.array(streams_grp[stream_name], dtype=np.float32)[:num_samples]
-                    action_parts.append(_action_part(part, stream_name, stream_configs, delta_actions))
-                elif stream_name in demo["obs"]:
-                    # Already zero-filled above from the shape cache.
-                    part = demo["obs"][stream_name]
-                    if part.ndim == 1:
-                        part = part[:, np.newaxis]
-                    action_parts.append(part)
-                else:
-                    # A missing action column would silently change the action size: fail the demo.
-                    raise ValueError(
-                        f"actions_to_extract: stream '{stream_name}' not found in {demo_name} "
-                        f"(no data anywhere in the batch)"
-                    )
+            for stream_name in actions_to_extract:  # present and the right length: checked by _demo_problem
+                part = np.array(streams_grp[stream_name], dtype=np.float32)
+                action_parts.append(_action_part(part, stream_name, stream_configs, delta_actions))
 
             action_parts = [p for p in action_parts if p.ndim < 2 or p.shape[1] > 0]
-            if action_parts:
-                demo["actions"] = np.concatenate(action_parts, axis=1)
-            else:
-                n_actions = _infer_n_actions(self.data_config)
-                demo["actions"] = np.zeros((num_samples, n_actions), dtype=np.float32)
+            demo["actions"] = np.concatenate(action_parts, axis=1)  # all zero-width: ValueError, the demo fails
 
             demo["rewards"] = _end_flags(num_samples)
             demo["dones"] = _end_flags(num_samples)
-            demo["states"] = _stack_states(demo["obs"], num_samples)
 
             logger.info(
                 f"Stream-based conversion: {demo_name}, "
@@ -1084,7 +1094,6 @@ class YAMLDrivenConverter:
 
         except Exception as e:
             logger.error(f"Error in stream-based conversion of '{demo_name}': {e}")
-            import traceback
             traceback.print_exc()
             return None
 
@@ -1097,15 +1106,13 @@ class YAMLDrivenConverter:
         demo_name: str,
     ) -> None:
         """
-        Populate demo['obs']/['next_obs'] for every bridge-map key (top-level
+        Populate demo['obs'] for every bridge-map key (top-level
         `output:` entries other than `streams`) not already present in demo['obs'].
 
-        This is how Image / organized PointCloud2 data reaches obs/next_obs:
+        This is how Image / organized PointCloud2 data reaches obs:
         those types can't be expressed as output.streams specs (numeric-only —
         see StreamBuilder), so they're referenced directly by their raw HDF5
-        path instead, e.g. `output: agentview_image: camera_rgb/images`. Called
-        from both branches of `_convert_single_demo` so bridge-map obs can
-        coexist with (or stand in for) output.streams-based obs.
+        path instead, e.g. `output: agentview_image: camera_rgb/images`.
         """
         required_keys = sorted(
             k for k in engine.bridge_map
@@ -1132,10 +1139,7 @@ class YAMLDrivenConverter:
                 is_image = dataset.dtype == np.uint8 or obs_key in self._modality_map
                 raw = np.array(dataset) if is_image else np.array(dataset, dtype=np.float32)
 
-                _check_length(raw, num_samples, obs_key)
                 demo["obs"][obs_key] = raw
-                if self._need_next_obs:
-                    demo["next_obs"][obs_key] = _next_obs(raw)
                 continue
 
             cached = self._shape_cache.get(obs_key)
@@ -1145,11 +1149,9 @@ class YAMLDrivenConverter:
                     f"shape anywhere in the batch; skipping."
                 )
                 continue
-            feat_shape, dtype = cached
-            fill = np.zeros((num_samples,) + feat_shape, dtype=dtype)
-            demo["obs"][obs_key] = fill
-            if self._need_next_obs:
-                demo["next_obs"][obs_key] = fill.copy()
+            feat_shape, dtype = cached  # a missing camera / point cloud skipped the demo in _demo_problem
+            logger.warning(f"'{obs_key}' not found in {demo_name}; zero-filling with shape {feat_shape}.")
+            demo["obs"][obs_key] = np.zeros((num_samples,) + feat_shape, dtype=dtype)
 
     def _convert_single_demo(
         self,
@@ -1160,62 +1162,18 @@ class YAMLDrivenConverter:
         """
         Convert one demo group to an in-memory dict ready for HDF5 writing.
 
-        Steps:
-          1. If a `streams/` group is present, start from stream-based
-             conversion (numeric obs from output.streams).
-          2. Always merge in bridge-map obs (top-level `output:` entries other
-             than `streams`) — this is how Image / organized PointCloud2 data
-             reaches obs/next_obs, and it coexists with output.streams rather
-             than being mutually exclusive with it.
-          3. If there was no `streams/` group at all, determine master
-             timestep count N via the bridge map instead, then generate
-             actions, rewards, dones, states as usual.
+        Numeric obs and actions come from the `streams/` group, then bridge-map obs
+        (cameras / point clouds) are merged in. Only for a demo `_demo_problem` passed.
         """
-        if "streams" in demo_data:
-            demo = self._convert_single_demo_from_streams(demo_data, demo_name)
-            if demo is None:
-                return None
-            try:
-                self._populate_bridge_obs(
-                    demo_data, engine, demo, demo["num_samples"], demo_name
-                )
-            except ValueError as e:  # one bad demo is skipped, not the rest of its file
-                logger.error(f"Error converting demo '{demo_name}': {e}")
-                return None
-            return demo
-
-        try:
-            num_samples = self._get_master_timesteps(demo_data, engine)
-            if num_samples is None or num_samples == 0:
-                logger.warning(f"Could not determine timesteps for {demo_name}")
-                return None
-
-            demo: Dict[str, Any] = {
-                "num_samples": num_samples,
-                "obs": {},
-                "next_obs": {},
-                "actions": None,
-                "rewards": None,
-                "dones": None,
-                "states": None,
-            }
-
-            self._populate_bridge_obs(demo_data, engine, demo, num_samples, demo_name)
-
-            # --- Actions, rewards, dones, states ---
-            demo["actions"] = engine.generate_actions(
-                demo_data, demo["obs"], num_samples
-            )
-            demo["rewards"] = _end_flags(num_samples)
-            demo["dones"] = _end_flags(num_samples)
-            demo["states"] = _stack_states(demo["obs"], num_samples)
-
-            return demo
-
-        except Exception as e:
-            logger.error(f"Error converting demo '{demo_name}': {e}")
-            traceback.print_exc()
+        demo = self._convert_single_demo_from_streams(demo_data, demo_name)
+        if demo is None:
             return None
+        try:
+            self._populate_bridge_obs(demo_data, engine, demo, demo["num_samples"], demo_name)
+        except ValueError as e:  # one bad demo is skipped, not the rest of its file
+            logger.error(f"Error converting demo '{demo_name}': {e}")
+            return None
+        return demo
 
     # ------------------------------------------------------------------
     # HDF5 write helpers
@@ -1239,49 +1197,33 @@ class YAMLDrivenConverter:
         dg.attrs["model_file"] = ""  # Required by some Robomimic loaders
 
         # Top-level datasets
-        for ds_name in ("states", "actions", "rewards", "dones"):
+        for ds_name in ("actions", "rewards", "dones"):
             arr = demo[ds_name].astype(np.float32)
             dg.create_dataset(ds_name, data=arr, **user_settings.h5_compression())
 
-        # obs and next_obs
-        for group_name in ("obs", "next_obs"):
-            grp = dg.create_group(group_name)
-            for key, data in demo[group_name].items():
-                is_image = data.dtype == np.uint8 or key in self._modality_map
+        # obs (no next_obs: robomimic only loads it with hdf5_load_next_obs, false in every shipped config)
+        grp = dg.create_group("obs")
+        for key, data in demo["obs"].items():
+            is_image = data.dtype == np.uint8 or key in self._modality_map
 
-                kwargs: Dict[str, Any] = {**user_settings.h5_compression(), "dtype": data.dtype}
-                if is_image and data.ndim >= 3:
-                    # Per-frame chunking for efficient sequential reads during training
-                    kwargs["chunks"] = (1,) + data.shape[1:]
+            kwargs: Dict[str, Any] = {**user_settings.h5_compression(), "dtype": data.dtype}
+            if is_image and data.ndim >= 3:
+                # Per-frame chunking for efficient sequential reads during training
+                kwargs["chunks"] = (1,) + data.shape[1:]
 
-                grp.create_dataset(key, data=data, **kwargs)
+            grp.create_dataset(key, data=data, **kwargs)
 
-    def _create_data_mask(self, mask_group: h5py.Group, demo_names: List[str], train: float, val: float, test: float):
+    def _create_data_mask(self, mask_group: h5py.Group, demo_names: List[str], train: float, val: float):
+        """mask/train and mask/valid; demos left over by rounding or train + val < 1 also train."""
         vlen_str_type = h5py.special_dtype(vlen=str)
 
-        for name, frac in (("train", train), ("val", val), ("test", test)):
-            if not isinstance(frac, (int, float)) or isinstance(frac, bool) or not 0 <= frac <= 1:
-                self.last_error = f"robomimic.splits: '{name}' must be a number between 0 and 1, got {frac!r}"
-                logger.error(self.last_error)
-                return False
-        if train == 0:  # every robomimic template trains on the "train" mask: no mask, no training
-            self.last_error = "robomimic.splits: 'train' must be more than 0"
-            logger.error(self.last_error)
-            return False
-        if train + val > 1 + 1e-9:
-            self.last_error = f"robomimic.splits: train ({train}) + val ({val}) is more than 1"
+        if error := _splits_error(train, val):
+            self.last_error = error
             logger.error(self.last_error)
             return False
 
         sorted_demo_names = sorted(demo_names, key=natural_key)
-        total_demos = len(sorted_demo_names)
-
-        # At least one training demo when training is asked for (round() would give 0 for few demos).
-        train_count = max(1, round(total_demos * train)) if train > 0 and total_demos else 0
-        val_count = min(round(total_demos * val), total_demos - train_count)
-        test_count = total_demos - train_count - val_count
-        if not test and train_count:  # no eval split asked for: rounding leftovers train instead of sitting unused in "eval"
-            train_count, test_count = train_count + test_count, 0
+        train_count, val_count = _split_counts(len(sorted_demo_names), train, val)
 
         if(train_count != 0):
             mask_group.create_dataset(
@@ -1297,13 +1239,6 @@ class YAMLDrivenConverter:
                 dtype=vlen_str_type,
             )
 
-        if(test_count != 0):
-            mask_group.create_dataset(
-                "eval",
-                data=[n.encode("utf-8") for n in sorted_demo_names[train_count + val_count:]],
-                dtype=vlen_str_type,
-            )
-
         return True
 
     # ------------------------------------------------------------------
@@ -1311,7 +1246,7 @@ class YAMLDrivenConverter:
     # ------------------------------------------------------------------
 
     def _find_demo_groups(self, input_file: h5py.File) -> List[str]:
-        """Return all group names directly under /data that start with 'demo_'."""
+        """Return the names of all groups directly under /data (any name, not only 'demo_*')."""
         groups: List[str] = []
         data_grp = input_file.get("data")
         if isinstance(data_grp, h5py.Group):
@@ -1319,102 +1254,6 @@ class YAMLDrivenConverter:
                 if isinstance(data_grp[key], h5py.Group):
                     groups.append(key)
         return groups
-
-    def _get_master_timesteps(
-        self,
-        demo_data: h5py.Group,
-        engine: DataTransformEngine,
-    ) -> Optional[int]:
-        """
-        Determine N (number of timesteps) for a demo group.
-
-        Priority:
-          1. Explicit 'timestamps' dataset at demo root
-          2. detailed_timestamps/recording_times
-          3. Primary observation dataset via bridge map (joint_positions)
-          4. Any first dataset found by scanning sub-groups
-        """
-        # 1. timestamps
-        if "timestamps" in demo_data:
-            ts = demo_data["timestamps"]
-            if isinstance(ts, h5py.Dataset) and ts.shape[0] > 0:
-                return ts.shape[0]
-
-        # 2. detailed_timestamps
-        dt = demo_data.get("detailed_timestamps")
-        if isinstance(dt, h5py.Group):
-            rt = dt.get("recording_times")
-            if isinstance(rt, h5py.Dataset) and rt.shape[0] > 0:
-                return rt.shape[0]
-
-        # 3. Primary obs from bridge map (dynamically discovered)
-        joint_key = engine._discover_joint_key()
-        eef_key = engine._discover_eef_key()
-        for primary_key in (joint_key, eef_key):
-            if not primary_key:
-                continue
-            path = engine.resolve_path(primary_key)
-            if path:
-                ds = engine._get_nested_data(demo_data, path)
-                if isinstance(ds, h5py.Dataset) and ds.shape[0] > 0:
-                    return ds.shape[0]
-
-        # 4. Scan any dataset in any sub-group
-        for key in demo_data.keys():
-            item = demo_data[key]
-            if isinstance(item, h5py.Group):
-                for sub_key in item.keys():
-                    sub = item[sub_key]
-                    if (
-                        isinstance(sub, h5py.Dataset)
-                        and len(sub.shape) >= 1
-                        and sub.shape[0] > 0
-                    ):
-                        return sub.shape[0]
-            elif isinstance(item, h5py.Dataset) and item.shape[0] > 0:
-                return item.shape[0]
-
-        return None
-
-    def _build_env_args(self, metadata: Dict) -> Dict:
-        """
-        Build the env_args dictionary that will be JSON-serialised into
-        /data.attrs['env_args'].
-
-        Structure required by Robomimic ObsUtils:
-          {
-            "env_name": str,
-            "type": int,           (Robomimic env-family enum, e.g. 1 = robosuite)
-            "env_kwargs": { ... }
-          }
-        """
-        return {
-            "env_name": metadata.get("env_name", "LFD_Demo_Environment"),
-            "env_version": metadata.get("env_version", ""),
-            "type": metadata.get("type", 1),
-            "env_kwargs": metadata.get("env_kwargs", {}),
-        }
-
-    def _build_modality_map(self) -> Dict[str, str]:
-        """
-        Build logical_key -> "rgb"|"depth"|"scan" from data_config's `input`
-        section's `modality` field. Only inputs with an explicit modality are
-        included — implicit rgb (the common case) is instead detected from
-        the real recorded dtype (uint8) wherever it's checked.
-        """
-        modality_map: Dict[str, str] = {}
-        for input_name, spec in self.data_config.get("input", {}).items():
-            if not isinstance(spec, dict):
-                continue
-            modality = spec.get("modality")
-            if modality in ("rgb", "depth", "scan"):
-                key = spec.get("output_map") or input_name
-                modality_map[key] = modality
-        return modality_map
-
-    def get_last_shape_cache(self) -> Dict[str, Tuple[Tuple[int, ...], Any]]:
-        """Real (feature_shape, dtype) per key from the last convert_multiple_files call."""
-        return dict(self._shape_cache)
 
     # ------------------------------------------------------------------
     # Real-data shape/dtype inference

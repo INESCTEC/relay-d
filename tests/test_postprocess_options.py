@@ -22,19 +22,10 @@ PostprocessOptions = po.PostprocessOptions
 
 FILE_OPTIONS = {
     "postprocess": {
-        "robomimic": {
-            "training_model": "diffusion_policy",
-            "splits": {"train_frac": 0.5, "val_frac": 0.5},
-            "metadata": {"env_name": "FromFile", "env_version": "9", "type": 1, "env_kwargs": {"a": 1}},
-        },
+        "robomimic": {"splits": {"train_frac": 0.5, "val_frac": 0.5}},
         "lerobot": {"task": "task from file", "robot_type": "iiwa"},
     }
 }
-
-
-@pytest.fixture(autouse=True)
-def _reset_warned():
-    po._warned_legacy.clear()
 
 
 def _write(path, data):
@@ -42,44 +33,36 @@ def _write(path, data):
     return str(path)
 
 
-def test_file_values_win_over_legacy_and_defaults(tmp_path):
+def test_file_values_and_defaults(tmp_path):
     opts, problems = PostprocessOptions.load(_write(tmp_path / "postprocess_config.yaml", FILE_OPTIONS))
     assert opts is not None and problems == []
-    legacy = {"metadata": {"env_name": "Legacy"}, "training_model": "bc_rnn_gmm", "train_frac": 0.1}
-    assert opts.robomimic_metadata(legacy)["env_name"] == "FromFile"
-    assert opts.training_model(legacy) == "diffusion_policy"
-    assert opts.splits(legacy) == {"train_frac": 0.5, "val_frac": 0.5, "test_frac": 0.0}
-    assert opts.lerobot({"lerobot": {"task": "legacy", "state_streams": ["x"]}}) == {
-        "task": "task from file", "robot_type": "iiwa", "state_streams": ["x"],
-    }
+    assert opts.splits() == {"train_frac": 0.5, "val_frac": 0.5}
+    assert opts.lerobot() == {"task": "task from file", "robot_type": "iiwa"}
+    assert PostprocessOptions().splits() == {"train_frac": 0.8, "val_frac": 0.2}
+    assert PostprocessOptions().lerobot() == {}
 
 
-def test_legacy_fallback_warns_once(caplog):
-    legacy = {"metadata": {"env_name": "Legacy"}, "training_model": "bc_transformer_gmm", "val_frac": 0.3}
-    opts = PostprocessOptions()
-    messages = []
-    import relay_d.acquisition.qt_app.ui.postprocess.postprocess_options as mod
-
-    mod.logger = type("L", (), {"warning": staticmethod(messages.append), "info": staticmethod(lambda *_: None)})
-    try:
-        assert opts.robomimic_metadata(legacy)["env_name"] == "Legacy"
-        assert opts.robomimic_metadata(legacy)["env_name"] == "Legacy"
-        assert opts.training_model(legacy) == "bc_transformer_gmm"
-        assert opts.splits(legacy)["val_frac"] == 0.3
-    finally:
-        import relay_d.utils.coloring_logger as cl
-
-        mod.logger = cl.logger
-    assert sum("'metadata'" in m for m in messages) == 1  # warned once, not per call
-    assert any("deprecated" in m and "postprocess_config.yaml" in m for m in messages)
+@pytest.mark.parametrize("robomimic, key", [
+    ({"metadata": {"env_name": "Lift"}}, "robomimic.metadata"),
+    ({"training_model": "diffusion_policy"}, "robomimic.training_model"),
+    ({"splits": {"train_frac": 0.8, "val_frac": 0.1, "test_frac": 0.1}}, "robomimic.splits.test_frac"),
+])
+def test_removed_options_are_refused(tmp_path, robomimic, key):
+    opts, problems = PostprocessOptions.load(_write(tmp_path / "o.yaml", {"postprocess": {"robomimic": robomimic}}))
+    assert opts is None and any(key in p and "removed" in p for p in problems)
 
 
-def test_defaults_when_nothing_set():
-    opts = PostprocessOptions()
-    assert opts.robomimic_metadata({}) == {}
-    assert opts.training_model({}) == "bc_rnn_gmm"
-    assert opts.splits({}) == {"train_frac": 0.8, "val_frac": 0.2, "test_frac": 0.0}
-    assert opts.lerobot({}) == {}
+@pytest.mark.parametrize("key", ["metadata", "training_model", "train_frac", "val_frac", "test_frac", "lerobot"])
+def test_removed_acquisition_keys_fail_the_conversion(tmp_path, key):
+    rec = tmp_path / "recording_0.h5"
+    write_recording(rec, LENGTHS)
+    cfg = json.loads(json.dumps(DATA_CONFIG))
+    cfg[key] = {"recording_frequency": 10} if key in ("metadata", "lerobot") else 0.5
+    conv = _converter(cfg)
+    assert not conv.convert_multiple_files("robomimic", [str(rec)], str(tmp_path / "rm.h5"))
+    assert f"'{key}'" in conv.last_error and "removed" in conv.last_error
+    assert not conv.convert_multiple_files("lerobot", [str(rec)], str(tmp_path / "lr"))
+    assert f"'{key}'" in conv.last_error
 
 
 def test_load_rejects_bad_files(tmp_path):
@@ -103,7 +86,6 @@ def test_find_sibling(tmp_path):
 def test_templates_are_valid():
     opts, problems = PostprocessOptions.load("relay_d/acquisition/qt_app/ui/config/templates/postprocess_config_template.yaml")
     assert opts is not None and problems == []
-    assert opts.robomimic_metadata({})["env_name"] == "Lift"
     acq = yaml.safe_load(open("relay_d/acquisition/qt_app/ui/config/templates/config_template.yaml"))["config"]
     for legacy_key in ("metadata", "training_model", "train_frac", "lerobot"):
         assert legacy_key not in acq
@@ -122,22 +104,10 @@ def test_robomimic_uses_options_file(tmp_path):
     out = tmp_path / "rm.h5"
     assert conv.convert_multiple_files("robomimic", [str(rec)], str(out))
     with h5py.File(out, "r") as f:
-        env_args = json.loads(f["data"].attrs["env_args"])
-        assert env_args["env_name"] == "FromFile"
+        assert json.loads(f["data"].attrs["env_args"]) == {"env_name": "relay_d", "type": 1, "env_kwargs": {"control_freq": float(DATA_CONFIG["recording_frequency"])}}
+        assert "next_obs" not in f["data/demo_0"] and "states" not in f["data/demo_0"] and "eval" not in f["mask"]
         # train 0.5 / valid 0.5 of 2 demos
         assert len(f["mask/train"]) == 1 and len(f["mask/valid"]) == 1
-
-
-def test_robomimic_legacy_config_still_works(tmp_path):
-    rec = tmp_path / "recording_0.h5"
-    write_recording(rec, LENGTHS)
-    cfg = json.loads(json.dumps(DATA_CONFIG))
-    cfg["metadata"] = {"env_name": "LegacyEnv", "env_version": "1", "type": 1, "env_kwargs": {}}
-    conv = _converter(cfg)
-    out = tmp_path / "rm.h5"
-    assert conv.convert_multiple_files("robomimic", [str(rec)], str(out))
-    with h5py.File(out, "r") as f:
-        assert json.loads(f["data"].attrs["env_args"])["env_name"] == "LegacyEnv"
 
 
 def test_lerobot_uses_options_file(tmp_path):
@@ -152,14 +122,6 @@ def test_lerobot_uses_options_file(tmp_path):
     import pyarrow.parquet as pq
 
     assert pq.read_table(out / "meta/tasks.parquet")["task"].to_pylist() == ["task from file"]
-
-
-def test_get_train_model_name_with_options(tmp_path):
-    p = YamlParser()
-    p.yaml_data = {"config": {"training_model": "legacy_model"}}
-    assert p.get_train_model_name() == "legacy_model"
-    opts, _ = PostprocessOptions.load(_write(tmp_path / "o.yaml", FILE_OPTIONS))
-    assert p.get_train_model_name(opts) == "diffusion_policy"
 
 
 def test_get_obs_config_without_sync_tolerance():
