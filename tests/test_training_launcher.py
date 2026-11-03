@@ -180,6 +180,20 @@ def test_check_environment(tmp_path):
     assert launcher.check_environment(str(tmp_path / "does-not-exist"), ROBOMIMIC)["ok"] is False
 
 
+def test_smolvla_is_fine_tuned_from_the_pretrained_base(folder):
+    ds = next(d for d in launcher.find_datasets(folder) if d.format == LEROBOT)
+    argv = launcher.build_command(TrainJob(ds, "py", "smolvla", {"device": "cuda"}), folder / "training_runs" / "s")
+    assert "--policy.path=lerobot/smolvla_base" in argv and not any(a.startswith("--policy.type") for a in argv)
+    assert "--policy.optimizer_lr=0.0001" in argv and "--policy.push_to_hub=false" in argv
+    # the pretrained model knows its cameras as camera1..3: the dataset's are renamed to them, in order
+    assert '--rename_map={"observation.images.cam": "observation.images.camera1"}' in argv
+    ds.summary["cameras"] = [f"observation.images.c{i}" for i in range(4)]
+    with pytest.raises(TrainingError, match="at most 3 cameras"):
+        launcher.build_command(TrainJob(ds, "py", "smolvla"), folder / "training_runs" / "t")
+    act = launcher.build_command(TrainJob(ds, "py", "act"), folder / "training_runs" / "a")
+    assert "--policy.type=act" in act and not any(a.startswith("--policy.path") for a in act)  # from scratch, as before
+
+
 def test_lerobot_dataset_without_camera_is_rejected(tmp_path):
     ds_dir = tmp_path / "state_only"
     (ds_dir / "meta").mkdir(parents=True)

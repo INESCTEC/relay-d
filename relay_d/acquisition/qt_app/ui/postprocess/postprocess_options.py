@@ -23,6 +23,7 @@ No Qt or ROS needed.
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
@@ -31,6 +32,19 @@ from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 
 OPTIONS_FILENAME = "postprocess_config.yaml"
+
+# Converted output says which format it is, like recording session folders end in _Recording.
+FORMAT_SUFFIX = {"robomimic": "_Robomimic", "lerobot": "_Lerobot"}
+
+
+def dataset_output_paths(save_folder: str, fmt: str, now: datetime) -> Tuple[str, str]:
+    """``(output folder, dataset path)`` of one Post-process conversion, e.g.
+    ``<save>/2026-11-02_15-10-00_Robomimic`` and ``.../dataset_1793630857_Robomimic.h5``.
+    A LeRobot dataset is a folder, so it has no extension."""
+    suffix = FORMAT_SUFFIX[fmt]
+    output_dir = os.path.join(save_folder, now.strftime("%Y-%m-%d_%H-%M-%S") + suffix)
+    extension = "" if fmt == "lerobot" else ".h5"
+    return output_dir, os.path.join(output_dir, f"dataset_{int(now.timestamp())}{suffix}{extension}")
 
 
 _warned_legacy: Set[str] = set()

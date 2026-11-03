@@ -42,7 +42,7 @@ from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 
 # ObsBuilder/ActionDispatcher/rclpy require a sourced ROS2 environment. Guard
-# the import so that pure-Python pieces (detect_backend, DispatcherHelpers) stay
+# the import so that pure-Python pieces (detect_backend, save_dispatch_templates) stay
 # importable in environments without ROS2.
 try:
     import rclpy
@@ -63,7 +63,7 @@ __all__ = [
     "InferenceSession",
     "ObsBuilder",
     "ActionDispatcher",
-    "DispatcherHelpers",
+    "save_dispatch_templates",
     "detect_backend",
 ]
 
@@ -93,29 +93,17 @@ def _wait_for_obs(obs_node: ObsBuilder, obs_keys: List[str], timeout: float, pol
         time.sleep(poll)
     return False
 
-class DispatcherHelpers:
-
-    def __init__(self):
-        logger.info("Initiated DispatcherHelper.")
-
-    def save_action_template(self, output_dir) -> str:
-        resource_target = resources.files("relay_d.dispatch").joinpath("config_templates/action_config_template.yaml")
-        destination_path = Path(output_dir) / "action_config.yaml"
-
-        # Read the bytes directly from the resource and write to the output directory
-        destination_path.write_bytes(resource_target.read_bytes())
-
-        return destination_path
-
-    def save_inference_script(self, output_dir):
-        """Copy the bundled inference script to the output directory."""
-        resource_target = resources.files("relay_d.dispatch").joinpath("templates/inference_script_template.py")
-        destination_path = Path(output_dir) / "inference_script.py"
-
-        # Read the bytes directly from the resource and write to the output directory
-        destination_path.write_bytes(resource_target.read_bytes())
-
-        return destination_path
+def save_dispatch_templates(output_dir) -> List[Path]:
+    """Copy the action_config.yaml template and the inference script into ``output_dir`` (the Post-process page's
+    action_dispatcher folder), so data prep writes the same config format that inference reads."""
+    package = resources.files("relay_d.dispatch")
+    written = []
+    for source, name in (("config_templates/action_config_template.yaml", "action_config.yaml"),
+                         ("templates/inference_script_template.py", "inference_script.py")):
+        destination = Path(output_dir) / name
+        destination.write_bytes(package.joinpath(source).read_bytes())
+        written.append(destination)
+    return written
 
 class InferenceSession:
     """Owns one ObsBuilder + policy + ActionDispatcher for a single rclpy process."""
@@ -128,10 +116,12 @@ class InferenceSession:
         device: str = "cpu",
         backend: Optional[str] = None,
         state_keys: Optional[List[str]] = None,
+        task: Optional[str] = None,
     ):
         """``backend``: "robomimic", "lerobot" or "auto" (default: the infer_backend setting, "auto" detects it from
         the checkpoint). ``state_keys``: LeRobot only, the observations that form observation.state, in order
-        (default: read from the dataset the policy was trained on)."""
+        (default: read from the dataset the policy was trained on). ``task``: LeRobot only, the instruction a language-conditioned
+        policy (SmolVLA) follows (default: the training dataset's task)."""
         if _ROS_IMPORT_ERROR is not None:
             raise ImportError(
                 "InferenceSession requires a sourced ROS2 environment "
@@ -156,10 +146,11 @@ class InferenceSession:
             from .lerobot_runner import LeRobotPolicyRunner
             self.model = LeRobotPolicyRunner(
                 checkpoint, device=device, state_keys=state_keys,
-                fallback_state_keys=self.obs_node.low_dim_obs_names,
+                fallback_state_keys=self.obs_node.low_dim_obs_names, task=task,
             )
 
         self.dispatcher = ActionDispatcher(self.obs_node, action_config)
+        self._was_stale = False  # after stale inputs the policy restarts: no queued actions or frames from before the gap
 
         self._executor = MultiThreadedExecutor()
         self._executor.add_node(self.obs_node)
@@ -179,6 +170,7 @@ class InferenceSession:
             self._spin_thread.start()
 
     def close(self) -> None:
+        self.dispatcher.send_stop()  # once: nothing is sent if run() already stopped and nothing was dispatched since
         self.dispatcher.close()
         self._executor.shutdown()
         self.obs_node.destroy_node()
@@ -237,13 +229,21 @@ class InferenceSession:
         stale = self._stale_inputs(max_obs_age)
         if stale:
             logger.error(f"[InferenceSession] Stale inputs (> {max_obs_age}s), not dispatching: {stale}")
+            self.dispatcher.send_stop()  # once per stale period
+            self._was_stale = True
             return None
+        self._reset_after_stale()
         action = self.predict(obs)
         self.dispatch(action)
         return action
 
     def reset(self) -> None:
         self.model.reset()
+
+    def _reset_after_stale(self) -> None:
+        if self._was_stale:
+            self.reset()
+            self._was_stale = False
 
     # -------------------------------------------------------------------
     # Full loop (same behavior as the inference_node.py CLI)
@@ -256,6 +256,15 @@ class InferenceSession:
         validate_timeout = user_settings.get("infer_obs_wait_s") if validate_timeout is None else validate_timeout
         max_obs_age = user_settings.get("infer_max_obs_age_s") if max_obs_age is None else max_obs_age
         self.start()
+
+        fps = getattr(self.model, "fps", None)
+        if fps and hz != fps:
+            pace = ("as fast as the loop runs" if hz <= 0 else
+                    f"{fps / hz:.2g}x slower" if hz < fps else f"{hz / fps:.2g}x faster")
+            logger.warning(
+                f"[InferenceSession] The policy was trained at {fps} Hz but runs at {hz or 'unthrottled'} Hz: each action "
+                f"is one {1 / fps:.3g} s step of the demos, so the robot moves {pace} than shown. Use hz={fps}."
+            )
 
         self.obs_node.get_logger().info(
             f"[Pre-flight] Validating input sources (timeout={validate_timeout}s) ..."
@@ -304,8 +313,11 @@ class InferenceSession:
                         f"Stale inputs (> {max_obs_age}s without new data), not dispatching: {stale}",
                         throttle_duration_sec=1.0,
                     )
+                    self.dispatcher.send_stop()  # once per stale period
+                    self._was_stale = True
                     time.sleep(0.05)
                     continue
+                self._reset_after_stale()
 
                 try:
                     action = self.predict(obs)
@@ -335,3 +347,5 @@ class InferenceSession:
 
         except KeyboardInterrupt:
             self.obs_node.get_logger().info("Shutting down inference session.")
+        finally:  # every way out of the loop (model error, on_timeout: raise, Ctrl+C, max_steps) stops the robot
+            self.dispatcher.send_stop()

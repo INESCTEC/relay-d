@@ -161,11 +161,13 @@ class _JointStateView:
 
     def __init__(self, msg, joint_names: List[str]):
         all_names = list(msg.name)
-        indices = [all_names.index(n) for n in joint_names if n in all_names]
-        self.name     = [joint_names[j] for j in range(len(indices))]
-        self.position = [float(msg.position[i]) for i in indices] if msg.position else []
-        self.velocity = [float(msg.velocity[i]) for i in indices] if msg.velocity else []
-        self.effort   = [float(msg.effort[i])   for i in indices] if msg.effort   else []
+        indices = [all_names.index(n) for n in joint_names]  # caller checks that every joint is there
+        n = len(all_names)
+        self.name     = list(joint_names)
+        # An array not filled for every joint (some drivers send no velocity) is left empty, never misread.
+        self.position = [float(msg.position[i]) for i in indices] if len(msg.position) == n else []
+        self.velocity = [float(msg.velocity[i]) for i in indices] if len(msg.velocity) == n else []
+        self.effort   = [float(msg.effort[i])   for i in indices] if len(msg.effort)   == n else []
 
 
 # ---------------------------------------------------------------------------
@@ -590,19 +592,22 @@ class ObsBuilder(Node):
 
         jnames = self._joint_filters.get(input_name)
         if jnames is not None:
-            if hasattr(msg, "name") and input_name not in self._joint_mismatch_warned:
-                msg_names = list(msg.name)
-                missing = [n for n in jnames if n not in msg_names]
-                if missing:
+            msg_names = list(msg.name)
+            missing = [n for n in jnames if n not in msg_names]
+            if missing:
+                # Sample-and-hold: a message without every configured joint (e.g. a gripper-only
+                # publisher on the same topic) would change the width and shift the values.
+                if input_name not in self._joint_mismatch_warned:
                     self._joint_mismatch_warned.add(input_name)
                     self.get_logger().warn(
                         f"[joint_names] Input '{input_name}': configured joints not found "
-                        f"in message.\n"
+                        f"in message; such messages are ignored.\n"
                         f"  Configured : {jnames}\n"
                         f"  Published  : {msg_names}\n"
                         f"  Missing    : {missing}\n"
                         f"  Update 'joint_names' in obs_config.yaml to match exactly."
                     )
+                return
             msg = _JointStateView(msg, jnames)
         with self._lock:
             self._latest_inputs[input_name] = msg
@@ -720,6 +725,14 @@ class ObsBuilder(Node):
                 arr = np.array(row, dtype=np.float32)
                 nc = self._norm_params.get(obs_name)
                 if nc is not None:
+                    if len(nc.limits) not in (1, len(arr)):
+                        # Never reuse the last limit for the rest: leave the obs unset so pre-flight fails.
+                        self.get_logger().error(
+                            f"obs '{obs_name}': 'limits' needs 1 entry or one per value ({len(arr)}), "
+                            f"got {len(nc.limits)}.",
+                            throttle_duration_sec=5.0,
+                        )
+                        continue
                     arr = _apply_normalization(arr, nc)
                 new_vals[obs_name] = arr
 

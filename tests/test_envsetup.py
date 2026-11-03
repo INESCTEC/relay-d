@@ -26,7 +26,7 @@ def test_package_lists_differ_per_format(tmp_path):
     lerobot = envsetup.build_script("lerobot", tmp_path / "l", "/usr/bin/uv", "python3")
     robomimic = envsetup.build_script("robomimic", tmp_path / "r", "/usr/bin/uv", "python3")
     v = envsetup.LEROBOT_VERSION  # pinned: launcher.py hard-codes this release's module and flags
-    assert f"'lerobot[training]=={v}' 'lerobot[diffusion]=={v}'" in lerobot and "robomimic" not in lerobot.replace("Relay-D", "")
+    assert f"'lerobot[training]=={v}' 'lerobot[diffusion]=={v}' 'lerobot[smolvla]=={v}'" in lerobot and "robomimic" not in lerobot.replace("Relay-D", "")
     assert f"git+https://github.com/ARISE-Initiative/robomimic.git@{envsetup.ROBOMIMIC_COMMIT}" in robomimic
     assert "--no-deps" in robomimic and "diffusers==0.11.1" in robomimic and "torch torchvision" in robomimic
     assert "import robomimic.scripts.train" in robomimic
@@ -112,3 +112,10 @@ def test_not_installed_message_tells_what_to_do(monkeypatch):
     for fmt in (launcher.LEROBOT, launcher.ROBOMIMIC):
         error = launcher.check_environment("/usr/bin/python3", fmt)["error"]
         assert f"is not installed for /usr/bin/python3" in error and f"'Set up {fmt} environment'" in error
+
+
+def test_env_dir_with_shell_characters_is_printed_not_run(tmp_path):
+    env = tmp_path / "a$(touch pwned)"
+    line = next(x for x in envsetup.build_script("lerobot", env, None, "python3").splitlines() if x.startswith("echo \"Relay-D"))
+    out = subprocess.run(["bash", "-c", line], cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert str(env) in out.stdout and not (tmp_path / "pwned").exists()

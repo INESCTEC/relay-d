@@ -2,7 +2,7 @@ from .api import (
     InferenceSession,
     ActionDispatcher,
     ObsBuilder,
-    DispatcherHelpers,
+    save_dispatch_templates,
     detect_backend,
 )
 
@@ -10,6 +10,6 @@ __all__ = [
     "InferenceSession",
     "ActionDispatcher",
     "ObsBuilder",
-    "DispatcherHelpers",
+    "save_dispatch_templates",
     "detect_backend",
 ]

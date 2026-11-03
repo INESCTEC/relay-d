@@ -60,7 +60,7 @@ See [Architecture diagrams](#6-architecture-diagrams) for how these pieces fit t
 
 **For `lfd-inference-node` / `InferenceSession`** there is no extra: policies run with the package that trained them, installed
 in the Python that runs the node: `robomimic` (above) for `.pth` checkpoints, or `lerobot` (`pip install 'lerobot[training]'`,
-plus `'lerobot[diffusion]'` for Diffusion) for LeRobot checkpoints. See "Running inference on the robot".
+plus `'lerobot[diffusion]'` for Diffusion and `'lerobot[smolvla]'` for SmolVLA) for LeRobot checkpoints. See "Running inference on the robot".
 
 **Optional extra** — `pip install ".[scripts]"`: `xmltodict`, used by `scripts/extract_joint_limits.py` to parse URDF XML.
 
@@ -144,6 +144,15 @@ RelayDApp
 
 Three pages: **Config** (load/validate your YAML), **Record** (start/pause/stop, live sensor feeds), **Post-process** (convert raw recordings to Robomimic or LeRobot format; a config can be loaded here without the robot running).
 
+Everything lands in the recordings folder (Settings), named by what it holds:
+
+```
+<recordings folder>/
+  2026-11-02_15-00-00_Recording/     the demos of one recording session (*.h5)
+  2026-11-02_15-10-00_Robomimic/     dataset_<time>_Robomimic.h5, its configs and action_dispatcher/
+  2026-11-02_15-12-00_Lerobot/       dataset_<time>_Lerobot/ (the LeRobot dataset folder), configs and action_dispatcher/
+```
+
 ### Building the acquisition config from the running robot
 
 On the **Config** page, the **Build from ROS** tab writes `acquisition_config.yaml` for you (start your robot's drivers first):
@@ -192,7 +201,11 @@ config, an `action_config.yaml` template to adapt, and an `inference_script.py`.
 
 For LeRobot the node feeds the policy what the dataset had: the vector observations side by side as `observation.state` (in the order of
 the dataset's `meta/info.json`, found through the checkpoint's `train_config.json`; `--state-keys a,b` overrides it) and each camera as
-`observation.images.<name>` (BGR to RGB, scaled to [0, 1]). LeRobot normalizes with the statistics saved in the checkpoint. The Python that
+`observation.images.<name>` (BGR to RGB, scaled to [0, 1]). LeRobot normalizes with the statistics saved in the checkpoint. The node runs at the rate
+the policy was trained at (the dataset's fps, i.e. the `recording_frequency`) unless `--hz` says otherwise, and warns when they differ: each
+predicted action is one step of the demos, so another rate makes the robot move faster or slower than you showed it. For the same reason a
+demo whose recorded rate is more than 10% off `recording_frequency` fails the after-recording check and is left out of LeRobot datasets.
+robomimic checkpoints do not store a rate: pass `--hz` equal to the recording frequency. The Python that
 runs the node needs `lerobot`; LeRobot 0.6 needs torch < 2.12, so it usually lives in its own virtual environment with ROS 2 sourced.
 
 See `relay_d/dispatch/inference_node.py` and `relay_d/dispatch/config_templates/*.yaml` for the full set of options and config syntax.
@@ -210,7 +223,7 @@ close Relay-D, and the table in the tab follows the runs (status, stop, follow t
 folder `training_runs/<format>_<time>/` next to the dataset (command, config, `train.log`).
 
 ```bash
-relay-d-train --folder ~/lfd_recordings/2026-10-23_10-00-00 --epochs 200                    # robomimic
+relay-d-train --folder ~/lfd_recordings/2026-10-23_10-00-00_Robomimic --epochs 200          # robomimic
 relay-d-train --folder <folder> --format lerobot --policy act --steps 50000 \
               --python ~/venvs/lerobot/bin/python --extra=--log_freq=50                       # LeRobot
 relay-d-train --folder <folder> --dry-run      # print the command only
@@ -220,9 +233,16 @@ relay-d-train --folder <folder> --list         # runs of this folder (also --sto
 Training runs with the Python you choose per format (default: the one running Relay-D), which must have
 `robomimic` (>=0.4, from source, see Installation) or `lerobot` installed. Use "Check environment" in the tab
 to test it. LeRobot pins its own torch range (0.6.x needs torch below 2.12), so it usually belongs in its own virtual
-environment: `pip install 'lerobot[training]'` (plus `'lerobot[diffusion]'` for Diffusion). ACT and Diffusion also
-need at least one camera in the dataset. Policies: robomimic `bc_rnn_gmm`,
-`bc_transformer_gmm`, `diffusion_policy`; LeRobot `act`, `diffusion`. Anything else goes in "Extra arguments".
+environment: `pip install 'lerobot[training]'` (plus `'lerobot[diffusion]'` for Diffusion, `'lerobot[smolvla]'` for SmolVLA; the
+**Set up lerobot environment** button installs all three, press it again to add SmolVLA to an older environment). All LeRobot policies
+need at least one camera in the dataset. Policies: robomimic `bc_rnn_gmm`, `bc_transformer_gmm`, `diffusion_policy`; LeRobot `act`,
+`diffusion` (trained from scratch) and `smolvla`. Anything else goes in "Extra arguments".
+
+**SmolVLA** is a small vision-language-action model (about 450M parameters) pretrained on many community robot datasets: Relay-D
+fine-tunes it from `lerobot/smolvla_base` instead of training from zero, so it usually needs fewer demos. It follows the dataset's task
+sentence (Post-process → LeRobot `task`), and `lfd-inference-node` gives it the same sentence (or `--task "..."`). The first run downloads
+the pretrained model from the Hugging Face Hub (internet once, about 1 GB); it needs a CUDA GPU (8 GB is enough). Larger VLAs (pi0, pi0.5,
+GR00T) need well over 8 GB to fine-tune and are not offered.
 Without a display (SSH) the run starts in the background and logs to `train.log`.
 
 ### Settings
@@ -230,7 +250,7 @@ Without a display (SSH) the run starts in the background and logs to `train.log`
 The **Settings** tab (tabs: General, Recording, Review, Post-process, Training, Inference) edits
 `~/.relayd_settings.json`. The same file is read by the command-line tools, so a value saved there is the
 default of `relay-d-train`, `relay-d-convert` (video quality, file sizes, splits), `lfd-inference-node`
-(`--device`, `--hz`, `--max-obs-age`, `--obs-wait`, `--backend`) and the headless `AppAPI`. Precedence is
+(`--device`, `--hz` when the policy has no rate of its own, `--max-obs-age`, `--obs-wait`, `--backend`) and the headless `AppAPI`. Precedence is
 **acquisition YAML > setting > built-in default**, and a command-line flag beats all of them. Settings marked
 "(restart)" apply the next time Relay-D starts; the others apply immediately. The list of settings, with their
 defaults and tooltips, is the table `SETTINGS` in `relay_d/utils/user_settings.py`; `RELAYD_SETTINGS_FILE`

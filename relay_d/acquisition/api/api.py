@@ -9,7 +9,7 @@ from ..qt_app.ui.record.topic_subscribers import TopicSubscribers
 from ..qt_app.ui.record.data_recorder import DataRecorder
 from ..qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
 from ..qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
-from ..qt_app.ui.postprocess.postprocess_options import PostprocessOptions
+from ..qt_app.ui.postprocess.postprocess_options import FORMAT_SUFFIX, PostprocessOptions
 from ..qt_app.ui.review.demo_validator import DemoValidator
 from relay_d.utils.coloring_logger import logger
 
@@ -92,9 +92,12 @@ class AppAPI:
             rclpy.spin_once(self._data_recorder, timeout_sec=0.0)
 
     def start_recording(self, demo_name: Optional[str] = None) -> bool:
-        return self._data_recorder.start_recording(
+        started = self._data_recorder.start_recording(
             self._topic_subscribers, demo_name, flush_stale_data=True
         )
+        if self._data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
+            self._session_h5_files.append(self._data_recorder.retried_file)
+        return started
 
     def pause_recording(self) -> bool:
         return self._data_recorder.pause_recording()
@@ -129,7 +132,7 @@ class AppAPI:
             if not self._session_h5_files:
                 logger.warning("No recordings in this session to convert.")
                 return False
-            name = "combined_dataset_lerobot" if output_format == "lerobot" else "combined_dataset.h5"
+            name = "combined_dataset" + FORMAT_SUFFIX[output_format] + ("" if output_format == "lerobot" else ".h5")
             output_path = os.path.join(self._data_recorder.recorded_data_dir, name)
             success = self._yaml_converter.convert_multiple_files(
                 output_format, self._session_h5_files, output_path
@@ -144,7 +147,19 @@ class AppAPI:
             logger.error(f"Error converting recording to dataset: {e}")
             return False
 
-    def shutdown(self):
+    def shutdown(self) -> bool:
+        """Save a running recording, convert the session and stop ROS. Returns False, and leaves everything
+        running, if a recording could not be saved: its samples are only in memory (fix the disk and call again)."""
+        if self._data_recorder.is_recording:  # its samples are only in memory: save them before converting
+            self.stop_recording()
+        if getattr(self._data_recorder, "_unsaved", False):
+            if not self._data_recorder.retry_save():
+                logger.error(
+                    f"Not shutting down: the last recording could not be saved to "
+                    f"{self._data_recorder.h5_file_path} and is still only in memory."
+                )
+                return False
+            self._session_h5_files.append(self._data_recorder.retried_file)
         self.convert_recording_to_dataset()
         self._should_spin = False
 
@@ -169,3 +184,4 @@ class AppAPI:
             self._topic_subscribers.close()
             if self._rclpy_initialized:
                 rclpy.shutdown()
+        return True

@@ -33,7 +33,7 @@ ROBOMIMIC, LEROBOT = "robomimic", "lerobot"
 RUNS_DIRNAME = "training_runs"
 
 ROBOMIMIC_POLICIES = ["bc_rnn_gmm", "bc_transformer_gmm", "diffusion_policy"]
-LEROBOT_POLICIES = ["act", "diffusion"]
+LEROBOT_POLICIES = ["act", "diffusion", "smolvla"]
 
 # Editable parameters. key -> (where it goes, type, label). The robomimic "where" is a path into the
 # config JSON; the LeRobot one is the command-line flag. A new LeRobot release that renames a flag is a
@@ -57,7 +57,11 @@ LEROBOT_PARAMS = {
     "device": ("--policy.device", str, "Device (cuda / cpu)"),
 }
 _LEROBOT_SAVE_EVERY = 20_000
-_LEROBOT_LR = {"act": 1e-5, "diffusion": 1e-4}
+_LEROBOT_LR = {"act": 1e-5, "diffusion": 1e-4, "smolvla": 1e-4}
+# Fine-tuned from a pretrained model on the Hugging Face Hub (downloaded on the first run) instead of trained from scratch,
+# with the camera names that model was trained with: the dataset's cameras are renamed to them, in order.
+_LEROBOT_PRETRAINED = {"smolvla": ("lerobot/smolvla_base", ["observation.images.camera1", "observation.images.camera2",
+                                                            "observation.images.camera3"])}
 _LEROBOT_MODULE = "lerobot.scripts.lerobot_train"
 _ZERO_OK = ("seed", "num_workers")  # 0 is meaningful for these (num_workers=0: load data in the main process)
 
@@ -304,16 +308,24 @@ def build_command(job: TrainJob, run_dir: Path, write: bool = True) -> List[str]
     if policy not in LEROBOT_POLICIES:
         raise TrainingError(f"unknown LeRobot policy '{policy}' (choose from {LEROBOT_POLICIES})")
     if not ds.summary.get("cameras"):
-        # ACT and Diffusion need an image (or environment state, which Relay-D does not write) as input.
+        # ACT, Diffusion and SmolVLA need an image (or environment state, which Relay-D does not write) as input.
         raise TrainingError(
-            "this LeRobot dataset has no camera: ACT and Diffusion need at least one image input. "
+            "this LeRobot dataset has no camera: ACT, Diffusion and SmolVLA need at least one image input. "
             "Record a camera, or train a state-only policy with robomimic."
         )
     params = {**default_params(ds, policy), **_coerce(job.params, LEROBOT_PARAMS)}
     flags = [f"{LEROBOT_PARAMS[k][0]}={v}" for k, v in params.items()]
+    if policy in _LEROBOT_PRETRAINED:
+        base, cameras = _LEROBOT_PRETRAINED[policy]
+        if len(ds.summary["cameras"]) > len(cameras):
+            raise TrainingError(f"{policy} takes at most {len(cameras)} cameras, this dataset has {len(ds.summary['cameras'])}.")
+        rename = dict(zip(ds.summary["cameras"], cameras))  # kept in the checkpoint: inference renames the same way
+        source = [f"--policy.path={base}", f"--rename_map={json.dumps(rename)}"]
+    else:
+        source = [f"--policy.type={policy}"]
     return [job.python, "-m", _LEROBOT_MODULE,
             f"--dataset.repo_id=local/{ds.name}", f"--dataset.root={ds.path}",
-            f"--policy.type={policy}", "--policy.push_to_hub=false",  # push_to_hub defaults to true
+            *source, "--policy.push_to_hub=false",  # push_to_hub defaults to true
             f"--output_dir={run_dir / 'output'}", f"--job_name={run_dir.name}", *flags, *extra]
 
 
@@ -474,7 +486,7 @@ def check_environment(python: str, fmt: str, timeout: float = 60.0) -> Dict[str,
         error = f"'{package}' is not installed for {python}"
         error += f". Use the 'Set up {fmt} environment' button in the Train tab to build one"
         if fmt == LEROBOT:
-            error += " (or: pip install 'lerobot[training]', and 'lerobot[diffusion]' for Diffusion)"
+            error += " (or: pip install 'lerobot[training]', plus 'lerobot[diffusion]' for Diffusion and 'lerobot[smolvla]' for SmolVLA)"
     elif not result["torch"]:
         error = f"torch is missing for {python}"
     else:
@@ -482,7 +494,7 @@ def check_environment(python: str, fmt: str, timeout: float = 60.0) -> Dict[str,
         if error:
             error = f"'{package}' is installed but cannot be imported: {error}"
             if "pip install" in error and fmt == LEROBOT:
-                error += " (LeRobot needs: pip install 'lerobot[training]', and 'lerobot[diffusion]' for Diffusion)"
+                error += " (LeRobot needs: pip install 'lerobot[training]', plus 'lerobot[diffusion]' for Diffusion and 'lerobot[smolvla]' for SmolVLA)"
             if "torchvision" in error:
                 error += (f" (torch {result['torch']} with torchvision {result.get('torchvision')}: "
                           "they must be built for each other, reinstall torchvision for this torch)")

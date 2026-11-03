@@ -42,7 +42,7 @@ class EnvSpec:
 ENVS = {
     "lerobot": EnvSpec(
         "lerobot",
-        ((("lerobot[training]==" + LEROBOT_VERSION, "lerobot[diffusion]==" + LEROBOT_VERSION)),),  # Diffusion needs its own extra
+        (tuple(f"lerobot[{extra}]=={LEROBOT_VERSION}" for extra in ("training", "diffusion", "smolvla")),),  # one extra per policy family
         "import lerobot, torch; print('lerobot ok, torch', torch.__version__, 'cuda', torch.cuda.is_available())",
     ),
     "robomimic": EnvSpec(
@@ -60,7 +60,7 @@ rm -f {exit_file}
 echo $$ > {pid_file}
 trap 'interrupted=1' INT
 {{
-echo "Relay-D: {fmt} environment in {env_dir}"
+echo "Relay-D: {fmt} environment in" {env_dir}  # env_dir is shlex-quoted: never inside double quotes
 {steps}
 }} 2>&1 | tee {log}
 code=${{PIPESTATUS[0]}}

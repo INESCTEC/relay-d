@@ -605,6 +605,10 @@ config:
   #
   # The streams are concatenated column-wise in the order listed.
   # n_actions above must equal the total number of columns.
+  # The action of step t is the target of the next step: the stream's value at
+  # t+1, or (in delta_actions) the change from t to t+1. A stream in
+  # delta_actions must not set `normalize: true` (the dispatcher could not turn
+  # a normalized delta back into real units): use a second, raw stream for it.
   # ---------------------------------------------------------------------------
 
   actions_to_extract:

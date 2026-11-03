@@ -12,6 +12,8 @@ from enum import Enum
 import h5py
 import numpy as np
 
+from relay_d.utils.numerics import RATE_TOLERANCE, median_rate
+
 
 class CheckStatus(str, Enum):
     PASS = "pass"
@@ -101,6 +103,7 @@ class DemoValidator:
                 result.demo_name = demo_name
                 self._check_min_length(demo_group, result)
                 self._check_timestamps_and_gaps(demo_group, result)
+                self._check_sample_rate(demo_group, result)
                 self._check_sample_counts(demo_group, result)
                 self._check_joint_counts(demo_group, result)
                 self._check_gap_fill(demo_group, result)
@@ -252,6 +255,25 @@ class DemoValidator:
                             "sync_spread", CheckStatus.PASS, "Sync spread within tolerance"
                         )
                     )
+
+    def _check_sample_rate(self, grp, result):
+        """The rate actually recorded against the configured one: the dataset uses the configured rate as its time
+        base (LeRobot fps), so a PC that could not keep up records demos the policy would replay too fast."""
+        try:
+            configured = float(self._get_metadata_attrs(grp).get("recording_frequency"))
+        except (TypeError, ValueError):
+            return
+        rate = median_rate(grp["timestamps"][:]) if "timestamps" in grp else None
+        if rate is None or configured <= 0:
+            return
+        if abs(rate - configured) > RATE_TOLERANCE * configured:
+            result.checks.append(CheckResult(
+                "sample_rate", CheckStatus.FAIL,
+                f"Recorded at {rate:.1f} Hz, but recording_frequency is {configured:g} Hz: this PC did not keep up. "
+                "Lower recording_frequency (or the camera load) and record again; LeRobot conversion skips this demo.",
+            ))
+        else:
+            result.checks.append(CheckResult("sample_rate", CheckStatus.PASS, f"Recorded at {rate:.1f} Hz"))
 
     def _check_sample_counts(self, grp, result):
         n = grp["timestamps"].shape[0] if "timestamps" in grp else 0

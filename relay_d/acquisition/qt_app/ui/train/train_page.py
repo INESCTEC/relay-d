@@ -8,7 +8,7 @@ import os
 import sys
 import time
 
-from PyQt5.QtCore import QTimer, QUrl
+from PyQt5.QtCore import Qt, QTimer, QUrl
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (
     QComboBox,
@@ -188,6 +188,9 @@ class TrainPage:
                 self.combo_policy.addItems([_FROM_FOLDER, *launcher.ROBOMIMIC_POLICIES])
             else:
                 self.combo_policy.addItems(launcher.LEROBOT_POLICIES)
+                i = launcher.LEROBOT_POLICIES.index("smolvla")
+                self.combo_policy.setItemData(i, "Fine-tunes the pretrained lerobot/smolvla_base (downloaded once, about 1 GB) "
+                                                 "and follows the dataset's task sentence. Needs a CUDA GPU.", Qt.ToolTipRole)
             s = ds.summary
             parts = [f"{s.get('episodes')} episodes", f"{s.get('frames')} frames"]
             if ds.format == launcher.LEROBOT:
@@ -195,7 +198,7 @@ class TrainPage:
             elif not s.get("has_valid"):
                 parts.append("no validation split (validation is turned off)")
             if ds.format == launcher.LEROBOT and not s.get("cameras"):
-                parts.append("NO CAMERA: ACT and Diffusion need at least one image input")
+                parts.append("NO CAMERA: ACT, Diffusion and SmolVLA need at least one image input")
             self.label_summary.setText(f"{ds.format}: {ds.path}\n" + ", ".join(parts))
             self.edit_python.setText(envsetup.python_for(ds.format))  # setting, else the environment made by the button
             self.label_python.setText(f"Python with {ds.format}")

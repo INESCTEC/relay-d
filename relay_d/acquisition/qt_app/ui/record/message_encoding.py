@@ -7,7 +7,6 @@ import numpy as np
 from sensor_msgs.msg import Image, CompressedImage, PointCloud2, JointState
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from std_msgs.msg import String, Float32, Float64, Int32, Bool
-from sensor_msgs_py import point_cloud2
 
 from relay_d.utils.ros_media_codec import decode_image, decode_organized_pointcloud
 
@@ -77,12 +76,7 @@ def _encode_pointcloud(pc_msg, modality):
         if points is None:
             return None
     else:
-        raw = list(
-            point_cloud2.read_points(
-                pc_msg, field_names=field_names, skip_nans=True
-            )
-        )
-        points = np.array(raw) if raw else np.array([])
+        points = None  # unorganized clouds are saved as metadata only: decoding them would just fill the buffer
 
     return {
         "type": "pointcloud",

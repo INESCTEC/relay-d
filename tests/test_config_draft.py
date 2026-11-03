@@ -62,6 +62,7 @@ def test_validator_rules():
     assert any("lower_lim must be smaller" in m for m in bad(lambda c: c["output"]["streams"]["q"].update(limits=[{"lower_lim": 1, "upper_lim": 1}] * 2)))
     assert any("actions_to_extract" in m for m in bad(lambda c: c.update(actions_to_extract=["nope"])))
     assert any("delta_actions" in m for m in bad(lambda c: c.update(delta_actions=["other"])))
+    assert any("is normalized" in m for m in bad(lambda c: c.update(delta_actions=["q"])))  # q is normalized
     assert any("positive" in m for m in bad(lambda c: c.update(recording_frequency=0)))
     assert any("rpy needs exactly 4" in m for m in bad(lambda c: c["output"]["streams"]["q"].update(rotation_format="rpy")))
     assert any("both recorded into" in m for m in bad(lambda c: c["input"].update(joint_b={"topic": "/x", "output_map": "joint_a"})))

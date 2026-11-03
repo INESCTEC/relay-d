@@ -1,12 +1,12 @@
 name: CI
 
-# NOTE: This workflow deliberately does NOT install or exercise ROS 2 (rclpy,
-# tf2_ros, ROS 2 message packages). GitHub-hosted runners don't have ROS 2
-# preinstalled, so the ROS-dependent code paths (recording, live inference) have
-# no automated tests yet (see CONTRIBUTING.md). It does:
+# It does:
 #   - sanity-check that the pip-installable subset of the package builds and installs,
 #   - run the ROS-free test suite (config parsing, dataset conversion to robomimic
-#     and LeRobot formats, the headless converter, ...),
+#     and LeRobot formats, the headless converter, ...) on a plain runner,
+#   - run the whole suite again inside the ros:jazzy image, so the tests that need
+#     rclpy (action dispatcher, recorder, AppAPI, inference session) run too: they
+#     skip themselves on the plain runner. No robot, no live topics: unit tests only.
 #   - produce a non-blocking lint report.
 # Only the `main` branch is covered.
 
@@ -59,6 +59,26 @@ jobs:
 
       - name: Run tests
         run: python -m pytest -q
+
+  test-ros:
+    name: Tests (ROS 2 Jazzy)
+    runs-on: ubuntu-latest
+    container: ros:jazzy
+    steps:
+      - uses: actions/checkout@v4
+
+      # Qt and OpenCV from apt, built against the system numpy that ROS uses; pip adds only what apt lacks.
+      - name: Install test dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3-pip python3-pytest python3-opencv python3-pyqt5
+          pip install --break-system-packages h5py "pyarrow<21" av pyqtgraph  # pyarrow 21+ needs NumPy 2
+
+      - name: Run tests
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          python3 -m pytest -q
 
   lint:
     name: Lint (non-blocking)

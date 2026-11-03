@@ -372,7 +372,8 @@ class ReviewPage:
         paths = sorted(
             p
             for p in glob.glob(os.path.join(self.session_dir, "*.h5"))
-            if os.path.basename(p) != "combined_dataset.h5"
+            # a robomimic dataset written into the session (AppAPI) is not a recorded demo; combined_dataset.h5 is the old name
+            if not os.path.basename(p).endswith("_Robomimic.h5") and os.path.basename(p) != "combined_dataset.h5"
         )
 
         for path in paths:

@@ -170,3 +170,17 @@ def test_get_obs_config_without_sync_tolerance():
     assert "sync" not in cfg and "observations" in cfg
     p.yaml_data["config"]["sync_tolerance_sec"] = 0.05
     assert p.get_obs_config()["config"]["sync"] == {"threshold": 0.05}
+
+
+def test_output_folder_and_dataset_are_named_after_the_format():
+    from datetime import datetime
+
+    from relay_d.acquisition.qt_app.ui.postprocess.postprocess_options import dataset_output_paths
+
+    now = datetime(2026, 11, 2, 15, 10, 0)
+    folder, dataset = dataset_output_paths("/rec", "robomimic", now)
+    assert folder == "/rec/2026-11-02_15-10-00_Robomimic"
+    assert dataset == f"{folder}/dataset_{int(now.timestamp())}_Robomimic.h5"
+    folder, dataset = dataset_output_paths("/rec", "lerobot", now)
+    assert folder == "/rec/2026-11-02_15-10-00_Lerobot"
+    assert dataset == f"{folder}/dataset_{int(now.timestamp())}_Lerobot"  # a LeRobot dataset is a folder: no extension

@@ -51,9 +51,10 @@ def test_convert_to_lerobot(tmp_path, converter):
 
     table = pq.read_table(out / "data/chunk-000/file-000.parquet")
     assert table.num_rows == sum(LENGTHS)
-    # action column equals the recorded robot_joint_pos stream
+    # action column is the recorded robot_joint_pos stream one step ahead (the last step holds)
     with h5py.File(rec, "r") as f:
-        expected = np.concatenate([f[f"data/demo_{i}/streams/robot_joint_pos"][:] for i in range(2)])
+        streams = [f[f"data/demo_{i}/streams/robot_joint_pos"][:] for i in range(2)]
+    expected = np.concatenate([np.concatenate([s[1:], s[-1:]]) for s in streams])
     got = np.array(table["action"].to_pylist(), dtype=np.float32)
     np.testing.assert_allclose(got, expected, rtol=1e-6)
     assert (out / "videos/observation.images.agentview_image/chunk-000/file-000.mp4").exists()
@@ -190,3 +191,41 @@ def test_writer_module_imports_without_pyarrow():
             sys.modules.pop(k, None)
         sys.modules.pop("relay_d.acquisition.qt_app.ui.postprocess.lerobot_writer", None)
         sys.modules.update(saved)
+
+
+def test_one_broken_file_is_skipped_not_the_whole_dataset_deleted(tmp_path, converter, monkeypatch):
+    good, bad = tmp_path / "recording_0.h5", tmp_path / "recording_1.h5"
+    write_recording(good, LENGTHS)
+    write_recording(bad, [5])
+    split = converter._lerobot_split_obs
+
+    def split_or_fail(demo, *a):
+        if demo["num_samples"] == 5:
+            raise KeyError("damaged group")  # not an OSError: used to reach the writer, which deleted everything
+        return split(demo, *a)
+
+    monkeypatch.setattr(converter, "_lerobot_split_obs", split_or_fail)
+    out = tmp_path / "lerobot_dataset"
+    assert converter.convert_multiple_files("lerobot", [str(good), str(bad)], str(out))
+    assert json.loads((out / "meta/info.json").read_text())["total_episodes"] == len(LENGTHS)
+
+
+def test_missing_action_stream_fails_the_demo_instead_of_narrowing_the_action(tmp_path):
+    cfg = json.loads(json.dumps(DATA_CONFIG))
+    cfg["actions_to_extract"] = ["robot_joint_pos", "gripper"]  # gripper never recorded
+    converter = YAMLDrivenConverter(PostprocessConfigLoader(), data_config=cfg)
+    rec = tmp_path / "recording_0.h5"
+    write_recording(rec, LENGTHS)
+    assert not converter.convert_multiple_files("lerobot", [str(rec)], str(tmp_path / "out"))  # was 4-wide actions
+
+
+def test_episode_recorded_slower_than_the_dataset_fps_is_skipped(tmp_path, converter):
+    rec = tmp_path / "recording_0.h5"
+    write_recording(rec, LENGTHS)
+    with h5py.File(rec, "a") as f:  # demo_0 kept up with recording_frequency (FPS), demo_1 only managed 70% of it
+        f["data/demo_0"].create_dataset("timestamps", data=(np.arange(LENGTHS[0]) * 1e9 / FPS).astype(np.int64))
+        f["data/demo_1"].create_dataset("timestamps", data=(np.arange(LENGTHS[1]) * 1e9 / (0.7 * FPS)).astype(np.int64))
+    out = tmp_path / "out"
+    assert converter.convert_multiple_files("lerobot", [str(rec)], str(out))
+    info = json.loads((out / "meta/info.json").read_text())
+    assert info["total_episodes"] == 1 and info["total_frames"] == LENGTHS[0]  # its time base would be 1.4x too fast

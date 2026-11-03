@@ -317,6 +317,9 @@ class UI(QMainWindow):
 
     def closeEvent(self, event):
         """Clean up timers and ROS connections before closing"""
+        if not self._recording_saved_or_dropped():
+            event.ignore()
+            return
         try:
             if hasattr(self, "page_record") and self.page_record is not None:
                 # Stop TF update timerexit_code
@@ -327,11 +330,6 @@ class UI(QMainWindow):
                 if hasattr(self.page_record, "container_visualizer"):
                     for timer in self.page_record.container_visualizer.visualization_timers.values():
                         timer.stop()
-
-                # Stop data recorder
-                if hasattr(self.page_record, "data_recorder"):
-                    if self.page_record.data_recorder.is_recording:
-                        self.page_record.data_recorder.stop_recording()
 
                 # Stop the TF listener's dedicated spin thread
                 if hasattr(self.page_record, "topic_subscribers"):
@@ -347,6 +345,28 @@ class UI(QMainWindow):
             logger.error(f"Error during cleanup: {e}")
 
         event.accept()
+
+
+    def _recording_saved_or_dropped(self) -> bool:
+        """Stop and save a running recording. False (keep the window open) if it could not be saved
+        and the user does not want to lose it: that demo is only in memory."""
+        recorder = getattr(getattr(self, "page_record", None), "data_recorder", None)
+        if recorder is None:
+            return True
+        try:
+            if recorder.is_recording:
+                recorder.stop_recording()
+            with recorder.recording_lock:  # a Stop pressed just before may still be saving in the background: wait
+                pass
+            if not getattr(recorder, "_unsaved", False) or recorder.retry_save():
+                return True
+        except Exception as e:
+            logger.error(f"Error saving the recording on close: {e}")
+        return CustomMessageBox.question(
+            f"The last recording could not be saved to {recorder.h5_file_path} (see the log).\n"
+            "Close anyway and lose it?",
+            title="Recording not saved",
+        )
 
 
 def main(args=None):

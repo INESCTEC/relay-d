@@ -1,11 +1,10 @@
 import os
 import shutil
-import time
 
 from PyQt5.QtWidgets import QWidget, QButtonGroup
 from PyQt5.QtWidgets import QFileDialog
 from datetime import datetime
-from relay_d.dispatch import DispatcherHelpers
+from relay_d.dispatch import save_dispatch_templates
 
 # Import utils
 from ..config.yaml_parser import YamlParser
@@ -21,6 +20,7 @@ from relay_d.utils.coloring_logger import logger
 from ...utils.custom_message_box import CustomMessageBox
 from ...utils.default_configs import generate_default_configs
 from ..postprocess.postprocess_config_loader import PostprocessConfigLoader
+from ..postprocess.postprocess_options import dataset_output_paths
 from ..postprocess.offline_config import load_offline_config
 from ..postprocess.postprocess_options import PostprocessOptions
 
@@ -48,9 +48,6 @@ class PostProcessPage(QWidget):
             "btn_format_robomimic": "robomimic",
             "btn_format_lerobot": "lerobot",
         }
-
-        # Use dispatcher api for helpers
-        self.dispatcher_helper = DispatcherHelpers()
 
         # If a yaml_parser was passed at construction and already has data loaded,
         # push its data_config into the converter immediately.
@@ -413,23 +410,13 @@ class PostProcessPage(QWidget):
 
         logger.info(f"Converting dataset to {self.output_format} format.")
 
-        timestamp_folder = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
         # The Recordings folder setting, else ~/.RelayDApp
         save_folder = self.settings_page.get_hdf5_save_folder() if self.settings_page else ""
         if not save_folder:
             save_folder = os.path.expanduser("~/.RelayDApp")
             logger.warning(f"The recordings folder is not set (Settings page). Defaulting to {save_folder}")
-        output_dir = os.path.join(save_folder, timestamp_folder)
-
+        output_dir, combined_output_path = dataset_output_paths(save_folder, self.output_format, datetime.now())
         os.makedirs(output_dir, exist_ok=True)
-
-        timestamp = int(time.time())
-        # LeRobot datasets are directories (parquet + mp4 + metadata); the other
-        # formats are single HDF5 files.
-        extension = "" if self.output_format == "lerobot" else ".h5"
-        output_filename = f"{self.output_format}_dataset_{timestamp}{extension}"
-        combined_output_path = os.path.join(output_dir, output_filename)
 
         success = self.yaml_converter.convert_multiple_files(
             self.output_format,
@@ -462,7 +449,7 @@ class PostProcessPage(QWidget):
                         self._active_parser().get_train_model_name(self.yaml_converter.options),
                     )
                     handler = RobomimicConfigHandler(train_config_path)
-                    handler.set_train_dir(f"~/Documents/robomimic_trains/{self.output_format}_dataset_{timestamp_folder}")
+                    handler.set_train_dir(f"~/Documents/robomimic_trains/{os.path.basename(output_dir)}")
 
                     # Classigy observations based on the actual converted data and populate the config
                     classification = classify_observations(
@@ -482,8 +469,7 @@ class PostProcessPage(QWidget):
                 parser.save_yaml_file(
                     file_path=os.path.join(action_dispatcher_folder, "obs_config.yaml"), data=parser.get_obs_config()
                 )
-                self.dispatcher_helper.save_action_template(output_dir=action_dispatcher_folder)
-                self.dispatcher_helper.save_inference_script(output_dir=action_dispatcher_folder)
+                save_dispatch_templates(action_dispatcher_folder)
 
             except Exception as e:
                 post_error = str(e) or type(e).__name__

@@ -139,6 +139,8 @@ class TopicSubscribers(Node):
             if not container_id:
                 logger.error("Container missing container_id")
                 return False
+            if container_id in self.subscribers:  # e.g. Start pressed again after a failed start: no duplicate subscription
+                self.stop_subscribing(container_id)
 
             is_tf_lookup = parent_frame and child_frame and not topic_path
 

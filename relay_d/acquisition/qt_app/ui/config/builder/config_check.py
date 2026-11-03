@@ -132,6 +132,8 @@ def check_config(data: Dict[str, Any]) -> List[Problem]:
     for name in config.get("delta_actions") or []:
         if name not in actions:
             add(ERROR, f"delta_actions: '{name}' is not listed in actions_to_extract")
+        elif isinstance(streams.get(name), dict) and streams[name].get("normalize"):
+            add(ERROR, f"delta_actions: '{name}' is normalized; the dispatcher cannot undo a normalized delta (use a raw stream for the action)")
     return problems
 
 

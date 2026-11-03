@@ -43,6 +43,11 @@
 #   limits            list[dict]     required if denormalizing. {lower_lim, upper_lim} per index, or 1 entry to broadcast
 #   transform         dict           optional.  one of: scale / threshold / clip / vacuum / magnetic / euler_to_quat
 #                                                (see TRANSFORMS section below)
+#   stop              list[float]    optional, command and topic entries.  values sent ONCE when inference stops
+#                                                sending (inputs stale, model error, Ctrl+C, exit), e.g. [0, 0, 0] for a
+#                                                velocity: a controller without a watchdog keeps the last command. Real-world
+#                                                values fed straight to mapping / {I[n]} (no limits, no transform). An action
+#                                                entry cannot have one (cancel its goal on the server instead).
 #
 #   -- then pick exactly ONE dispatch method --
 #   command                                 METHOD 1.  shell string, {I[0]}, {I[1]}, ... substituted, run via subprocess
@@ -183,7 +188,7 @@ actions:
       force: 100
       velocity: 100
     mapping:
-      position: 7
+      position: 0                         # slice index: indices [7] gives a 1-value slice
 
   # Same as robotiq_gripper, but blocking dispatch() until the gripper skill
   # itself confirms completion — illustrative; adjust success_field/
@@ -205,7 +210,7 @@ actions:
   #     force: 100
   #     velocity: 100
   #   mapping:
-  #     position: 7
+  #     position: 0
   #   feedback:
   #     source: result                       # or "feedback" if this server
   #                                           # only ever signals completion
@@ -404,6 +409,7 @@ actions:
   #     out_min: -0.1
   #     out_max:  0.1
   #   command: "ros2 topic pub -1 /cmd_vel ... \"{I[0]}, {I[1]}, {I[2]}\""
+  #   stop: [0.0, 0.0, 0.0]   # sent once when inference stops: the base must not keep the last velocity
 
   # Example: clip transform
   # safe_velocity:

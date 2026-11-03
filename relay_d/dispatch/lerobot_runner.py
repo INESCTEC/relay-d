@@ -50,17 +50,60 @@ def state_layout_from_names(names: List[str]) -> List[Tuple[str, int]]:
     return layout
 
 
-def dataset_info(checkpoint: Path) -> Optional[dict]:
-    """``meta/info.json`` of the dataset this checkpoint was trained on (via ``train_config.json``), if it is still there."""
+def _train_config(checkpoint: Path) -> dict:
     try:
-        root = json.loads((checkpoint / "train_config.json").read_text())["dataset"]["root"]
-        return json.loads((Path(root) / "meta" / "info.json").read_text())
-    except (OSError, ValueError, KeyError, TypeError):
+        return json.loads((checkpoint / "train_config.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _dataset_root(checkpoint: Path) -> Optional[Path]:
+    try:
+        return Path(_train_config(checkpoint)["dataset"]["root"])
+    except (KeyError, TypeError):
         return None
 
 
-def build_batch(obs: Dict[str, np.ndarray], state_keys: List[str], images: Dict[str, Tuple[str, tuple]]) -> Dict[str, np.ndarray]:
-    """The LeRobot input for one tick, as numpy arrays without a batch dimension.
+def fine_tuned(checkpoint: Path) -> bool:
+    """True for a policy fine-tuned from a pretrained model (SmolVLA): its config keeps the input features of that model
+    (its camera names, state size), so the inputs it was really trained on are the training dataset's."""
+    return bool((_train_config(checkpoint).get("policy") or {}).get("pretrained_path"))
+
+
+def dataset_inputs(info: dict) -> Tuple[int, Dict[str, Tuple[str, tuple]]]:
+    """``(state width, {camera obs name: (feature, (C, H, W))})`` as the dataset's ``info.json`` declares them."""
+    feats = info.get("features", {})
+    state = int((feats.get(STATE) or {}).get("shape", [0])[0])
+    images = {k[len(IMAGE_PREFIX):]: (k, (3, int(f["shape"][0]), int(f["shape"][1])))
+              for k, f in feats.items() if k.startswith(IMAGE_PREFIX) and f.get("dtype") in ("video", "image")}
+    return state, images
+
+
+def dataset_info(checkpoint: Path) -> Optional[dict]:
+    """``meta/info.json`` of the dataset this checkpoint was trained on (via ``train_config.json``), if it is still there."""
+    root = _dataset_root(checkpoint)
+    try:
+        return json.loads((root / "meta" / "info.json").read_text()) if root else None
+    except (OSError, ValueError):
+        return None
+
+
+def dataset_task(checkpoint: Path) -> Optional[str]:
+    """The task sentence of the training dataset (``meta/tasks.parquet``), if it has exactly one."""
+    root = _dataset_root(checkpoint)
+    try:
+        import pyarrow.parquet as pq  # installed with lerobot
+
+        tasks = pq.read_table(root / "meta" / "tasks.parquet", columns=["task"]).column("task").to_pylist() if root else []
+    except Exception:  # no pyarrow, file gone or unreadable: the caller asks for --task
+        return None
+    return tasks[0] if len(tasks) == 1 else None
+
+
+def build_batch(obs: Dict[str, np.ndarray], state_keys: List[str], images: Dict[str, Tuple[str, tuple]],
+                task: Optional[str] = None) -> Dict[str, object]:
+    """The LeRobot input for one tick, as numpy arrays without a batch dimension, plus the ``task`` sentence that
+    language-conditioned policies (SmolVLA) read; the others ignore it.
 
     ``images`` maps an obs name to ``(feature name, (C, H, W))`` of the policy's image input.
     """
@@ -77,6 +120,8 @@ def build_batch(obs: Dict[str, np.ndarray], state_keys: List[str], images: Dict[
             )
         rgb = frame[:h, :w, ::-1]  # live frames are BGR, the dataset video (and so the policy) is RGB
         batch[feature] = np.ascontiguousarray(rgb.transpose(2, 0, 1), dtype=np.float32) / 255.0
+    if task is not None:
+        batch["task"] = task
     return batch
 
 
@@ -89,9 +134,11 @@ class LeRobotPolicyRunner:
         device: str = "cpu",
         state_keys: Optional[List[str]] = None,
         fallback_state_keys: Optional[List[str]] = None,
+        task: Optional[str] = None,
     ):
         """``state_keys``: obs names that form ``observation.state``, in order. If None they are read from the dataset
-        the policy was trained on; if that is gone, ``fallback_state_keys`` (the obs_config order) is used with a warning."""
+        the policy was trained on; if that is gone, ``fallback_state_keys`` (the obs_config order) is used with a warning.
+        ``task``: the instruction for a language-conditioned policy (SmolVLA); default: the training dataset's task."""
         folder = resolve_checkpoint(checkpoint)
         if folder is None:
             raise FileNotFoundError(
@@ -124,18 +171,34 @@ class LeRobotPolicyRunner:
         self._state_dim = int(features[STATE].shape[0]) if STATE in features else 0
         self._images = {k[len(IMAGE_PREFIX):]: (k, tuple(f.shape)) for k, f in features.items() if k.startswith(IMAGE_PREFIX)}
 
-        self.state_keys = self._resolve_state_keys(folder, state_keys, fallback_state_keys)
+        info = dataset_info(folder)
+        if fine_tuned(folder):
+            # Fed under the dataset's camera names: the checkpoint's preprocessor renames them (--rename_map at training).
+            if info is None:
+                raise ValueError(
+                    f"[LeRobotPolicyRunner] {cfg.type} was fine-tuned from a pretrained model, so its inputs are read from the "
+                    "training dataset (train_config.json -> dataset.root), which was not found: put it back at that path."
+                )
+            self._state_dim, self._images = dataset_inputs(info)
+        # The control rate the policy learned: each predicted action is one step at the dataset's fps.
+        self.fps: Optional[float] = (info or {}).get("fps")
+        self.state_keys = self._resolve_state_keys(info, state_keys, fallback_state_keys)
+        self.task = task or dataset_task(folder)
+        if self.task is None and any("Tokenizer" in type(step).__name__ for step in getattr(self._pre, "steps", [])):
+            raise ValueError(
+                f"[LeRobotPolicyRunner] {cfg.type} is told what to do in words, but the training dataset's task was not "
+                "found (dataset moved, or several tasks): pass --task \"<the instruction>\"."
+            )
         self.obs_keys: List[str] = [*self.state_keys, *self._images]
         logger.info(
-            f"[LeRobotPolicyRunner] policy={cfg.type} device={device} state={self.state_keys} "
+            f"[LeRobotPolicyRunner] policy={cfg.type} device={device} fps={self.fps} task={self.task!r} state={self.state_keys} "
             f"cameras={list(self._images)} checkpoint={folder}"
         )
         self.reset()
 
-    def _resolve_state_keys(self, folder: Path, explicit, fallback) -> List[str]:
+    def _resolve_state_keys(self, info: Optional[dict], explicit, fallback) -> List[str]:
         if explicit:
             return list(explicit)
-        info = dataset_info(folder)
         names = ((info or {}).get("features", {}).get(STATE) or {}).get("names")
         if isinstance(names, list):
             layout = state_layout_from_names(names)
@@ -159,14 +222,14 @@ class LeRobotPolicyRunner:
         self._post.reset()
 
     def get_action(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
-        batch = build_batch(obs_dict, self.state_keys, self._images)
+        batch = build_batch(obs_dict, self.state_keys, self._images, self.task)
         if self._state_dim and batch[STATE].shape[0] != self._state_dim:
             widths = {k: int(np.asarray(obs_dict[k]).size) for k in self.state_keys}
             raise ValueError(
                 f"[LeRobotPolicyRunner] {STATE} has {batch[STATE].shape[0]} values {widths}, the policy expects {self._state_dim}. "
                 "Check the observations (or --state-keys) against the dataset the policy was trained on."
             )
-        tensors = {k: self._torch.from_numpy(v) for k, v in batch.items()}
+        tensors = {k: v if isinstance(v, str) else self._torch.from_numpy(v) for k, v in batch.items()}
         with self._torch.no_grad():
             action = self._post(self._policy.select_action(self._pre(tensors)))
         return action.detach().cpu().numpy().astype(np.float32).reshape(-1)

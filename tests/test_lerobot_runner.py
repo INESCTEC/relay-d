@@ -73,6 +73,29 @@ def test_build_batch_orders_the_state_and_converts_the_camera():
     assert image[:, 0, 0].tolist() == pytest.approx([30 / 255, 20 / 255, 10 / 255])  # BGR input -> RGB channels, in [0, 1]
 
 
+def test_build_batch_passes_the_task_sentence_only_when_there_is_one():
+    obs = {"a": np.array([1.0])}
+    assert "task" not in build_batch(obs, ["a"], {})
+    assert build_batch(obs, ["a"], {}, task="pick the cube")["task"] == "pick the cube"
+
+
+def test_dataset_task_is_read_from_the_training_dataset(tmp_path):
+    pq = pytest.importorskip("pyarrow.parquet")
+    import pyarrow as pa
+
+    from relay_d.dispatch.lerobot_runner import dataset_task
+
+    ck = _lerobot_folder(tmp_path / "pretrained_model")
+    assert dataset_task(ck) is None  # no train_config.json
+    root = tmp_path / "ds"
+    (root / "meta").mkdir(parents=True)
+    (ck / "train_config.json").write_text(json.dumps({"dataset": {"root": str(root)}}))
+    pq.write_table(pa.table({"task_index": [0], "task": ["stack the cubes"]}), root / "meta" / "tasks.parquet")
+    assert dataset_task(ck) == "stack the cubes"
+    pq.write_table(pa.table({"task_index": [0, 1], "task": ["a", "b"]}), root / "meta" / "tasks.parquet")
+    assert dataset_task(ck) is None  # several tasks: which one is ambiguous, so --task must say
+
+
 def test_build_batch_crops_an_odd_frame_like_the_dataset_writer_did_and_rejects_other_sizes():
     obs = {"s": np.zeros(1), "cam": _frame(5, 7)}
     assert build_batch(obs, ["s"], {"cam": ("observation.images.cam", (3, 4, 6))})["observation.images.cam"].shape == (3, 4, 6)
@@ -104,7 +127,7 @@ def test_runner_feeds_lerobot_and_returns_a_flat_float32_action(tmp_path, monkey
             self.scale, self.resets = scale, 0
 
         def __call__(self, x):
-            return {k: v.unsqueeze(0) for k, v in x.items()} if isinstance(x, dict) else x * self.scale
+            return {k: v.unsqueeze(0) if hasattr(v, "unsqueeze") else v for k, v in x.items()} if isinstance(x, dict) else x * self.scale
 
         def reset(self):
             self.resets += 1
@@ -138,6 +161,39 @@ def test_runner_feeds_lerobot_and_returns_a_flat_float32_action(tmp_path, monkey
         runner.get_action({"x": np.array([1.0]), "y": np.array([2.0]), "cam": _frame(4, 6)})
     with pytest.raises(FileNotFoundError, match="not a LeRobot checkpoint"):
         lr.LeRobotPolicyRunner(str(tmp_path / "nowhere"))
+    assert runner.fps is None  # no training dataset to read the rate from
+
+    root = tmp_path / "ds"
+    (root / "meta").mkdir(parents=True)
+    (root / "meta" / "info.json").write_text(json.dumps({"fps": 15, "features": {STATE: {"names": ["x", "y.0", "y.1"]}}}))
+    (ck / "train_config.json").write_text(json.dumps({"dataset": {"root": str(root)}}))
+    runner = lr.LeRobotPolicyRunner(str(ck), device="cpu")
+    assert runner.fps == 15 and runner.state_keys == ["x", "y"]  # the control rate the policy learned
+
+    class TokenizerProcessorStep:  # what a language-conditioned policy (SmolVLA) has in its preprocessor
+        pass
+
+    pipelines[0].steps = [TokenizerProcessorStep()]
+    with pytest.raises(ValueError, match="--task"):  # no dataset task to fall back on: fail at startup, not mid-run
+        lr.LeRobotPolicyRunner(str(ck), device="cpu")
+    runner = lr.LeRobotPolicyRunner(str(ck), device="cpu", task="stack the cubes")
+    runner.get_action({"x": np.array([1.0]), "y": np.array([2.0, 3.0]), "cam": _frame(4, 6)})
+    assert seen["batch"]["task"] == "stack the cubes"
+
+    # fine-tuned from a pretrained model: its config keeps that model's inputs (6 values, camera1 at 256x256), the
+    # real inputs are the dataset's, fed under the dataset's camera name (the preprocessor renames it to camera1)
+    cfg.input_features = {STATE: feature((6,)), "observation.images.camera1": feature((3, 256, 256))}
+    (root / "meta" / "info.json").write_text(json.dumps({"fps": 15, "features": {
+        STATE: {"names": ["x", "y.0", "y.1"], "shape": [3]},
+        "observation.images.cam": {"dtype": "video", "shape": [4, 6, 3]}}}))
+    (ck / "train_config.json").write_text(json.dumps({"dataset": {"root": str(root)}, "policy": {"pretrained_path": "lerobot/smolvla_base"}}))
+    runner = lr.LeRobotPolicyRunner(str(ck), device="cpu", task="stack the cubes")
+    assert runner.obs_keys == ["x", "y", "cam"]
+    runner.get_action({"x": np.array([1.0]), "y": np.array([2.0, 3.0]), "cam": _frame(4, 6)})
+    assert seen["batch"][STATE].shape == (1, 3) and seen["batch"]["observation.images.cam"].shape == (1, 3, 4, 6)
+    (ck / "train_config.json").write_text(json.dumps({"dataset": {"root": str(tmp_path / "gone")}, "policy": {"pretrained_path": "x"}}))
+    with pytest.raises(ValueError, match="training dataset"):  # without the dataset its real inputs are unknown
+        lr.LeRobotPolicyRunner(str(ck), device="cpu", task="t")
 
 
 def test_old_custom_backend_setting_falls_back_to_auto(settings_file):

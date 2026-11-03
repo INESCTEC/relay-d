@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Upgrade notes (read first)
+- **Re-convert your datasets and retrain.** An absolute action is now the target of the next step (`action[t] = value[t+1]`), see *Changed*. Datasets converted before this release taught the policy to hold still.
+- **LeRobot environment:** press **Set up lerobot environment** (Train tab) again: it adds `lerobot[smolvla]`. The `.[lerobot]` extra now needs `pyarrow<21` (pyarrow 21+ needs NumPy 2, ROS Jazzy has 1.26).
+- **`relay_d.dispatch.DispatcherHelpers` is gone:** use `save_dispatch_templates(output_dir)`.
+- **`lfd-inference-node --hz`** defaults to the rate the LeRobot policy was trained at (its dataset fps), no longer the `infer_hz` setting (10 Hz). robomimic checkpoints still use the setting: pass `--hz <recording_frequency>`.
+- **Action configs copied from the template:** the `robotiq_gripper` entry must map `position: 0`, not `7` (see *Fixed*).
+- **New folder names:** recording sessions end in `_Recording`, Post-process outputs in `_Robomimic` / `_Lerobot`. Existing folders keep their names.
+
+### Added
+- **SmolVLA**, a third LeRobot policy (Train tab, `relay-d-train --policy smolvla`). It is a 450M vision-language-action model fine-tuned from the pretrained `lerobot/smolvla_base` (`--policy.path`, downloaded once), not trained from scratch,
+  and it follows the dataset's task sentence. The dataset's cameras (at most 3) are renamed to the model's `camera1..3` with `--rename_map`, which LeRobot keeps in the checkpoint. "Set up lerobot environment" installs
+  `lerobot[smolvla]` (`transformers`, `num2words`). Measured on an RTX 4060 Laptop (8 GB): the fine-tune peaks at about 4.2 GB with the default batch size, and inference needs under 1 GB.
+- **Task sentence at inference:** `lfd-inference-node --task "..."` / `InferenceSession(task=...)`, by default the training dataset's task (`meta/tasks.parquet`). A language policy without a task stops at startup. For a fine-tuned checkpoint
+  the state size and cameras are taken from the training dataset, because the checkpoint config keeps the pretrained model's ones.
+- **Safe stop:** a command or topic entry of `action_config.yaml` can set `stop: [...]` (e.g. `[0, 0, 0]` for a velocity), sent once when inference stops sending: inputs go stale, the model fails, `on_timeout: raise`, Ctrl+C, the end of
+  `run()`, or `close()`. Before, the node just went quiet and a controller without a watchdog kept the last command. A broken `stop` (wrong length, a mapping that does not fit, set on an `action: true` entry) stops startup.
+- **Recorded-rate check:** a demo recorded more than 10% off `recording_frequency` (a PC that could not keep up) fails the after-recording check and is left out of LeRobot datasets, whose fps time base would make the policy move
+  faster than shown.
+- **CI runs the ROS-dependent tests** in a `ros:jazzy` container job (dispatcher, recorder, `AppAPI`, inference session). `pytest` also runs locally with ROS sourced (`pyproject.toml` disables the ROS pytest plugins).
+- Verified end to end against LeRobot 0.6.1: `LeRobotDataset` loads a Relay-D dataset (frames, RGB video, `action[t] = state[t+1]`, ACT-style action chunks via `delta_timestamps`), `lerobot_train` trains on it with the Train tab's
+  command (ACT and SmolVLA), and `LeRobotPolicyRunner` runs the checkpoint, with state and action normalized by the dataset's own stats.
+
+### Changed
+- **Training actions are next-step targets:** an absolute action (a stream not in `delta_actions`) is the stream's value at t+1, as a delta already looked one step ahead; it was the value at t, so a state stream used as an action
+  taught the policy to stand still. A stream that is both `normalize: true` and in `delta_actions` is refused (conversion and the config check): the dispatcher cannot turn a normalized delta back into real units.
+- **LeRobot policies run at their training rate:** `--hz` defaults to the dataset's fps (read through the checkpoint), and `InferenceSession.run()` warns when the rate differs (a 30 fps policy at 10 Hz played its actions 3x slower).
+- **Output names:** a recording session folder ends in `_Recording` (after the `session_folder_format` pattern). A Post-process output folder and the dataset inside it end in `_Robomimic` or `_Lerobot`
+  (`2026-11-02_15-10-00_Robomimic/dataset_<time>_Robomimic.h5`, `2026-11-02_15-12-00_Lerobot/dataset_<time>_Lerobot/`). `AppAPI` writes `combined_dataset_Robomimic.h5` / `combined_dataset_Lerobot` into the session folder, and Review
+  leaves `*_Robomimic.h5` out of the demo list. Training finds datasets by their content, as before.
+- **Record page Stop** saves in a background thread: the window no longer freezes while a large demo is written, the buttons are locked until it is done, and closing the window waits for that save. Demo names carry milliseconds,
+  so two Starts in one second no longer clash.
+- The exported `inference_script.py` is a thin wrapper around `lfd-inference-node` (same options and defaults; only `--obs-config` / `--action-config` default to the files next to it).
+- `relay_d.dispatch.save_dispatch_templates(output_dir)` replaces `DispatcherHelpers`; the action dispatcher walks field paths in one place (`_walk` / `_assign`).
+- The app logo is a small PNG (11 KB instead of 3.9 MB), so `resources_rc.py` shrinks by about 250k lines; duplicate icon entries are removed from `resources.qrc`.
+
+### Fixed
+- **Conversion no longer guesses:** a configured path that is missing is not replaced by the first group with the same field name (an arm path could read the gripper), and a dataset whose length differs from the demo's timestamps
+  fails that demo instead of being stretched. The train/validation masks sort demos by number (`demo_2` before `demo_10`).
+- **`AppAPI.shutdown()`** keeps everything running and returns False when the last recording could not be saved (it was only in memory and got lost); True otherwise. Closing the GUI with an unsaved demo retries the save and asks
+  before losing it.
+- **Action dispatcher:** a `scale` / `strength_scale` with `in_min == in_max` stops startup (the magnetic gripper crashed the node the first time it switched on); an ack that arrives while a stale one is being read is no longer lost.
+- **Action template:** `robotiq_gripper` mapped `position: 7`, but mapping values index the entry's slice (`indices: [7]` has only index 0), so the copied template failed its startup check. It is now `position: 0`.
+- **`.[lerobot]` extra:** pyarrow is capped below 21: pyarrow 21+ needs NumPy 2 at import and ROS Jazzy's Python has NumPy 1.26, so LeRobot conversion failed on a standard ROS machine.
+- **Joint states:** a message without every configured joint (e.g. a gripper-only publisher on the same topic) is ignored instead of shifting the values (`ObsBuilder`, recording streams), and an array the driver does not fill for
+  every joint (often `velocity`) reads as zeros/empty instead of raising or being misread. Joint datasets keep one row per timestamp, an empty first row is zero-padded instead of failing the save.
+- **Observations:** an obs whose `limits` count matches neither 1 nor its width is left unset (pre-flight fails) instead of reusing the last limit.
+- **Recording:** a new demo never overwrites an existing file (the demo counter restarts in every process), and a demo saved by a retry at Start joins the session; a YAML date in the config metadata no longer drops the metadata
+  keys after it; pressing Start again after a failed start no longer subscribes twice; unorganized point clouds are stored as metadata only instead of being decoded into the RAM buffer.
+- **Environment setup:** the folder name in the setup script is shell-quoted correctly.
+
+### Removed
+- `relay_d.dispatch.DispatcherHelpers` (replaced by `save_dispatch_templates`).
+- The converter's field-scan fallback (`_scan_for_field`) and the resampling of datasets of the wrong length (`_resize_data`): both hid broken data (see *Fixed*).
+
 ### Fixed (audit)
 - **Action dispatcher:** a `mapping` that does not fit its message (a wrong field name or index) now stops startup; before, the first tick sent the other entries (the arm) and skipped that one (the gripper). An output that is not finite
   after its `transform` (a `scale` with `in_min == in_max`) skips the whole tick instead of being published.
@@ -222,6 +276,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed leftover local absolute file paths (`/home/<user>/...`) from
   `pyuic5`-generated header comments in the compiled Qt UI modules.
 
+## [0.1.1] — 2026-10-08
+
+### Fixed
+- Startup crash under NumPy 2: removed the compiled `cv_bridge` dependency (replaced by pure-numpy `imgmsg_to_cv2`/`cv2_to_imgmsg` in `relay_d.utils.ros_media_codec`) and dropped the `numpy<2` pin.
+- Qt "xcb" plugin abort when the full `opencv-python` wheel is installed: `sanitize_qt_env()` undoes cv2's Qt plugin-path override.
+
 ## [0.1.0] — 2026-07-28
 
 ### Added
@@ -233,9 +293,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shared `relay_d.utils` module (colored console logger, config loader).
 - Packaging via `pyproject.toml` (setuptools backend), with `RelayDApp` and
   `lfd-inference-node` console-script entry points.
-
-## [0.1.1] — 2026-10-8
-
-### Fixed
-- Startup crash under NumPy 2: removed the compiled `cv_bridge` dependency (replaced by pure-numpy `imgmsg_to_cv2`/`cv2_to_imgmsg` in `relay_d.utils.ros_media_codec`) and dropped the `numpy<2` pin.
-- Qt "xcb" plugin abort when the full `opencv-python` wheel is installed: `sanitize_qt_env()` undoes cv2's Qt plugin-path override.

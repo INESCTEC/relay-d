@@ -20,7 +20,7 @@ flowchart TD
     G --> I["lfd-inference-node\n(relay_d.dispatch:\n robomimic or LeRobot runner)"]
     I --> K[Robot ROS 2 interfaces\n topics / actions]
 
-    D -. shares action_config.yaml format via .-> L[DispatcherHelpers]
+    D -. shares action_config.yaml format via .-> L[save_dispatch_templates]
     L -. used by .-> I
 ```
 
@@ -35,7 +35,7 @@ flowchart TD
   the robot.
 - The two subsystems interoperate through `action_config.yaml`:
   `relay_d.acquisition`'s post-process page uses
-  `relay_d.dispatch.DispatcherHelpers` so the same config format is produced
+  `relay_d.dispatch.save_dispatch_templates` so the same config format is produced
   during data prep and consumed at inference time.
 - **`relay_d.utils`** provides small shared utilities (e.g. the colored
   console logger) used by both subsystems.

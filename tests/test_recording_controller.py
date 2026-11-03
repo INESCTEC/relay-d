@@ -48,6 +48,7 @@ def env(qapp, monkeypatch):
     recorder.resume_recording.return_value = True
     recorder.stop_recording.return_value = True
     recorder.h5_file_path = "/data/my_demo_1.h5"
+    recorder.retried_file = None
     subscribers = MagicMock()
     subscribers.create_subscribers_for_containers.return_value = {"a": True}
     containers = MagicMock()
@@ -59,10 +60,19 @@ def env(qapp, monkeypatch):
     )
     box = MagicMock()
     monkeypatch.setattr(rc_mod, "CustomMessageBox", box)
+    monkeypatch.setattr(rc_mod, "run_in_background", _run_now)  # the save thread, made synchronous
     ctrl = rc_mod.RecordingController(ui, yaml_parser, recorder, subscribers, containers, manager, validator)
     ctrl.connect_buttons()
     return SimpleNamespace(ui=ui, ctrl=ctrl, recorder=recorder, subscribers=subscribers,
                            manager=manager, validator=validator, box=box, yaml_parser=yaml_parser)
+
+
+def _run_now(parent, work, on_done, busy=None):
+    try:
+        value, error = work(), None
+    except Exception as e:
+        value, error = None, e
+    on_done(value, error)
 
 
 def _states(ui):
@@ -115,7 +125,7 @@ def test_full_cycle_through_button_clicks(env):
 
 
 def test_guards(env):
-    assert env.ctrl.stop_recording() is False
+    assert env.ctrl.stop_recording() is False  # nothing to stop
     assert env.ctrl.pause_recording() is False
     env.yaml_parser.is_loaded.return_value = False
     assert env.ctrl.start_recording() is False
@@ -162,9 +172,30 @@ def test_failed_validation_warns_and_validator_errors_do_not_break_stop(env):
 def test_stop_failure_keeps_recording(env):
     env.ctrl.start_recording()
     env.recorder.stop_recording.return_value = False
-    assert env.ctrl.stop_recording() is False
+    env.ctrl.stop_recording()
     assert env.ctrl.is_recording
     assert env.ctrl.session_h5_files == []
+
+
+def test_save_runs_in_the_background_with_the_buttons_locked(env, monkeypatch):
+    pending = []
+    monkeypatch.setattr(rc_mod, "run_in_background", lambda parent, work, on_done, busy=None: pending.append((work, on_done)))
+    env.ctrl.set_config_loaded(True)
+    env.ctrl.start_recording()
+    assert env.ctrl.stop_recording() is True
+    assert _states(env.ui) == (False, False, "Pause", False)  # nothing to click while the demo is written
+    assert env.ctrl.stop_recording() is False  # a second Stop does not start a second save
+    work, on_done = pending.pop()
+    on_done(work(), None)  # the thread finished
+    assert not env.ctrl.is_recording and env.ctrl.session_h5_files == ["/data/my_demo_1.h5"]
+    assert _states(env.ui) == (True, False, "Pause", False)
+
+
+def test_a_crash_in_the_save_thread_is_a_failed_stop(env):
+    env.ctrl.start_recording()
+    env.recorder.stop_recording.side_effect = OSError("disk")
+    env.ctrl.stop_recording()
+    assert env.ctrl.session_h5_files == [] and not env.ctrl.is_saving
 
 
 def test_remove_session_file(env):
@@ -190,3 +221,11 @@ def test_create_containers_is_not_reentrant_while_waiting(qapp):
     assert manager.create_containers() is True
     assert results == [False]
     assert manager.create_containers() is True  # usable again afterwards
+
+
+def test_demo_saved_by_a_retry_at_start_joins_the_session(env):
+    env.ctrl.set_config_loaded(True)
+    env.recorder.retried_file = "/data/my_demo_0.h5"  # its save failed at Stop, the retry at Start worked
+    env.ui.btn_start_record.click()
+    env.ui.btn_stop_record.click()
+    assert env.ctrl.session_h5_files == ["/data/my_demo_0.h5", "/data/my_demo_1.h5"]

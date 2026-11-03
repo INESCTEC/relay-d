@@ -52,9 +52,10 @@ def test_recorder_sync_tolerance_zero_means_off(recorder_cls, settings):
 def test_session_folder_name_follows_the_setting(recorder_cls, settings):
     settings({"session_folder_format": "run_%Y"})
     name = recorder_cls._session_folder_name()
-    assert name.startswith("run_") and len(name) == 8
+    assert name.startswith("run_") and name.endswith("_Recording") and len(name) == 8 + len("_Recording")
     settings({"session_folder_format": ""})  # empty falls back to the default pattern
-    assert len(recorder_cls._session_folder_name()) == 19
+    name = recorder_cls._session_folder_name()
+    assert len(name) == 19 + len("_Recording") and name.endswith("_Recording")
 
 
 def test_compression_setting_reaches_the_hdf5_datasets(recorder_cls, settings, tmp_path):

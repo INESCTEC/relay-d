@@ -14,7 +14,7 @@ import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Set
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils import user_settings
-from relay_d.utils.numerics import normalize, quat_to_euler
+from relay_d.utils.numerics import RATE_TOLERANCE, median_rate, normalize, quat_to_euler
 from .postprocess_options import PostprocessOptions
 import re
 import json
@@ -146,6 +146,25 @@ def _infer_n_actions(data_config: Dict) -> int:
     return total if total > 0 else 1
 
 
+def _action_part(part: np.ndarray, key: str, stream_configs: dict, delta_actions: list) -> np.ndarray:
+    """One `actions_to_extract` entry as (N, width) columns: its stream's rotation format and
+    normalization, then the target of step t: the delta to t+1 if listed in `delta_actions`, else
+    the value at t+1 (the value at t is the current state, which would teach the policy to stand still).
+    Shared by both conversion paths."""
+    part = part if part.ndim > 1 else part[:, np.newaxis]
+    _, normalize, norm_range, limits, rot_fmt = _parse_stream_entry(stream_configs.get(key, []))
+    if normalize and limits and key in delta_actions:
+        # A delta of normalized values has no offset: the dispatcher's denormalize (which adds lower_lim) cannot undo it.
+        raise ValueError(
+            f"stream '{key}' is both normalized and in delta_actions: the dispatcher cannot turn that back into "
+            f"real units. Add a second stream over the same specs without `normalize` and use it as the action."
+        )
+    part = _apply_rotation_format(part, rot_fmt, key)
+    if normalize and limits:
+        part = _apply_normalization(part, limits, norm_range)
+    return _compute_delta(part) if key in delta_actions else _next_obs(part)
+
+
 def _compute_delta(data: np.ndarray) -> np.ndarray:
     """Return frame-to-frame delta (data[t+1] - data[t]); last step is zero-padded."""
     if data.ndim == 1:
@@ -196,6 +215,13 @@ def _end_flags(n: int) -> np.ndarray:
     if n > 0:
         flags[-1] = 1.0
     return flags
+
+
+def _check_length(data: np.ndarray, num_samples: int, key: str) -> None:
+    """The recorder writes one row per timestamp: another length means lost or extra frames, so the demo fails
+    instead of being stretched out of step with the actions."""
+    if len(data) != num_samples:
+        raise ValueError(f"'{key}' has {len(data)} rows but the demo has {num_samples} timesteps")
 
 
 def _next_obs(obs: np.ndarray) -> np.ndarray:
@@ -342,14 +368,6 @@ class DataTransformEngine:
                 raise ValueError(f"actions_to_extract key '{key}' not found in bridge_map")
 
             data = self._get_nested_data(input_data, path)
-            if data is None and "/" in path:
-                field_name = path.split("/")[-1]
-                data = self._scan_for_field(input_data, field_name)
-                if data is not None:
-                    logger.info(
-                        f"actions fallback: resolved '{key}' via field scan "
-                        f"('{path}' not found, matched '{field_name}')"
-                    )
             if data is None:
                 raise ValueError(f"actions_to_extract key '{key}': path '{path}' not found in data")
 
@@ -357,19 +375,8 @@ class DataTransformEngine:
             if len(raw_data) == 0:
                 raise ValueError(f"actions_to_extract key '{key}': dataset '{path}' is empty")
 
-            raw_data = self._resize_data(raw_data, num_samples)
-            part = raw_data if raw_data.ndim > 1 else raw_data[:, np.newaxis]
-
-            _, normalize, norm_range, limits, rot_fmt = _parse_stream_entry(
-                stream_configs.get(key, [])
-            )
-            part = _apply_rotation_format(part, rot_fmt, key)
-            if normalize and limits:
-                part = _apply_normalization(part, limits, norm_range)
-
-            if key in delta_actions:
-                part = _compute_delta(part)
-            action_parts.append(part)
+            _check_length(raw_data, num_samples, key)
+            action_parts.append(_action_part(raw_data, key, stream_configs, delta_actions))
 
         actions = np.concatenate(action_parts, axis=1)
 
@@ -382,24 +389,6 @@ class DataTransformEngine:
     # ------------------------------------------------------------------
     # HDF5 nested data reader
     # ------------------------------------------------------------------
-
-    def _scan_for_field(
-        self, group: h5py.Group, field_name: str
-    ) -> Optional[h5py.Dataset]:
-        """
-        Scan all direct sub-groups for a dataset named field_name.
-        Fallback when bridge map paths don't match the recorded container names.
-        """
-        for key in group.keys():
-            item = group[key]
-            if isinstance(item, h5py.Group) and field_name in item:
-                candidate = item[field_name]
-                if isinstance(candidate, h5py.Dataset):
-                    logger.debug(
-                        f"Fallback scan: found '{field_name}' under sub-group '{key}'"
-                    )
-                    return candidate
-        return None
 
     def _get_nested_data(self, group: h5py.Group, path: str) -> Optional[h5py.Dataset]:
         """
@@ -419,26 +408,6 @@ class DataTransformEngine:
             current = current[part]
 
         return current if isinstance(current, h5py.Dataset) else None
-
-    def _resize_data(
-        self,
-        data: np.ndarray,
-        target_samples: int,
-        preserve_dtype: bool = False,
-    ) -> np.ndarray:
-        """
-        Resample data along axis-0 to target_samples using linear index interpolation.
-        Preserves dtype when preserve_dtype=True (important for uint8 images).
-        """
-        if len(data) == target_samples:
-            return data
-
-        if len(data) == 0:
-            return np.zeros((target_samples,) + data.shape[1:], dtype=data.dtype)
-
-        indices = np.linspace(0, len(data) - 1, target_samples).astype(int)
-        resampled = data[indices]
-        return resampled if preserve_dtype else resampled.astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -829,6 +798,15 @@ class YAMLDrivenConverter:
                                 demo_data = in_data_grp.get(raw_demo_name)
                                 if not isinstance(demo_data, h5py.Group):
                                     continue
+                                ts = demo_data.get("timestamps")
+                                rate = median_rate(ts[:]) if isinstance(ts, h5py.Dataset) else None
+                                if rate is not None and abs(rate - fps) > RATE_TOLERANCE * fps:
+                                    # fps is the episode's time base: a policy trained on it would move rate/fps faster
+                                    logger.error(
+                                        f"Skipped {file_path}::{raw_demo_name}: recorded at {rate:.1f} Hz, but the dataset "
+                                        f"fps is {fps}. Set recording_frequency to a rate this PC keeps up with and record again."
+                                    )
+                                    continue
                                 demo = self._convert_single_demo(
                                     demo_data, engine, f"lerobot_ep_{written}"
                                 )
@@ -863,9 +841,11 @@ class YAMLDrivenConverter:
                                     f"Converted {file_path}::{raw_demo_name} -> "
                                     f"episode {written - 1} ({demo['num_samples']} frames)"
                                 )
-                    except OSError as e:
+                    except LeRobotDependencyError:
+                        raise
+                    except Exception as e:  # skip a broken file: reaching the writer would delete the whole output
                         fname = os.path.basename(file_path)
-                        logger.error(f"Skipping {fname} — could not open: {e}")
+                        logger.error(f"Skipping {fname} — could not read: {e}")
                         skipped.append(fname)
 
                 if written == 0:
@@ -1069,19 +1049,8 @@ class YAMLDrivenConverter:
             action_parts = []
             for stream_name in actions_to_extract:
                 if stream_name in streams_grp:
-                    part = np.array(streams_grp[stream_name], dtype=np.float32)
-                    if part.ndim == 1:
-                        part = part[:, np.newaxis]
-                    part = part[:num_samples]
-                    _, normalize, norm_range, limits, rot_fmt = _parse_stream_entry(
-                        stream_configs.get(stream_name, [])
-                    )
-                    part = _apply_rotation_format(part, rot_fmt, stream_name)
-                    if normalize and limits:
-                        part = _apply_normalization(part, limits, norm_range)
-                    if stream_name in delta_actions:
-                        part = _compute_delta(part)
-                    action_parts.append(part)
+                    part = np.array(streams_grp[stream_name], dtype=np.float32)[:num_samples]
+                    action_parts.append(_action_part(part, stream_name, stream_configs, delta_actions))
                 elif stream_name in demo["obs"]:
                     # Already zero-filled above from the shape cache.
                     part = demo["obs"][stream_name]
@@ -1089,7 +1058,8 @@ class YAMLDrivenConverter:
                         part = part[:, np.newaxis]
                     action_parts.append(part)
                 else:
-                    logger.warning(
+                    # A missing action column would silently change the action size: fail the demo.
+                    raise ValueError(
                         f"actions_to_extract: stream '{stream_name}' not found in {demo_name} "
                         f"(no data anywhere in the batch)"
                     )
@@ -1153,17 +1123,6 @@ class YAMLDrivenConverter:
             if recorded_path:
                 dataset = engine._get_nested_data(demo_data, recorded_path)
 
-                # Fallback: scan sub-groups for the field name when the config
-                # path doesn't match the recorded container name.
-                if dataset is None and "/" in recorded_path:
-                    field_name = recorded_path.split("/")[-1]
-                    dataset = engine._scan_for_field(demo_data, field_name)
-                    if dataset is not None:
-                        logger.info(
-                            f"Fallback: resolved '{obs_key}' via field scan "
-                            f"('{recorded_path}' not found, matched '{field_name}')"
-                        )
-
             if dataset is not None:
                 # Images are recorded as uint8 by the acquisition pipeline —
                 # that's a data-driven signal, not a guess from the key name.
@@ -1173,9 +1132,7 @@ class YAMLDrivenConverter:
                 is_image = dataset.dtype == np.uint8 or obs_key in self._modality_map
                 raw = np.array(dataset) if is_image else np.array(dataset, dtype=np.float32)
 
-                if len(raw) != num_samples:
-                    raw = engine._resize_data(raw, num_samples, preserve_dtype=is_image)
-
+                _check_length(raw, num_samples, obs_key)
                 demo["obs"][obs_key] = raw
                 if self._need_next_obs:
                     demo["next_obs"][obs_key] = _next_obs(raw)
@@ -1218,9 +1175,13 @@ class YAMLDrivenConverter:
             demo = self._convert_single_demo_from_streams(demo_data, demo_name)
             if demo is None:
                 return None
-            self._populate_bridge_obs(
-                demo_data, engine, demo, demo["num_samples"], demo_name
-            )
+            try:
+                self._populate_bridge_obs(
+                    demo_data, engine, demo, demo["num_samples"], demo_name
+                )
+            except ValueError as e:  # one bad demo is skipped, not the rest of its file
+                logger.error(f"Error converting demo '{demo_name}': {e}")
+                return None
             return demo
 
         try:
@@ -1303,18 +1264,24 @@ class YAMLDrivenConverter:
                 self.last_error = f"robomimic.splits: '{name}' must be a number between 0 and 1, got {frac!r}"
                 logger.error(self.last_error)
                 return False
+        if train == 0:  # every robomimic template trains on the "train" mask: no mask, no training
+            self.last_error = "robomimic.splits: 'train' must be more than 0"
+            logger.error(self.last_error)
+            return False
         if train + val > 1 + 1e-9:
             self.last_error = f"robomimic.splits: train ({train}) + val ({val}) is more than 1"
             logger.error(self.last_error)
             return False
 
-        sorted_demo_names = sorted(demo_names)
+        sorted_demo_names = sorted(demo_names, key=natural_key)
         total_demos = len(sorted_demo_names)
 
-        # At least one training demo when training is asked for (int() would give 0 for few demos).
-        train_count = max(1, int(total_demos * train)) if train > 0 and total_demos else 0
-        val_count = min(int(total_demos * val), total_demos - train_count)
+        # At least one training demo when training is asked for (round() would give 0 for few demos).
+        train_count = max(1, round(total_demos * train)) if train > 0 and total_demos else 0
+        val_count = min(round(total_demos * val), total_demos - train_count)
         test_count = total_demos - train_count - val_count
+        if not test and train_count:  # no eval split asked for: rounding leftovers train instead of sitting unused in "eval"
+            train_count, test_count = train_count + test_count, 0
 
         if(train_count != 0):
             mask_group.create_dataset(
@@ -1468,10 +1435,7 @@ class YAMLDrivenConverter:
         path = engine.resolve_path(key)
         if not path:
             return None
-        ds = engine._get_nested_data(demo_data, path)
-        if ds is None and "/" in path:
-            ds = engine._scan_for_field(demo_data, path.split("/")[-1])
-        return ds
+        return engine._get_nested_data(demo_data, path)
 
     def _prescan_shapes(
         self,

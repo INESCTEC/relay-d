@@ -6,7 +6,7 @@ import rclpy.time
 from rclpy.node import Node
 from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
-from ...utils.stream_builder import StreamBuilder
+from ...utils.stream_builder import StreamBuilder, fill_none_gaps
 import time
 import json
 from threading import Lock, Thread
@@ -44,6 +44,7 @@ class DataRecorder(Node):
         self.recorded_data = defaultdict(list)
         self.recording_metadata = {}
         self.current_demo_number = 0
+        self.retried_file = None  # path of the demo saved by the last retry_save()
 
         self._apply_setting_defaults()  # the config file's values win (below, and again at each start_recording)
 
@@ -138,6 +139,7 @@ class DataRecorder(Node):
                     logger.warning("Recording already in progress")
                     return False
 
+                self.retried_file = None
                 if self._unsaved:
                     logger.warning("Previous recording was not saved; retrying the save before starting")
                     if not self.retry_save():
@@ -183,9 +185,10 @@ class DataRecorder(Node):
                     )
                     self.recording_metadata["recording_frequency"] = self.recording_frequency
                     logger.info(f"Recording frequency: {self.recording_frequency} Hz")
+                    # 0 means off, in the YAML as in the setting
                     self._sync_tolerance = config.get(
-                        "sync_tolerance_sec", user_settings.get("rec_default_sync_tolerance_sec") or None
-                    )
+                        "sync_tolerance_sec", user_settings.get("rec_default_sync_tolerance_sec")
+                    ) or None
                     self._sync_mode = config.get("sync_mode", user_settings.get("rec_default_sync_mode"))
                     self.recording_metadata["sync_tolerance_sec"] = self._sync_tolerance
                     if self._sync_tolerance is not None:
@@ -252,7 +255,7 @@ class DataRecorder(Node):
             # published yet.
             warmup_timeout = float(user_settings.get("rec_warmup_s"))
             warmup_start = time.monotonic()
-            while time.monotonic() - warmup_start < warmup_timeout:
+            while time.monotonic() - warmup_start < warmup_timeout and not self.stop_recording_flag:  # Stop must not wait out a long warm-up
                 topic_subscribers.update_tf_lookups()
                 snapshot = topic_subscribers.get_content()
                 if snapshot and all(v is not None for v in snapshot.values()):
@@ -392,44 +395,39 @@ class DataRecorder(Node):
                                     else:
                                         next_tick = time.monotonic()
                                     continue
-                    self.timestamp_spreads.append(spread)
-
                     current_time = self._clock.now().to_msg()
                     timestamp_nsec = (
                         current_time.sec * 1000000000 + current_time.nanosec
                     )
-                    self.timestamps.append(timestamp_nsec)
 
-                    # Streams share the same snapshot as all containers.
-                    if self._stream_builder.has_streams():
-                        self._stream_builder.evaluate(all_data)
-
-                    data_processed = 0
-                    all_container_ids = list(self.topic_subscribers.subscribers.keys())
-                    for container_id in all_container_ids:
+                    # Encode the whole tick first, append it only once all of it worked: a tick that
+                    # fails half way would leave some inputs one sample behind the timestamps for good.
+                    tick = {}
+                    for container_id in self.recorded_data.keys() | self.topic_subscribers.subscribers.keys():
                         msg_data = all_data.get(container_id)
+                        processed_data = None
                         if msg_data is not None:
                             msg_data = self._stream_builder.apply_joint_filter(container_id, msg_data)
                             processed_data = self._process_message_for_recording(
                                 msg_data, container_id
                             )
-                            if processed_data:
-                                self._last_valid_raw[container_id] = processed_data
-                                self.recorded_data[container_id].append(processed_data)
-                                self._buffered_bytes += _sample_nbytes(processed_data)
-                                data_processed += 1
-                            elif container_id in self._last_valid_raw:
-                                self.recorded_data[container_id].append(
-                                    self._last_valid_raw[container_id]
-                                )
-                            else:
-                                self.recorded_data[container_id].append(None)
-                        elif container_id in self._last_valid_raw:
-                            self.recorded_data[container_id].append(
-                                self._last_valid_raw[container_id]
-                            )
-                        else:
-                            self.recorded_data[container_id].append(None)
+                        tick[container_id] = processed_data
+
+                    # Streams share the same snapshot as all containers.
+                    if self._stream_builder.has_streams():
+                        self._stream_builder.evaluate(all_data)
+
+                    self.timestamp_spreads.append(spread)
+                    self.timestamps.append(timestamp_nsec)
+                    data_processed = 0
+                    for container_id, processed_data in tick.items():
+                        if processed_data:
+                            self._last_valid_raw[container_id] = processed_data
+                            self._buffered_bytes += _sample_nbytes(processed_data)
+                            data_processed += 1
+                        self.recorded_data[container_id].append(
+                            processed_data or self._last_valid_raw.get(container_id)
+                        )
 
                     self.recording_sample_count += 1
                     consecutive_errors = 0
@@ -505,9 +503,8 @@ class DataRecorder(Node):
                 expected = len(self.timestamps)
                 for cid, samples in list(self.recorded_data.items()):
                     if len(samples) != expected:
-                        logger.warning(
-                            f"Sample count mismatch: '{cid}' has {len(samples)} samples, "
-                            f"expected {expected}. Gap-fill will be applied before saving."
+                        logger.error(
+                            f"Sample count mismatch: '{cid}' has {len(samples)} samples, expected {expected}."
                         )
 
                 self.recording_metadata["end_time"] = time.time()
@@ -556,7 +553,7 @@ class DataRecorder(Node):
     def retry_save(self):
         """Save the samples left in memory by a failed stop_recording(). True on success."""
         try:
-            self._create_h5_file(self.recording_metadata["demo_name"])
+            self._create_h5_file(self.recording_metadata["demo_name"], mode="w")  # replaces its own partial file
             saved = self._save_recorded_data()
         except Exception as e:
             logger.error(f"Retry save failed: {e}")
@@ -566,6 +563,7 @@ class DataRecorder(Node):
             self.h5_file = None
         if saved:
             self._unsaved = False
+            self.retried_file = self.h5_file_path  # the caller adds it to its session list
             self.current_demo_number += 1
         return saved
 
@@ -575,11 +573,11 @@ class DataRecorder(Node):
 
     @staticmethod
     def _session_folder_name():
-        """Folder name of a recording session: the ``session_folder_format`` setting (strftime pattern)."""
+        """Folder name of a recording session: the ``session_folder_format`` setting (strftime pattern) + ``_Recording``."""
         name = datetime.now().strftime(user_settings.get("session_folder_format") or "%Y-%m-%d_%H-%M-%S")
-        return name.replace(os.sep, "_") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        return (name.replace(os.sep, "_") or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")) + "_Recording"
 
-    def _create_h5_file(self, demo_name):
+    def _create_h5_file(self, demo_name, mode="w-"):
         """Create the H5 file of a demo in the current session folder. A session folder is reused only while it is still
         inside the recordings folder: after a change in Settings the next demo opens a new session there."""
         try:
@@ -596,7 +594,8 @@ class DataRecorder(Node):
 
             self.recorded_data_dir = output_dir
             self.h5_file_path = os.path.join(str(output_dir), f"{demo_name}.h5")
-            self.h5_file = h5py.File(self.h5_file_path, "w", libver="latest")
+            # "w-": never overwrite a demo already there (the demo counter restarts in every process)
+            self.h5_file = h5py.File(self.h5_file_path, mode, libver="latest")
             logger.info(f"Created H5 file: {self.h5_file_path}")
         except Exception as e:
             logger.error(f"Failed to create H5 file: {e}")
@@ -654,24 +653,6 @@ class DataRecorder(Node):
                         self._fill_defaults[container_id] = default_val
         return fill_set
 
-    def _forward_fill(self, data_list):
-        """Hold-last-value forward-fill: replace None with the most recent valid entry.
-
-        Leading Nones that have no prior value are left as-is (handled upstream by
-        seeding _last_valid_raw before the recording loop starts).
-        Returns the original list unchanged when all entries are None.
-        """
-        if not any(item is not None for item in data_list):
-            return data_list
-        filled = list(data_list)
-        last_valid = None
-        for i, item in enumerate(filled):
-            if item is not None:
-                last_valid = item
-            elif last_valid is not None:
-                filled[i] = last_valid
-        return filled
-
     def _save_recorded_data(self):
         try:
             if not self.h5_file:
@@ -709,7 +690,7 @@ class DataRecorder(Node):
                 non_null_raw = sum(1 for d in data_list if d is not None)
 
                 if container_id in self._fill_gaps_containers:
-                    filled_list = self._forward_fill(data_list)
+                    filled_list = fill_none_gaps(data_list)
                     fill_count = sum(
                         1 for a, b in zip(data_list, filled_list)
                         if a is None and b is not None
@@ -772,13 +753,13 @@ class DataRecorder(Node):
         if not lengths:
             return
         if len(lengths) == 1:
-            first_len = len(series[0]) if series[0] else 1
+            first_len = next(iter(lengths))
             group.create_dataset(
                 dataset_name, data=np.array([row if row else [0.0] * first_len for row in series])
             )
         else:
             logger.warning(f"{dataset_name} have inconsistent lengths, saving as variable-length")
-            rows = [np.array(row, dtype=np.float64) for row in series if row]
+            rows = [np.array(row, dtype=np.float64) for row in series]  # empty rows too: one row per timestamp
             group.create_dataset(dataset_name, data=rows, dtype=h5py.vlen_dtype(np.float64))
 
     def _save_data_type_to_h5_safe(self, group, data_type, data_list):
@@ -962,9 +943,10 @@ class DataRecorder(Node):
                 if isinstance(value, (int, float, str, bool)):
                     metadata_group.attrs[key] = value
                 else:
-                    metadata_group.attrs[key] = json.dumps(value) if value else ""
+                    metadata_group.attrs[key] = json.dumps(value, default=str) if value else ""  # e.g. a YAML date
 
             logger.info("Saved metadata to H5 file")
 
         except Exception as e:
             logger.error(f"Error saving metadata: {e}")
+            raise

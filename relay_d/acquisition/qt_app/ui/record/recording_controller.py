@@ -6,6 +6,7 @@ from relay_d.utils.coloring_logger import logger
 from relay_d.utils.tf_topic import TfTopicSubscriptionError
 
 from ..review.demo_validator import CheckStatus
+from ...utils.background import run_in_background
 from ...utils.custom_message_box import CustomMessageBox
 
 
@@ -37,8 +38,9 @@ class RecordingController:
         self.container_manager = container_manager
         self._demo_validator = demo_validator
 
-        self.is_recording = False  # stays True while paused
+        self.is_recording = False  # stays True while paused, and while the demo is being saved
         self.is_paused = False
+        self.is_saving = False  # Stop was pressed; the save runs in a background thread
         self.recording_start_time = None
         self.config_loaded = False
 
@@ -65,9 +67,9 @@ class RecordingController:
     def update_buttons(self):
         """Enable/label the buttons from the current state."""
         self.ui.btn_start_record.setEnabled(self.config_loaded and not self.is_recording)
-        self.ui.btn_pause_record.setEnabled(self.is_recording)
+        self.ui.btn_pause_record.setEnabled(self.is_recording and not self.is_saving)
         self.ui.btn_pause_record.setText("Resume" if self.is_paused else "Pause")
-        self.ui.btn_stop_record.setEnabled(self.is_recording)
+        self.ui.btn_stop_record.setEnabled(self.is_recording and not self.is_saving)
 
     def set_config_loaded(self, loaded: bool):
         """A config was loaded (Start becomes available) or cleared."""
@@ -118,10 +120,12 @@ class RecordingController:
 
             # Start recording with DataRecorder
             dataset_name = self.yaml_parser.get_dataset_name()
-            demo_name = f"{dataset_name}_{int(time.time())}"
+            demo_name = f"{dataset_name}_{time.time_ns() // 1_000_000}"  # ms: two Starts in one second must not clash ("w-")
             success = self.data_recorder.start_recording(
                 self.topic_subscribers, demo_name
             )
+            if self.data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
+                self.session_h5_files.append(self.data_recorder.retried_file)
 
             if success:
                 CustomMessageBox.info(
@@ -213,15 +217,29 @@ class RecordingController:
             return False
 
     def stop_recording(self):
-        """Stop recording process"""
+        """Stop button: start saving the demo. True if the save was started.
+
+        Writing a few GB of frames takes seconds to minutes: on the GUI thread the window would freeze (and the ROS
+        spin timer stop), so the save runs in the background and ``_on_stopped`` finishes the job.
+        """
+        if not self.is_recording or self.is_saving:
+            logger.warning("No recording in progress" if not self.is_recording else "The recording is already being saved")
+            return False
+        self._buffer_timer.stop()
+        self.is_saving = True
+        self.update_buttons()
+        logger.info("Saving the recording...")
+        run_in_background(self.ui.btn_stop_record, self.data_recorder.stop_recording, self._on_stopped)
+        return True
+
+    def _on_stopped(self, success, error):
+        """GUI thread, after DataRecorder.stop_recording ended: update the session and the UI."""
+        self.is_saving = False
+        self.update_buttons()
+        if error is not None:
+            logger.error(f"Error stopping recording: {error}")
+            success = False
         try:
-            if not self.is_recording:
-                logger.warning("No recording in progress")
-                return False
-
-            self._buffer_timer.stop()
-            success = self.data_recorder.stop_recording()
-
             if success:
                 self.is_recording = False
                 self.is_paused = False

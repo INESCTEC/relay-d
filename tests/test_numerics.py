@@ -90,11 +90,17 @@ def test_split_mask_normal_and_few_demos(converter):
     assert ok and sizes["train"] >= 1  # int(2 * 0.8) would be 1 here, int(1 * 0.8) would be 0
 
 
+def test_split_mask_without_test_split_trains_on_the_leftovers(converter):
+    assert _mask(converter, 10, 0.8, 0.1, 0.0) == (True, {"train": 9, "valid": 1})  # was 8 / 1 / 1 unused "eval"
+    assert _mask(converter, 100, 0.29, 0.71, 0.0)[1] == {"train": 29, "valid": 71}  # int(100 * 0.29) is 28
+
+
 def test_split_mask_rejects_bad_fractions(converter):
     assert _mask(converter, 10, 0.9, 0.2, 0.0)[0] is False
     assert "more than 1" in converter.last_error
     assert _mask(converter, 10, -0.1, 0.1, 0.1)[0] is False
     assert _mask(converter, 10, "0.8", 0.1, 0.1)[0] is False
+    assert _mask(converter, 10, 0.0, 0.5, 0.5)[0] is False  # no train mask: robomimic could not start
 
 
 def test_generate_actions_fails_on_missing_key():
@@ -116,3 +122,48 @@ def test_zero_quaternion_in_an_rpy_stream_fails_instead_of_writing_nan():
     assert np.allclose(_quat_to_rpy(good, "eef"), [[0, 0, 0], [0, 0, np.pi / 2]], atol=1e-6)
     with pytest.raises(ValueError, match=r"stream 'eef' has 1 row"):
         _quat_to_rpy(np.array([[0, 0, 0, 1.0], [0, 0, 0, 0.0]], dtype=np.float32), "eef")
+
+
+def test_action_is_the_next_step_target():
+    from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import _action_part
+
+    x = np.array([[0.0], [1.0], [3.0]], dtype=np.float32)
+    raw = {"q": ["j.position[:]"]}
+    # absolute: value at t+1 (the value at t is where the robot already is); the last step holds
+    assert _action_part(x, "q", raw, []).ravel().tolist() == [1.0, 3.0, 3.0]
+    # delta: change from t to t+1; the last step is zero
+    assert _action_part(x, "q", raw, ["q"]).ravel().tolist() == [1.0, 2.0, 0.0]
+    norm = {"q": {"specs": ["j.position[:]"], "normalize": True, "limits": [{"lower_lim": 0.0, "upper_lim": 4.0}]}}
+    assert _action_part(x, "q", norm, []).ravel().tolist() == [-0.5, 0.5, 0.5]
+    with pytest.raises(ValueError, match="delta_actions"):  # a normalized delta cannot be denormalized at run time
+        _action_part(x, "q", norm, ["q"])
+
+
+def test_generate_actions_fails_on_a_length_mismatch_instead_of_stretching():
+    cfg = {"actions_to_extract": ["q"], "output": {"q": "robot/joint_positions"}}
+    with h5py.File("b.h5", "w", driver="core", backing_store=False) as f:
+        f.create_dataset("robot/joint_positions", data=np.ones((4, 2), dtype=np.float32))
+        with pytest.raises(ValueError, match="4 rows"):
+            DataTransformEngine(cfg).generate_actions(f, {}, 5)
+
+
+def test_generate_actions_does_not_guess_another_group_with_the_same_field():
+    cfg = {"actions_to_extract": ["q"], "output": {"q": "arm/joint_positions"}}
+    with h5py.File("c.h5", "w", driver="core", backing_store=False) as f:
+        f.create_dataset("gripper/joint_positions", data=np.ones((5, 1), dtype=np.float32))
+        with pytest.raises(ValueError, match="not found in data"):  # was: silently used the gripper
+            DataTransformEngine(cfg).generate_actions(f, {}, 5)
+
+
+def test_split_mask_sorts_demo_numbers_naturally(converter):
+    with h5py.File("d.h5", "w", driver="core", backing_store=False) as f:
+        assert converter._create_data_mask(f.create_group("mask"), [f"demo_{i}" for i in range(11)], 0.9, 0.1, 0.0)
+        assert [n.decode() for n in f["mask/valid"][:]] == ["demo_10"]  # the last demo, not demo_9
+
+
+def test_median_rate_ignores_a_pause_and_needs_two_samples():
+    from relay_d.utils.numerics import median_rate
+
+    ts = [0, 50e6, 100e6, 150e6, 2_150e6, 2_200e6]  # 20 Hz with a 2 s pause in the middle
+    assert median_rate(ts) == pytest.approx(20.0)
+    assert median_rate([5]) is None and median_rate([]) is None

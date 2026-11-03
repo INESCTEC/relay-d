@@ -92,3 +92,16 @@ def read_scalar(getter, msg, math_op) -> float:
     """
     v = float(np.asarray(getter(msg)).reshape(-1)[0])
     return float(math_op(v)) if math_op is not None else v
+
+
+def median_rate(timestamps_ns) -> Optional[float]:
+    """Sampling rate (Hz) of a recording from its per-sample timestamps in nanoseconds: 1 / median step.
+
+    The median ignores a pause or an occasional late tick. None with fewer than two increasing samples.
+    """
+    steps = np.diff(np.asarray(timestamps_ns, dtype=np.float64))
+    steps = steps[steps > 0]
+    return 1e9 / float(np.median(steps)) if steps.size else None
+
+
+RATE_TOLERANCE = 0.10  # a recording more than 10% off its configured rate has the wrong time base for training

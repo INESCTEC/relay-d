@@ -38,8 +38,9 @@ def main():
     parser.add_argument("--obs-config",    required=True,  help="Path to obs_config.yaml")
     parser.add_argument("--action-config", required=True,  help="Path to action_config.yaml")
     parser.add_argument("--device",        default=user_settings.get("infer_device"),  help="Torch device: cpu | cuda (default: the infer_device setting)")
-    parser.add_argument("--hz",            type=float, default=user_settings.get("infer_hz"),
-                        help="Max inference rate in Hz (0 = as fast as possible; default: the infer_hz setting)")
+    parser.add_argument("--hz",            type=float, default=None,
+                        help="Control rate in Hz (0 = as fast as possible). Default: the rate the policy was trained at "
+                             "(a LeRobot dataset's fps), else the infer_hz setting")
     parser.add_argument("--max-obs-age",   type=float, default=user_settings.get("infer_max_obs_age_s"),
                         help="Skip dispatching while any input is older than this many seconds (default: the infer_max_obs_age_s setting)")
     parser.add_argument("--obs-wait",      type=float, default=user_settings.get("infer_obs_wait_s"),
@@ -50,6 +51,9 @@ def main():
     parser.add_argument("--state-keys",    default=None,
                         help="lerobot only: comma-separated observations that form observation.state, in order. "
                              "Default: read from the dataset the policy was trained on")
+    parser.add_argument("--task",          default=None,
+                        help="lerobot only: the instruction a language-conditioned policy (SmolVLA) follows. "
+                             "Default: the task of the dataset the policy was trained on")
     args = parser.parse_args()
 
     try:  # the package of the backend may live in another environment (the one built by the Train tab)
@@ -67,9 +71,12 @@ def main():
         device=args.device,
         backend=args.backend,
         state_keys=state_keys,
+        task=args.task,
     )
+    # Each predicted action is one step of the training data: at another rate the robot moves faster or slower than shown.
+    hz = args.hz if args.hz is not None else (getattr(session.model, "fps", None) or user_settings.get("infer_hz"))
     try:
-        session.run(hz=args.hz, validate_timeout=args.obs_wait, max_obs_age=args.max_obs_age)
+        session.run(hz=hz, validate_timeout=args.obs_wait, max_obs_age=args.max_obs_age)
     finally:
         session.close()
 
