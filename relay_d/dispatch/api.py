@@ -46,7 +46,7 @@ from relay_d.utils.coloring_logger import logger
 # importable in environments without ROS2.
 try:
     import rclpy
-    from rclpy.executors import MultiThreadedExecutor
+    from rclpy.executors import SingleThreadedExecutor
 
     from .action_dispatcher import ActionDispatcher
     from .obs_builder import ObsBuilder
@@ -54,7 +54,7 @@ try:
     _ROS_IMPORT_ERROR = None
 except ImportError as _e:
     rclpy = None
-    MultiThreadedExecutor = None
+    SingleThreadedExecutor = None
     ActionDispatcher = None
     ObsBuilder = None
     _ROS_IMPORT_ERROR = _e
@@ -156,7 +156,9 @@ class InferenceSession:
         self._check_action_layout()
         self._was_stale = False  # after stale inputs the policy restarts: no queued actions or frames from before the gap
 
-        self._executor = MultiThreadedExecutor()
+        # Single-threaded, as the recorder: rclpy's MultiThreadedExecutor could not keep up with 3 cameras at 20 Hz next to
+        # the inference loop (inputs went stale, ~6 Hz of commands). The ack waits run on the inference thread, not in callbacks.
+        self._executor = SingleThreadedExecutor()
         self._executor.add_node(self.obs_node)
         self._spin_thread = None
 

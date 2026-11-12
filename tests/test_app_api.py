@@ -157,3 +157,16 @@ def test_the_after_recording_check_is_logged(caplog):
         relay_logger.removeHandler(caplog.handler)
     lines = [(r.levelname, r.getMessage()) for r in caplog.records if "Demo check" in r.getMessage()]
     assert lines == [("WARNING", "Demo check [WARN] rate: 9.1 Hz"), ("ERROR", "Demo check [FAIL] samples: no samples")]
+
+
+def test_delete_demo_removes_the_file_and_drops_it_from_the_session(tmp_path):
+    api = _recording_api()
+    kept, rejected = tmp_path / "stack_1.h5", tmp_path / "stack_2.h5"
+    kept.write_bytes(b"x")
+    rejected.write_bytes(b"x")
+    api._session_h5_files = [str(kept), str(rejected)]
+    assert api.delete_demo(str(rejected))
+    assert not rejected.exists() and kept.exists()
+    assert api._session_h5_files == [str(kept)]  # shutdown() no longer converts a missing file
+    assert api.delete_demo(str(rejected)) is False  # already gone: nothing changes
+    assert api._session_h5_files == [str(kept)]

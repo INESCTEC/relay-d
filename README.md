@@ -161,7 +161,7 @@ On the **Config** page, the **Build from ROS** tab writes `acquisition_config.ya
 4. **Actions**: tick the streams that form the action, in order, with optional delta.  5. **Recording**: name, frequency, buffer, sync.
 6. **Review**: the YAML, the problems found (errors block saving) and **Save and use now**, which loads it like any hand-written file. **Edit loaded config** brings an existing file back into the builder.
 
-The headless `AppAPI`, `relay-d-convert` and the other tools still take a ready-made config file. The train / validation split and the LeRobot options (task, robot type, video settings) stay in `postprocess_config.yaml`; the robomimic policy is chosen on the Train tab.
+The headless `AppAPI`, `relay-d-convert` and the other tools still take a ready-made config file. `AppAPI.delete_demo(path)` rejects a recorded demo like Review > Delete / Reject Demo (file deleted, left out of the session's conversion). The train / validation split and the LeRobot options (task, robot type, video settings) stay in `postprocess_config.yaml`; the robomimic policy is chosen on the Train tab.
 
 ### Converting recordings without the GUI
 

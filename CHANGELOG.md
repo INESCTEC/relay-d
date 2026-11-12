@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **New folder names:** recording sessions end in `_Recording`, Post-process outputs in `_Robomimic` / `_Lerobot`. Existing folders keep their names.
 
 ### Added
+- **Review shows everything that was recorded.**
+  - **Images:** every camera of the demo is shown side by side (raw or compressed), each in its own card titled with its name and resolution. The frame fills the card, keeps its aspect ratio and rescales with the window. One slider drives them all, with the frame number and the time since the start. Before, only the first camera was shown.
+  - **Every other recorded dataset gets its own channel too:**
+    - raw input data (e.g. `joint_states/joint_positions`, with the joint names as legend), `timestamps` and `timestamp_spreads` are plotted;
+    - messages stored as JSON (types without their own encoder, e.g. `std_msgs/Float64MultiArray`) are decoded: their numeric fields are plotted over the demo, and the sample you pick is shown as indented JSON, with readable field names and number lists on one line;
+    - the cursor of these plots follows the picked sample.
+- **`AppAPI.delete_demo(path)`** deletes a recorded demo and drops it from the session, like the GUI's Review > Delete / Reject Demo (same `delete_demo_file()`). A script can now reject a bad demo (e.g. a failed scripted run) without `shutdown()` then converting a missing file.
 - **SmolVLA**, a third LeRobot policy (Train tab, `relay-d-train --policy smolvla`). It is a 450M vision-language-action model fine-tuned from the pretrained `lerobot/smolvla_base` (`--policy.path`, downloaded once), not trained from scratch,
   and it follows the dataset's task sentence. The dataset's cameras (at most 3) are renamed to the model's `camera1..3` with `--rename_map`, which LeRobot keeps in the checkpoint. "Set up lerobot environment" installs
   `lerobot[smolvla]` (`transformers`, `num2words`). Measured on an RTX 4060 Laptop (8 GB): the fine-tune peaks at about 4.2 GB with the default batch size, and inference needs under 1 GB.
@@ -58,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The app logo is a small PNG (11 KB instead of 3.9 MB), so `resources_rc.py` shrinks by about 250k lines; duplicate icon entries are removed from `resources.qrc`.
 
 ### Fixed
+- **robomimic environment had no OpenCV:** `lfd-inference-node` re-executes into it with Relay-D on `PYTHONPATH` but not Relay-D's dependencies, so every camera frame failed (`No module named 'cv2'`). "Set up robomimic environment" now installs `opencv-python-headless` and checks `import cv2`; press it again to update an existing environment.
+- **`lfd-inference-node` kept its rate with several cameras:** the node spun its inputs with rclpy's `MultiThreadedExecutor`, which could not keep up with 3 cameras + 4 other inputs at 20 Hz next to the inference loop: inputs went stale for seconds and only ~6 commands/s were sent. It now spins with a `SingleThreadedExecutor`, like the recorder (measured 19.95 Hz, no stale input).
+- **`relay-d-train --folder` with a relative path** failed at once (`FileNotFoundError` for `robomimic_config.json`): `run.sh` changes to the run folder, where the relative dataset and config paths no longer resolve. Dataset paths are now made absolute.
 - **Conversion no longer guesses:** a configured path that is missing is not replaced by the first group with the same field name (an arm path could read the gripper), and a dataset whose length differs from the demo's timestamps
   fails that demo instead of being stretched. The train/validation masks sort demos by number (`demo_2` before `demo_10`).
 - **`AppAPI.shutdown()`** keeps everything running and returns False when the last recording could not be saved (it was only in memory and got lost); True otherwise. Closing the GUI with an unsaved demo retries the save and asks

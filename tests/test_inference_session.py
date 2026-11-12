@@ -217,11 +217,13 @@ def test_device_defaults_to_the_infer_device_setting(monkeypatch):
     monkeypatch.setattr(api, "ObsBuilder", lambda cfg: SimpleNamespace(low_dim_obs_names=[],
                                                                        get_logger=lambda: SimpleNamespace(info=print)))
     monkeypatch.setattr(api, "ActionDispatcher", lambda *a, **k: SimpleNamespace(_action_configs={}))
-    monkeypatch.setattr(api, "MultiThreadedExecutor", lambda: SimpleNamespace(add_node=lambda n: None))
+    executors = []
+    monkeypatch.setattr(api, "SingleThreadedExecutor", lambda: executors.append(1) or SimpleNamespace(add_node=lambda n: None))
     monkeypatch.setattr(lr, "LeRobotPolicyRunner", lambda ckpt, device, **k: devices.append(device) or SimpleNamespace())
     InferenceSession("m", "o.yaml", "a.yaml", backend="lerobot")
     InferenceSession("m", "o.yaml", "a.yaml", device="cpu", backend="lerobot")
     assert devices == ["cuda:7", "cpu"]  # the API runs where the CLI and the Run tab run
+    assert len(executors) == 2  # single-threaded spin: the multi-threaded one dropped to ~6 Hz with 3 cameras
 
 
 def test_node_passes_its_rate_through_and_exits_1_on_a_model_error(monkeypatch):

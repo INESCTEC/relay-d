@@ -64,6 +64,15 @@ def test_find_datasets_in_a_folder_or_directly(folder):
     assert launcher.find_datasets(folder / "raw_recording.h5") == []
 
 
+def test_a_relative_folder_gives_absolute_paths(folder, monkeypatch):
+    # run.sh cd's into the run folder before training: a relative dataset path would no longer resolve there
+    monkeypatch.chdir(folder.parent)
+    found = launcher.find_datasets(folder.name)
+    assert found and all(d.path.is_absolute() for d in found)
+    cmd = launcher.build_command(TrainJob(_robomimic(folder.name)), launcher.new_run_dir(found[0].base, ROBOMIMIC), write=False)
+    assert all(os.path.isabs(a) for a in cmd[cmd.index("--config") + 1:cmd.index("--name")] if a != "--dataset")
+
+
 def _robomimic(folder):
     return next(d for d in launcher.find_datasets(folder) if d.format == ROBOMIMIC)
 

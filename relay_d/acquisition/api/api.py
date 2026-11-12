@@ -16,6 +16,7 @@ from ..qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigL
 from ..qt_app.ui.postprocess.offline_config import load_conversion_config, write_dataset_files
 from ..qt_app.ui.postprocess.postprocess_options import dataset_output_paths
 from ..qt_app.ui.review.demo_validator import CheckStatus, DemoValidator
+from ..qt_app.utils.demo_file_ops import delete_demo_file
 from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 
@@ -120,6 +121,13 @@ class AppAPI:
             except Exception as e:
                 logger.error(f"Error validating recording: {e}")
         return result
+
+    def delete_demo(self, file_path: str) -> bool:
+        """Delete a recorded demo and drop it from this session, like the GUI's Review > Delete / Reject Demo."""
+        if not delete_demo_file(file_path):
+            return False
+        self._session_h5_files = [p for p in self._session_h5_files if p != file_path]
+        return True
 
     def _load_conversion_config(self, config_path: Optional[str], options_path: Optional[str]) -> None:
         """The converter, with the config and format options of relay-d-convert (options: ``options_path``, else a

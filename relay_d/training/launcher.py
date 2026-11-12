@@ -137,9 +137,9 @@ def find_datasets(path) -> List[DatasetInfo]:
     """Training datasets at ``path``, newest first.
 
     ``path`` can be the dataset itself (a robomimic ``.h5`` or a LeRobot folder) or the folder the
-    Post-process page / ``relay-d-convert`` wrote it to.
+    Post-process page / ``relay-d-convert`` wrote it to. Paths are made absolute: the run script works in the run folder.
     """
-    path = Path(path)
+    path = Path(path).resolve()
     candidates = [path] if (path.is_file() or (path / "meta" / "info.json").exists()) else sorted(path.iterdir()) if path.is_dir() else []
     found = []
     for item in candidates:
