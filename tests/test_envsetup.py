@@ -30,6 +30,7 @@ def test_package_lists_differ_per_format(tmp_path):
     assert f"git+https://github.com/ARISE-Initiative/robomimic.git@{envsetup.ROBOMIMIC_COMMIT}" in robomimic
     assert "--no-deps" in robomimic and "diffusers==0.11.1" in robomimic and "torch torchvision" in robomimic
     assert "import robomimic.scripts.train" in robomimic
+    assert " six " in robomimic and " packaging " in robomimic  # imported by robomimic but not in its requirements
     assert "opencv-python-headless" in robomimic and "cv2" in robomimic  # inference decodes camera frames there
 
 

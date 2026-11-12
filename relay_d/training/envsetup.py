@@ -26,9 +26,10 @@ _STALE_SECONDS = 900
 LEROBOT_VERSION = "0.6.1"
 
 # robomimic: the source checkout version the code is tested with (PyPI stops at 0.3.0; diffusion_policy needs master).
-# Installed with --no-deps: its pins (egl_probe, which only robosuite environments import) are replaced by the list below.
+# Installed with --no-deps: its pins (egl_probe, which only robosuite environments import) are replaced by the list below,
+# plus what it imports without declaring it (six: config/base_config.py; packaging: algo/diffusion_policy.py).
 ROBOMIMIC_COMMIT = "e10526b9a40c78b41f1e37e60041dc0ec0a5f60f"
-_ROBOMIMIC_DEPS = ("numpy", "h5py", "psutil", "tqdm", "termcolor", "tensorboard", "tensorboardX", "imageio", "imageio-ffmpeg",
+_ROBOMIMIC_DEPS = ("numpy", "six", "packaging", "h5py", "psutil", "tqdm", "termcolor", "tensorboard", "tensorboardX", "imageio", "imageio-ffmpeg",
                    "matplotlib", "huggingface_hub==0.23.4", "transformers==4.41.2", "diffusers==0.11.1",
                    "opencv-python-headless>=4.8.0,<4.13")  # cv2: lfd-inference-node decodes camera frames in this environment
 

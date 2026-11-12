@@ -65,6 +65,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The app logo is a small PNG (11 KB instead of 3.9 MB), so `resources_rc.py` shrinks by about 250k lines; duplicate icon entries are removed from `resources.qrc`.
 
 ### Fixed
+- **robomimic environment:** the setup now installs `six` and `packaging`, which robomimic imports without declaring them; on a fresh machine the environment failed its check with `No module named 'six'`. Press **Set up robomimic environment** again.
 - **robomimic environment had no OpenCV:** `lfd-inference-node` re-executes into it with Relay-D on `PYTHONPATH` but not Relay-D's dependencies, so every camera frame failed (`No module named 'cv2'`). "Set up robomimic environment" now installs `opencv-python-headless` and checks `import cv2`; press it again to update an existing environment.
 - **`lfd-inference-node` kept its rate with several cameras:** the node spun its inputs with rclpy's `MultiThreadedExecutor`, which could not keep up with 3 cameras + 4 other inputs at 20 Hz next to the inference loop: inputs went stale for seconds and only ~6 commands/s were sent. It now spins with a `SingleThreadedExecutor`, like the recorder (measured 19.95 Hz, no stale input).
 - **`relay-d-train --folder` with a relative path** failed at once (`FileNotFoundError` for `robomimic_config.json`): `run.sh` changes to the run folder, where the relative dataset and config paths no longer resolve. Dataset paths are now made absolute.
