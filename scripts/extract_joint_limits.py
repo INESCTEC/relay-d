@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
 Extract joint position, velocity, and effort limits from a URDF robot description
-and print them as ready-to-paste YAML blocks for acquisition_config.yaml.
+and print them as ready-to-paste `limits:` blocks for action_config.yaml entries.
+
+The dispatcher clamps each model output value to [lower_lim, upper_lim] before sending it,
+so these are real units (rad, m, rad/s, N·m), the same units the model outputs.
+Relay-D does not normalize: robomimic and LeRobot normalize with the dataset's stats.
 
 Usage
 -----
@@ -11,26 +15,20 @@ From a URDF file:
 From the live ROS 2 parameter server (robot_state_publisher must be running):
   python3 scripts/extract_joint_limits.py --ros2
 
-Filter / reorder joints (must match the joint_names order in acquisition_config.yaml):
+Filter / reorder joints (must match the order of the entry's indices):
   python3 scripts/extract_joint_limits.py --urdf robot.urdf \\
       --joints iiwa_joint_1 iiwa_joint_2 iiwa_joint_3 \\
                iiwa_joint_4 iiwa_joint_5 iiwa_joint_6 iiwa_joint_7
 
-Change the output stream-name prefix (default: robot0):
+Change the output entry-name prefix (default: robot0):
   python3 scripts/extract_joint_limits.py --urdf robot.urdf --prefix robot0
-
-Change the input name used in the spec (default: joint_1):
-  python3 scripts/extract_joint_limits.py --urdf robot.urdf --input-name joint_1
 """
 
 import argparse
 import subprocess
 import sys
 
-try:
-    import xmltodict
-except ImportError:
-    sys.exit("ERROR: xmltodict is required.  Install with: pip install xmltodict")
+from relay_d.acquisition.qt_app.ui.config.builder.urdf_limits import parse_joint_limits as _parse
 
 
 # ---------------------------------------------------------------------------
@@ -85,54 +83,14 @@ def _load_from_ros2(node_name: str = "robot_state_publisher",
 # ---------------------------------------------------------------------------
 
 def parse_joint_limits(xml_string: str, joint_filter: list | None = None) -> list:
-    """
-    Parse a URDF XML string and return a list of dicts for each
-    revolute / prismatic joint, in URDF document order (or joint_filter order).
-
-    Each dict:
-      name     : str
-      type     : str   ('revolute' | 'prismatic')
-      lower    : float  position lower limit (rad or m)
-      upper    : float  position upper limit
-      velocity : float  max velocity (always positive)
-      effort   : float  max effort (always positive)
-    """
+    """Same as the library function, but exits with a message on a bad URDF and warns about unknown joints."""
     try:
-        robot = xmltodict.parse(xml_string)["robot"]
-    except (KeyError, Exception) as exc:
-        sys.exit(f"ERROR: failed to parse URDF XML: {exc}")
-
-    raw_joints = robot.get("joint", [])
-    if not isinstance(raw_joints, list):
-        raw_joints = [raw_joints]
-
-    # Build name → data map
-    joint_map: dict = {}
-    for j in raw_joints:
-        jtype = j.get("@type", "")
-        if jtype not in ("revolute", "prismatic"):
-            continue
-        name = j.get("@name", "")
-        lim = j.get("limit", {}) or {}
-        joint_map[name] = {
-            "name": name,
-            "type": jtype,
-            "lower":    float(lim.get("@lower",    0.0)),
-            "upper":    float(lim.get("@upper",    0.0)),
-            "velocity": float(lim.get("@velocity", 0.0)),
-            "effort":   float(lim.get("@effort",   0.0)),
-        }
-
-    if joint_filter:
-        result = []
-        for jname in joint_filter:
-            if jname not in joint_map:
-                print(f"WARNING: joint '{jname}' not found in URDF (skipped)", file=sys.stderr)
-            else:
-                result.append(joint_map[jname])
-        return result
-
-    return list(joint_map.values())
+        joints = _parse(xml_string, joint_filter)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
+    for name in set(joint_filter or []) - {j["name"] for j in joints}:
+        print(f"WARNING: joint '{name}' not found in URDF (skipped)", file=sys.stderr)
+    return joints
 
 
 # ---------------------------------------------------------------------------
@@ -144,21 +102,18 @@ def _fmt(value: float) -> str:
     return f"{value:8.4f}"
 
 
-def _limits_block(stream_name: str, spec: str, joints: list,
+def _limits_block(entry_name: str, joints: list,
                   lo_key: str, hi_key: str, symmetric: bool) -> str:
     """
-    Produce one YAML dict-form stream block.
+    Produce one action_config.yaml entry with its `limits:` clamp (add indices and a dispatch method).
 
     symmetric=True  → lower_lim = -value, upper_lim = +value  (vel / eff)
     symmetric=False → lower_lim = joint[lo_key], upper_lim = joint[hi_key]  (pos)
     """
     lines = [
-        f"      {stream_name}:",
-        f"        specs:",
-        f"          - {spec}",
-        f"        normalize: true",
-        f"        normalized_range: [-1.0, 1.0]",
-        f"        limits:",
+        f"  {entry_name}:",
+        f"    indices: [{', '.join(str(i) for i in range(len(joints)))}]   # positions in the model output",
+        f"    limits:   # clamp, real units",
     ]
     for j in joints:
         if symmetric:
@@ -169,40 +124,37 @@ def _limits_block(stream_name: str, spec: str, joints: list,
             lo = j[lo_key]
             hi = j[hi_key]
         lines.append(
-            f"          - {{lower_lim: {_fmt(lo)}, upper_lim: {_fmt(hi)}}}"
+            f"      - {{lower_lim: {_fmt(lo)}, upper_lim: {_fmt(hi)}}}"
             f"   # {j['name']}  ({j['type']})"
         )
     return "\n".join(lines)
 
 
-def print_yaml_blocks(joints: list, prefix: str, input_name: str) -> None:
+def print_yaml_blocks(joints: list, prefix: str) -> None:
     if not joints:
         sys.exit("ERROR: no matching revolute/prismatic joints found.")
 
     pos_block = _limits_block(
         f"{prefix}_joint_pos",
-        f"{input_name}.position[:]",
         joints,
         lo_key="lower", hi_key="upper",
         symmetric=False,
     )
     vel_block = _limits_block(
         f"{prefix}_joint_vel",
-        f"{input_name}.velocity[:]",
         joints,
         lo_key=None, hi_key="velocity",
         symmetric=True,
     )
     eff_block = _limits_block(
         f"{prefix}_joint_eff",
-        f"{input_name}.effort[:]",
         joints,
         lo_key=None, hi_key="effort",
         symmetric=True,
     )
 
     separator = "\n"
-    print("# ── paste into acquisition_config.yaml → output.streams ──────────────────\n")
+    print("# ── paste the limits you need into action_config.yaml entries (clamp, real units) ──\n")
     print(pos_block)
     print(separator)
     print(vel_block)
@@ -234,18 +186,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--joints", nargs="+", metavar="JOINT_NAME",
         help="Filter and order output to these joint names "
-             "(must match joint_names in acquisition_config.yaml). "
+             "(must match the order of the action_config entry's indices). "
              "Defaults to all revolute/prismatic joints in URDF order.",
     )
     p.add_argument(
         "--prefix", default="robot0", metavar="PREFIX",
-        help="Stream-name prefix (default: robot0). "
+        help="Entry-name prefix (default: robot0). "
              "Produces <PREFIX>_joint_pos, <PREFIX>_joint_vel, <PREFIX>_joint_eff.",
-    )
-    p.add_argument(
-        "--input-name", default="joint_1", metavar="NAME",
-        help="Input source name used in the spec string "
-             "(default: joint_1, matching acquisition_config.yaml).",
     )
     p.add_argument(
         "--node-name", default="robot_state_publisher", metavar="NODE",
@@ -264,7 +211,7 @@ def main() -> None:
         xml_string = _load_from_file(args.urdf)
 
     joints = parse_joint_limits(xml_string, joint_filter=args.joints)
-    print_yaml_blocks(joints, prefix=args.prefix, input_name=args.input_name)
+    print_yaml_blocks(joints, prefix=args.prefix)
 
 
 if __name__ == "__main__":

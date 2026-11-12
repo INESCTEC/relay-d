@@ -84,17 +84,30 @@ def cv2_to_imgmsg(arr, encoding: str = "bgr8"):
     return msg
 
 
+_no_bgr8_warned = set()  # (encoding, frame_id) already warned about: once per camera, not once per frame
+
+
 def decode_image(img_msg, is_depth: bool = False):
     """Decode a sensor_msgs/Image into an (H, W, C) or (H, W) numpy array.
 
     `is_depth` selects "passthrough" mode instead of "bgr8" so the native depth
     encoding (typically 32FC1 float meters or 16UC1 uint16 millimeters) is
-    preserved instead of being reinterpreted as color.
+    preserved instead of being reinterpreted as color. An encoding with no bgr8
+    conversion (16UC1, 32FC1, mono16, 8UC3, rgb16, ...) is also kept as decoded.
 
     Returns None on decode failure.
     """
     try:
-        return imgmsg_to_cv2(img_msg, "passthrough" if is_depth else "bgr8")
+        if is_depth or img_msg.encoding not in _ENCODINGS:
+            return imgmsg_to_cv2(img_msg, "passthrough")  # an unknown encoding raises here
+        try:
+            return imgmsg_to_cv2(img_msg, "bgr8")
+        except ValueError as e:
+            key = (img_msg.encoding, getattr(getattr(img_msg, "header", None), "frame_id", ""))
+            if key not in _no_bgr8_warned:
+                _no_bgr8_warned.add(key)
+                logger.warning(f"{e}: keeping '{img_msg.encoding}' images as decoded (frame '{key[1]}')")
+            return imgmsg_to_cv2(img_msg, "passthrough")
     except Exception as e:
         logger.error(f"Error decoding image message: {e}")
         return None

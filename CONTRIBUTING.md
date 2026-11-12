@@ -37,7 +37,7 @@ including the optional `robomimic` extra.
 
 1. **Open an issue first** for anything beyond a trivial fix, so the approach
    can be discussed before you invest time in an implementation.
-2. **Create a branch** off `master` named descriptively, e.g.
+2. **Create a branch** off `main` named descriptively, e.g.
    `fix/postprocess-page-crash` or `feat/add-force-topic-support`.
 3. **Keep commits focused** — one logical change per commit, with a clear
    commit message describing *why*, not just *what*.
@@ -64,14 +64,14 @@ with `pyrcc5` the same way.
 
 ## Submitting a pull request
 
-- Rebase on the latest `master` before opening the PR.
+- Rebase on the latest `main` before opening the PR.
 - Describe **what** changed and **why** in the PR description; link the
   related issue if one exists.
-- Note any manual testing you did — this project currently has no automated
-  test suite exercising the ROS 2-dependent code paths (CI only does a
-  dependency-installable-subset build/lint check), so a clear description of
-  how you validated the change (e.g. "ran `RelayDApp`, recorded a demo,
-  converted it") is genuinely useful to reviewers.
+- Note any manual testing you did. CI runs the unit tests twice: on a plain
+  runner, and inside the `ros:jazzy` image so the rclpy-dependent tests run too.
+  It never talks to live topics or a robot, so a clear description of how you
+  validated the change (e.g. "ran `RelayDApp`, recorded a demo, converted it")
+  is genuinely useful to reviewers. Locally, `pytest` works with ROS sourced.
 - A maintainer will review and may ask for changes before merging.
 
 ## Reporting bugs / requesting features

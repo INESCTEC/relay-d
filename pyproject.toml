@@ -22,14 +22,10 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "pyyaml>=6.0.3",
-    "torch>=2.10.0",
     "h5py>=3.15.1",
     "opencv-python-headless>=4.8.0,<4.13",
     "pyqt5>=5.15.11",
     "pyqtgraph>=0.13.7",
-    "PyQt5-sip>=12.15",
-    "xmltodict",
-    "scipy>=1.10.0",
 ]
 # rclpy, tf2_ros, ROS2 message packages (std_msgs, geometry_msgs,
 # sensor_msgs, tf2_msgs) are intentionally NOT declared here:
@@ -41,7 +37,7 @@ dependencies = [
 Homepage = "https://github.com/pascd/Relay-D"
 Repository = "https://github.com/pascd/Relay-D"
 Issues = "https://github.com/pascd/Relay-D/issues"
-Changelog = "https://github.com/pascd/Relay-D/blob/master/CHANGELOG.md"
+Changelog = "https://github.com/pascd/Relay-D/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # PyPI's published `robomimic` only goes up to 0.3.0 and is NOT compatible
@@ -49,16 +45,25 @@ Changelog = "https://github.com/pascd/Relay-D/blob/master/CHANGELOG.md"
 # dispatcher targets >=0.4, e.g. 0.5.0). Install your robomimic source
 # checkout in editable mode BEFORE installing this extra — see README.md.
 robomimic = ["robomimic>=0.4"]
+# LeRobotDataset v3.0: convert to it (postprocess/lerobot_writer.py) and open it in the Review tab.
+# pyarrow 21+ needs NumPy 2 at import, and ROS Jazzy's Python ships NumPy 1.26 (pyarrow does not declare it, so pip would not warn).
+lerobot = ["pyarrow>=15.0,<21", "av>=12.0"]
 
 [dependency-groups]
 dev = [
-    "jurigged>=0.6.1",
-    "watchdog>=6.0.0",
+    "pytest>=8.0",
 ]
 
 [project.scripts]
 lfd-inference-node = "relay_d.dispatch.inference_node:main"
 RelayDApp = "relay_d.acquisition.qt_app.app:main"
+relay-d-convert = "relay_d.acquisition.convert_cli:main"
+relay-d-train = "relay_d.training.train_cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A sourced ROS 2 registers its own pytest plugins, which break collection of this suite.
+addopts = "-p no:launch_testing -p no:launch_testing_ros_pytest_entrypoint -p no:launch_ros"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -66,8 +71,9 @@ include = ["relay_d*"]
 
 [tool.setuptools.package-data]
 "relay_d.dispatch" = ["config_templates/*.yaml"]
+"relay_d.acquisition.qt_app.ui.config" = ["templates/*.yaml"]
 "relay_d.acquisition.qt_app" = ["resources/**/*", "resources.qrc"]
 "relay_d.acquisition.qt_app.ui.containers" = ["*.ui"]
-"relay_d.acquisition.qt_app.ui.postprocess.postprocess_configs" = ["*.json", "*.yaml"]
+"relay_d.acquisition.qt_app.ui.postprocess.postprocess_configs" = ["*.json"]
 "relay_d.acquisition.qt_app.ui.review" = ["*.rviz"]
 "relay_d.acquisition.qt_app.ui.styles" = ["*.qss"]

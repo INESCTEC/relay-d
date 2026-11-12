@@ -12,8 +12,8 @@ config:
   # ---------------------------------------------------------------------------
 
   dataset_name: my_robot_demo     # prefix used for HDF5 group names (e.g. demo_0, demo_1)
-  recording_frequency: 20         # samples per second saved to disk (Hz)
-  normalize_actions: false        # reserved — keep false
+  recording_frequency: 20         # required: samples per second saved to disk (Hz)
+  # max_buffer_mb: 4096           # optional: recording stops sampling past this much buffered image data (Stop still saves)
 
   # ---------------------------------------------------------------------------
   # inputs — define every sensor source
@@ -130,7 +130,7 @@ config:
     # when omitted — existing configs need no changes.
     camera_rgb:
       topic: /camera/color/image_raw
-      modality: rgb   (default, can be omitted)
+      modality: rgb                # the default, can be omitted
 
     # --- Depth image ------------------------------------------------------------
     # Also a sensor_msgs/Image, but decoded with cv_bridge's "passthrough"
@@ -208,7 +208,7 @@ config:
   # ---------------------------------------------------------------------------
   # Two stream formats are supported:
   #
-  # Plain list form (no normalization):
+  # Plain list form:
   #   <obs_key>:
   #     - <input>.<field>
   #     - <input>.<field>[:]
@@ -216,21 +216,14 @@ config:
   #     - sin/cos(<input>.<field>[:])
   #     - zero:N
   #
-  # Dict form (with optional normalization applied at conversion time):
+  # Dict form:
   #   <obs_key>:
   #     specs: [...]                          # same spec syntax as plain list
-  #     normalize: true                       # set false to skip normalization
-  #     normalized_range: [-1.0, 1.0]         # target output range
-  #     limits:
-  #       - {lower_lim: ..., upper_lim: ...}  # one entry per column, OR
-  #       - {lower_lim: ..., upper_lim: ...}  # one entry → broadcast to all columns
   #     rotation_format: quat | rpy           # see "Rotation representation" below
   #
-  # Notes on normalization:
-  #   - sin/cos-wrapped specs are already in [-1, 1]; no limits needed.
-  #   - Quaternion streams (rotation.x/y/z/w) are already in [-1, 1].
-  #   - Use ??? as a placeholder for limits you will fill in after inspecting data.
-  #   - Normalization is applied during HDF5 postprocessing, not at recording time.
+  # Values are stored in real units: robomimic and LeRobot normalize with the
+  # dataset's stats at training time (normalize / normalized_range / limits are
+  # no longer accepted here and fail the config check and the conversion).
   #
   # Rotation representation (quaternion vs RPY):
   #   - Rotation is always *recorded* as quaternion (x,y,z,w) — TF/Pose messages
@@ -261,10 +254,10 @@ config:
   # nested inside it) map an obs_key straight to a raw recorded HDF5 path:
   #   <obs_key>: <input_name>/<recorded_dataset_name>
   #
-  # This is the only way to get raw pixel/point data into obs/next_obs, and it
+  # This is the only way to get raw pixel/point data into obs, and it
   # freely coexists with output.streams — a config can have both numeric
   # streams (joint positions, TF, ...) and bridge-map image/pointcloud obs at
-  # the same time, all ending up in the same demo's obs/next_obs.
+  # the same time, all ending up in the same demo's obs.
   #
   # Recorded dataset names by input type (see the `input:` examples above):
   #   Image (rgb)             -> <input_name>/images    (N, H, W, 3) uint8
@@ -314,63 +307,67 @@ config:
         - tf_eef.rotation.z
         - tf_eef.rotation.w
 
+      # The streams below read inputs that are only commented examples above
+      # (tf_object, ee_pose, transform_pub, force_z, gripper_state): uncomment
+      # the input together with its stream.
+
       # Object position — shape (N, 3)
-      object_translation:
-        - tf_object.translation.x
-        - tf_object.translation.y
-        - tf_object.translation.z
+      # object_translation:
+        # - tf_object.translation.x
+        # - tf_object.translation.y
+        # - tf_object.translation.z
 
       # Object orientation — shape (N, 4)
-      object_rotation:
-        - tf_object.rotation.x
-        - tf_object.rotation.y
-        - tf_object.rotation.z
-        - tf_object.rotation.w
+      # object_rotation:
+        # - tf_object.rotation.x
+        # - tf_object.rotation.y
+        # - tf_object.rotation.z
+        # - tf_object.rotation.w
 
       # PoseStamped position — shape (N, 3)
       # Use this when subscribing a geometry_msgs/PoseStamped topic.
-      ee_pose_position:
-        - ee_pose.pose.position.x
-        - ee_pose.pose.position.y
-        - ee_pose.pose.position.z
+      # ee_pose_position:
+        # - ee_pose.pose.position.x
+        # - ee_pose.pose.position.y
+        # - ee_pose.pose.position.z
 
       # PoseStamped orientation — shape (N, 4)
-      ee_pose_orientation:
-        - ee_pose.pose.orientation.x
-        - ee_pose.pose.orientation.y
-        - ee_pose.pose.orientation.z
-        - ee_pose.pose.orientation.w
+      # ee_pose_orientation:
+        # - ee_pose.pose.orientation.x
+        # - ee_pose.pose.orientation.y
+        # - ee_pose.pose.orientation.z
+        # - ee_pose.pose.orientation.w
 
       # TransformStamped (topic) translation — shape (N, 3)
       # Note: "transform." prefix IS required here (unlike TF inputs).
-      ts_translation:
-        - transform_pub.transform.translation.x - transform_pub.transform.translation.y
-        - transform_pub.transform.translation.y
-        - transform_pub.transform.translation.z
+      # ts_translation:
+        # - transform_pub.transform.translation.x - transform_pub.transform.translation.y   # arithmetic example: x - y
+        # - transform_pub.transform.translation.y
+        # - transform_pub.transform.translation.z
 
       # TransformStamped (topic) rotation — shape (N, 4)
-      ts_rotation:
-        - transform_pub.transform.rotation.x
-        - transform_pub.transform.rotation.y
-        - transform_pub.transform.rotation.z
-        - transform_pub.transform.rotation.w
+      # ts_rotation:
+        # - transform_pub.transform.rotation.x
+        # - transform_pub.transform.rotation.y
+        # - transform_pub.transform.rotation.z
+        # - transform_pub.transform.rotation.w
 
       # Force reading — shape (N, 1)
-      force_reading:
-        - force_z.data
+      # force_reading:
+        # - force_z.data
 
       # Gripper state — shape (N, 1)
-      gripper_pos:
-        - gripper_state.data
+      # gripper_pos:
+        # - gripper_state.data
 
       # Combined observation vector — shape (N, 7+3+1 = 11)
       # Mix any fields from any inputs into a single flat vector.
-      observation:
-        - joint_1.position[:]
-        - tf_eef.translation.x
-        - tf_eef.translation.y
-        - tf_eef.translation.z
-        - force_z.data
+      # observation:
+        # - joint_1.position[:]
+        # - tf_eef.translation.x
+        # - tf_eef.translation.y
+        # - tf_eef.translation.z
+        # - force_z.data
 
       # Full robot state — shape (N, 7+7+3+4 = 21)
       full_state:
@@ -383,84 +380,6 @@ config:
         - tf_eef.rotation.y
         - tf_eef.rotation.z
         - tf_eef.rotation.w
-
-      # -----------------------------------------------------------------------
-      # Normalized stream examples (dict form)
-      # Replace ??? with your actual observed min/max values before use.
-      # IIWA 14 R820 limits are pre-filled; workspace/sensor limits are left
-      # as ??? for you to fill in.
-      # -----------------------------------------------------------------------
-
-      # Joint positions — 7 DOF IIWA 14 (rad)
-      # robot_joint_pos:
-      #   specs:
-      #     - joint_1.position[:]
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: -2.9671, upper_lim:  2.9671}   # J1 ±170°
-      #     - {lower_lim: -2.0944, upper_lim:  2.0944}   # J2 ±120°
-      #     - {lower_lim: -2.9671, upper_lim:  2.9671}   # J3 ±170°
-      #     - {lower_lim: -2.0944, upper_lim:  2.0944}   # J4 ±120°
-      #     - {lower_lim: -2.9671, upper_lim:  2.9671}   # J5 ±170°
-      #     - {lower_lim: -2.0944, upper_lim:  2.0944}   # J6 ±120°
-      #     - {lower_lim: -3.0543, upper_lim:  3.0543}   # J7 ±175°
-
-      # Joint velocities — 7 DOF IIWA 14 (rad/s)
-      # robot_joint_vel:
-      #   specs:
-      #     - joint_1.velocity[:]
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: -1.4835, upper_lim:  1.4835}   # J1 ±85°/s
-      #     - {lower_lim: -1.4835, upper_lim:  1.4835}   # J2 ±85°/s
-      #     - {lower_lim: -1.7453, upper_lim:  1.7453}   # J3 ±100°/s
-      #     - {lower_lim: -1.3090, upper_lim:  1.3090}   # J4 ±75°/s
-      #     - {lower_lim: -2.2689, upper_lim:  2.2689}   # J5 ±130°/s
-      #     - {lower_lim: -2.3562, upper_lim:  2.3562}   # J6 ±135°/s
-      #     - {lower_lim: -2.3562, upper_lim:  2.3562}   # J7 ±135°/s
-
-      # Joint efforts — 7 DOF IIWA 14 (Nm)
-      # robot_joint_eff:
-      #   specs:
-      #     - joint_1.effort[:]
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: -320, upper_lim:  320}   # J1
-      #     - {lower_lim: -320, upper_lim:  320}   # J2
-      #     - {lower_lim: -176, upper_lim:  176}   # J3
-      #     - {lower_lim: -176, upper_lim:  176}   # J4
-      #     - {lower_lim: -110, upper_lim:  110}   # J5
-      #     - {lower_lim:  -40, upper_lim:   40}   # J6
-      #     - {lower_lim:  -40, upper_lim:   40}   # J7
-
-      # End-effector position — world-frame (m). Fill ??? from your workspace.
-      # eef_translation:
-      #   specs:
-      #     - tf_eef.translation.x
-      #     - tf_eef.translation.y
-      #     - tf_eef.translation.z
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: ???, upper_lim: ???}   # x (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # y (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # z (m)
-
-      # End-effector rotation — quaternion already in [-1, 1]; normalize is optional.
-      # One broadcast entry covers all four components.
-      # eef_rotation:
-      #   specs:
-      #     - tf_eef.rotation.x
-      #     - tf_eef.rotation.y
-      #     - tf_eef.rotation.z
-      #     - tf_eef.rotation.w
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: -1.0, upper_lim: 1.0}   # broadcast to all 4 components
 
       # -----------------------------------------------------------------------
       # Per-use rotation representation: obs stays quaternion, action uses RPY.
@@ -486,116 +405,6 @@ config:
       #     - tf_eef.rotation.z
       #     - tf_eef.rotation.w
       #   rotation_format: rpy
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # roll  (+/- pi)
-      #     - {lower_lim: -1.57079633, upper_lim: 1.57079633}   # pitch (+/- pi/2)
-      #     - {lower_lim: -3.14159265, upper_lim: 3.14159265}   # yaw   (+/- pi)
-
-      # Object translation — world-frame (m). Fill ??? from your workspace.
-      # object_translation:
-      #   specs:
-      #     - tf_object.translation.x
-      #     - tf_object.translation.y
-      #     - tf_object.translation.z
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: ???, upper_lim: ???}   # x (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # y (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # z (m)
-
-      # Object rotation — quaternion, same reasoning as eef_rotation.
-      # object_rotation:
-      #   specs:
-      #     - tf_object.rotation.x
-      #     - tf_object.rotation.y
-      #     - tf_object.rotation.z
-      #     - tf_object.rotation.w
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: -1.0, upper_lim: 1.0}   # broadcast
-
-      # Gripper position — fill ??? with your driver's output range.
-      # Common ranges: 0–255 (raw Robotiq byte), 0.0–1.0 (normalised), 0.0–0.085 (metres).
-      # gripper_pos:
-      #   specs:
-      #     - gripper_state.data
-      #     - gripper_state.data      # duplicate if your obs key expects shape (N, 2)
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: ???, upper_lim: ???}   # broadcast to both columns
-
-      # Force / torque reading (single axis). Fill ??? with your sensor's rated range.
-      # force_reading:
-      #   specs:
-      #     - force_z.data
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: ???, upper_lim: ???}   # e.g. -100.0 / 100.0 (N)
-
-      # Mixed object stream (position + quaternion + relative position, 10D).
-      # Requires one limits entry per column because scales differ.
-      # Prefer splitting into separate streams; use this only when a single key is needed.
-      # object:
-      #   specs:
-      #     - tf_object.translation.x
-      #     - tf_object.translation.y
-      #     - tf_object.translation.z
-      #     - tf_object.rotation.x
-      #     - tf_object.rotation.y
-      #     - tf_object.rotation.z
-      #     - tf_object.rotation.w
-      #     - tf_tool0_object.translation.x
-      #     - tf_tool0_object.translation.y
-      #     - tf_tool0_object.translation.z
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: ???, upper_lim: ???}   # world x (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # world y (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # world z (m)
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat x
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat y
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat z
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat w
-      #     - {lower_lim: ???, upper_lim: ???}   # relative x (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # relative y (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # relative z (m)
-
-      # Same 10D object stream, but computing the relative (gripper-to-object)
-      # position inline with arithmetic instead of a separate tf_tool0_object
-      # frame. cube_pos - eef_pos is the standard Robosuite/Robomimic
-      # object-observation convention.
-      # object:
-      #   specs:
-      #     - tf_object.translation.x
-      #     - tf_object.translation.y
-      #     - tf_object.translation.z
-      #     - tf_object.rotation.x
-      #     - tf_object.rotation.y
-      #     - tf_object.rotation.z
-      #     - tf_object.rotation.w
-      #     - tf_object.translation.x - tf_eef.translation.x   # gripper_to_cube x
-      #     - tf_object.translation.y - tf_eef.translation.y   # gripper_to_cube y
-      #     - tf_object.translation.z - tf_eef.translation.z   # gripper_to_cube z
-      #   normalize: true
-      #   normalized_range: [-1.0, 1.0]
-      #   limits:
-      #     - {lower_lim: ???, upper_lim: ???}   # world x (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # world y (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # world z (m)
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat x
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat y
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat z
-      #     - {lower_lim: -1.0, upper_lim: 1.0}  # quat w
-      #     - {lower_lim: ???, upper_lim: ???}   # relative x (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # relative y (m)
-      #     - {lower_lim: ???, upper_lim: ???}   # relative z (m)
 
   # ---------------------------------------------------------------------------
   # actions_to_extract
@@ -604,7 +413,8 @@ config:
   # in the Robomimic output file.
   #
   # The streams are concatenated column-wise in the order listed.
-  # n_actions above must equal the total number of columns.
+  # The action of step t is the target of the next step: the stream's value at
+  # t+1, or (in delta_actions) the change from t to t+1.
   # ---------------------------------------------------------------------------
 
   actions_to_extract:
@@ -617,92 +427,19 @@ config:
   # actions_to_extract:
   #   - robot_joint_pos           # (N, 7)
   #   - eef_translation           # (N, 3)
-  #   # → actions shape: (N, 10), so set n_actions: 10
+  #   # → actions shape: (N, 10)
 
   # To use RPY rotation for the action while the observation stays quaternion
   # (see the eef_rotation_obs / eef_rotation_action example under output.streams):
   # actions_to_extract:
   #   - eef_translation           # (N, 3)
   #   - eef_rotation_action       # (N, 3) — RPY radians, converted from quaternion
-  #   # → actions shape: (N, 6), so set n_actions: 6
+  #   # → actions shape: (N, 6)
   #   # eef_rotation_obs stays quaternion (N, 4) and is picked up automatically as
   #   # an obs-only stream since it isn't listed here.
 
   # ---------------------------------------------------------------------------
-  # metadata — embedded into the Robomimic output as env_args
-  #
-  # Required fields for Robomimic compatibility:
-  #   env_name, env_version, type (1 = Robosuite)
-  #
-  # env_kwargs mirrors the Robosuite environment constructor arguments.
+  # Format-specific settings (split fractions, LeRobot task, ...) do NOT belong here. Put them in `postprocess_config.yaml`
+  # (see relay_d/acquisition/qt_app/ui/config/templates/postprocess_config_template.yaml); the Post-process page picks it up
+  # from the same folder as this file. Such keys left in this file fail the conversion.
   # ---------------------------------------------------------------------------
-
-  metadata:
-    env_name: Lift                # Robosuite environment name
-    env_version: 1.5.1
-    type: 1                       # 1 = Robosuite
-
-    env_kwargs:
-      robots:
-        - IIWA                    # robot model name in Robosuite
-
-      control_freq: 20            # controller frequency (Hz)
-
-      # Rendering — set both to false for headless recording
-      has_renderer: false
-      has_offscreen_renderer: false
-
-      # Observations
-      use_camera_obs: false       # set true if recording camera obs for policy
-      use_object_obs: true        # set true to include object state in obs
-
-      # Episode behaviour
-      ignore_done: true
-      reward_shaping: false
-      lite_physics: false
-
-      # Camera resolution (used if use_camera_obs: true)
-      camera_heights: 84
-      camera_widths: 84
-      camera_depths: false
-
-      # Controller configuration (example: operational space control)
-      controller_configs:
-        type: BASIC
-        body_parts:
-          right:
-            type: OSC_POSE
-            input_min: -1
-            input_max: 1
-            output_min:
-              - -0.05
-              - -0.05
-              - -0.05
-              - -0.5
-              - -0.5
-              - -0.5
-            output_max:
-              - 0.05
-              - 0.05
-              - 0.05
-              - 0.5
-              - 0.5
-              - 0.5
-            kp: 150
-            kp_limits:
-              - 0
-              - 300
-            damping: 1
-            damping_limits:
-              - 0
-              - 10
-            impedance_mode: fixed
-            uncouple_pos_ori: true
-            control_delta: true
-            ramp_ratio: 0.2
-            input_ref_frame: world
-            interpolation: null
-            orientation_limits: null
-            position_limits: null
-            gripper:
-              type: GRIP

@@ -1,6 +1,6 @@
 <div align="center">
 
-![logo](../profile/inesctec_banner.png)
+![logo](../img/inesctec_banner.png)
 
 ## INESC TEC
 ### Open-Source Software: *Security Issue Reporting Template*

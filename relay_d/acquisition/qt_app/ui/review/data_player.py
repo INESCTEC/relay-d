@@ -22,16 +22,7 @@ except ImportError:
 
 from relay_d.utils.coloring_logger import logger
 from .demo_playback_reconstructor import DemoPlaybackReader, ChannelKind
-
-# tf2_ros.TransformBroadcaster hardcodes its publish topic to the absolute
-# "/tf" - a namespace remap does not affect it, only an explicit topic remap
-# does. Applied to this node so its TF traffic lands on /playback/tf instead
-# of colliding with any live /tf.
-_TF_REMAP_ARGS = [
-    "--ros-args",
-    "-r", "/tf:=/playback/tf",
-    "-r", "/tf_static:=/playback/tf_static",
-]
+from .playback_process_manager import TF_REMAP_ARGS
 
 
 class PlaybackState(Enum):
@@ -162,7 +153,7 @@ class DataPlayer:
 
     def _setup_node(self):
         node_name = f"data_player_{id(self)}"
-        self._node = rclpy.create_node(node_name, cli_args=_TF_REMAP_ARGS)
+        self._node = rclpy.create_node(node_name, cli_args=["--ros-args", *TF_REMAP_ARGS])
 
         qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.RELIABLE)
 

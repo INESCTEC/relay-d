@@ -19,9 +19,7 @@ from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from std_msgs.msg import String, Float32, Float64, Int32, Bool
 
 from relay_d.utils.coloring_logger import logger
-
-# Groups under data/<demo_name>/ that are not "raw input" containers.
-_NON_INPUT_GROUPS = {"streams", "metadata", "gripper_states"}
+from .demo_validator import NON_INPUT_GROUPS, first_demo
 
 _SIMPLE_MSG_CLASSES = {
     "string": String,
@@ -259,12 +257,10 @@ class DemoPlaybackReader:
         self.h5_path = h5_path
         self._h5 = h5py.File(h5_path, "r")
 
-        if "data" not in self._h5 or not list(self._h5["data"].keys()):
+        demo_name, self.demo_group = first_demo(self._h5)
+        if self.demo_group is None:
             self._h5.close()
             raise ValueError(f"No data/<demo_name> group found in {h5_path}")
-
-        demo_name = list(self._h5["data"].keys())[0]
-        self.demo_group = self._h5["data"][demo_name]
 
         if "timestamps" not in self.demo_group or self.demo_group["timestamps"].shape[0] == 0:
             self._h5.close()
@@ -289,7 +285,7 @@ class DemoPlaybackReader:
     def _scan_channels(self):
         channels = []
         for name, item in self.demo_group.items():
-            if name in _NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
+            if name in NON_INPUT_GROUPS or not isinstance(item, h5py.Group):
                 continue
             channels.append(self._classify_group(name, item))
         return channels

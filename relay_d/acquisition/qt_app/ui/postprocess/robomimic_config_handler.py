@@ -16,9 +16,6 @@ class RobomimicConfigHandler:
     def get_config(self) -> Dict:
         return self.json_config
 
-    def set_train_dir(self, train_dir: str):
-        self.json_config.setdefault("train", {})["output_dir"] = train_dir
-
     def set_observation_modalities(
         self,
         low_dim: Iterable[str],
@@ -37,9 +34,24 @@ class RobomimicConfigHandler:
         obs["depth"] = list(depth)
         obs["scan"] = list(scan)
 
-    def save(self, output_path: str = None):
-        with open(output_path or self.config_path, "w") as f:
-            json.dump(self.json_config, f, indent=4)
+
+def explicit_modalities(data_config: Dict) -> Dict[str, str]:
+    """Output (observation) key -> "rgb"|"depth"|"scan" for camera / point-cloud outputs whose input
+    sets ``modality``. ``output: agentview_depth: camera_depth/images`` takes the modality of the input
+    recorded into the group ``camera_depth`` (the input's name)."""
+    by_group = {
+        name: spec.get("modality")
+        for name, spec in (data_config.get("input") or {}).items()
+        if isinstance(spec, dict)
+    }
+    modalities: Dict[str, str] = {}
+    for key, path in (data_config.get("output") or {}).items():
+        if key in ("streams", "prefix_path") or not isinstance(path, str):
+            continue
+        modality = by_group.get(path.split("/")[0])
+        if modality in ("rgb", "depth", "scan"):
+            modalities[key] = modality
+    return modalities
 
 
 def classify_observations(
@@ -48,7 +60,7 @@ def classify_observations(
 ) -> Dict[str, list]:
     """
     Classify every key in shape_cache (the observations that actually
-    survived the last conversion) into Robomimic's low_dim/rgb/depth/scan
+    are in the converted dataset) into Robomimic's low_dim/rgb/depth/scan
     obs modalities.
 
     Priority:
@@ -59,14 +71,7 @@ def classify_observations(
          inputs that never bothered setting `modality`).
       3. Otherwise -> low_dim.
     """
-    explicit_modality: Dict[str, str] = {}
-    for input_name, spec in data_config.get("input", {}).items():
-        if not isinstance(spec, dict):
-            continue
-        modality = spec.get("modality")
-        if modality in ("rgb", "depth", "scan"):
-            key = spec.get("output_map") or input_name
-            explicit_modality[key] = modality
+    explicit_modality = explicit_modalities(data_config)
 
     low_dim, rgb, depth, scan = [], [], [], []
     buckets = {"low_dim": low_dim, "rgb": rgb, "depth": depth, "scan": scan}

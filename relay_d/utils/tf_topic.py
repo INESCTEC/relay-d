@@ -31,6 +31,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from tf2_msgs.msg import TFMessage
 
 from relay_d.utils.coloring_logger import logger
+from relay_d.utils.tf_filter import StaleTfFilter
 
 try:
     from tf2_ros import Buffer
@@ -54,9 +55,10 @@ class _TfTopicListener:
     read a TF tree published under a non-default topic (e.g. /robot_1/tf).
     """
 
-    def __init__(self, buffer, node, tf_topic, tf_static_topic):
+    def __init__(self, buffer, node, tf_topic, tf_static_topic, cache_time=10.0):
         self.buffer = buffer
         self.node = node
+        self._filter = StaleTfFilter(cache_time)
         # Reentrant so lookup_transform() can be called from within a TF
         # callback without deadlocking, same as upstream TransformListener.
         self.group = ReentrantCallbackGroup()
@@ -85,7 +87,9 @@ class _TfTopicListener:
 
     def _callback(self, data):
         for transform in data.transforms:
-            self.buffer.set_transform(transform, "default_authority")
+            stamp = transform.header.stamp
+            if self._filter.accept(transform.child_frame_id, stamp.sec * 10**9 + stamp.nanosec):
+                self.buffer.set_transform(transform, "default_authority")
 
     def _static_callback(self, data):
         for transform in data.transforms:
@@ -128,7 +132,7 @@ def get_or_create_tf_buffer(
 
     try:
         buf = Buffer(cache_time=rclpy_duration(seconds=cache_time))
-        listener = _TfTopicListener(buf, node, tf_topic, tf_static_topic)
+        listener = _TfTopicListener(buf, node, tf_topic, tf_static_topic, cache_time)
         buffers[key] = buf
         listeners[key] = listener
         logger.info(f"TF buffer created for topics {tf_topic}, {tf_static_topic}")

@@ -8,18 +8,26 @@ sanitize_qt_env()
 import rclpy
 from rclpy.node import Node
 
-from PyQt5.QtWidgets import QMainWindow, QApplication, QLabel, QTextEdit, QPushButton
+from PyQt5.QtWidgets import QMainWindow, QApplication
 from PyQt5 import uic
-from PyQt5.QtCore import QTimer, QFileSystemWatcher, QObject, pyqtSignal
+from PyQt5.QtCore import QTimer, QFileSystemWatcher
+
+from relay_d.utils import user_settings
+from .ctrl_c import close_on_ctrl_c
+from .first_run import ask_save_folder
+from .settings_apply import live_changes, needs_config, ros_domain_to_set, startup_page
+from .ui.settings.config_manager import config
+from .utils.custom_message_box import CustomMessageBox
 
 try:
-    from relay_d.utils.coloring_logger import logger
-    from relay_d.utils.coloring_logger import set_level
-    set_level("INFO")   # or "DEBUG" / "ERROR" / etc.
+    from relay_d.utils.coloring_logger import logger, apply_user_level
 except ImportError:
     # Fallback to standard logging if relay_d isn't installed/importable
     import logging
     logger = logging.getLogger(__name__)
+
+    def apply_user_level():
+        pass
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -35,9 +43,11 @@ try:
     from .ui.postprocess.postprocess_page import PostProcessPage
     from .ui.settings.settings_page import SettingsPage
     from .ui.review.review_page import ReviewPage
+    from .ui.train.train_page import TrainPage
+    from .ui.run.run_page import RunPage
 except ImportError as e:
     logger.error(f"Failed to import one or more UI pages: {e}")
-    ConfigPage = RecordPage = PostProcessPage = SettingsPage = ReviewPage = None
+    ConfigPage = RecordPage = PostProcessPage = SettingsPage = ReviewPage = TrainPage = RunPage = None
 
 
 class UI(QMainWindow):
@@ -49,7 +59,7 @@ class UI(QMainWindow):
         # ROS spin timer - this is critical for receiving ROS messages
         self.ros_spin_timer = QTimer()
         self.ros_spin_timer.timeout.connect(self.spin_once)
-        self.ros_spin_timer.start(10)  # Spin every 10ms (100 Hz)
+        self.ros_spin_timer.start(int(user_settings.get("ros_spin_ms")))  # setting: how often ROS callbacks run
 
         self.resize_timer = QTimer()
         self.resize_timer.setSingleShot(True)
@@ -66,6 +76,8 @@ class UI(QMainWindow):
             "btn_import",
             "btn_settings",
             "btn_review",
+            "btn_train",
+            "btn_run",
         ])
 
         # After setup_menu_buttons(self, menu_buttons)
@@ -124,6 +136,12 @@ class UI(QMainWindow):
                     record_page=getattr(self, "page_record", None),
                     settings_page=settings,
                 )
+            if TrainPage is not None:
+                self.page_train_ui = TrainPage(
+                    self, settings_page=getattr(self, "page_settings_ui", None)
+                )
+            if RunPage is not None:
+                self.page_run_ui = RunPage(self)
             if hasattr(self, "page_record") and hasattr(self, "page_config"):
                 self.page_record.connect_to_config_signals(
                     self.page_config.signal_manager
@@ -136,29 +154,34 @@ class UI(QMainWindow):
             logger.error(f"Error setting up pages: {e}")
             sys.exit(1)
 
-        self.load_theme("light")
+        theme = user_settings.get("theme")
+        self.load_theme(theme)
 
         # Configuração do Live Reload para QSS
         self.qss_watcher = QFileSystemWatcher()
-        self._update_watcher_path("light")
+        self._update_watcher_path(theme)
         self.qss_watcher.fileChanged.connect(self._on_qss_changed)
-
-        try:
-            self.btn_theme_toggle.clicked.connect(self._toggle_theme)
-        except AttributeError:
-            pass
+        self._theme = theme
+        config.settings_changed.connect(self._on_settings_changed)
 
         # Load the settings
         if hasattr(self, "page_settings_ui"):
             self.page_settings_ui.load_settings()
 
-        # Change the current widget to the start page
+        # Change the current widget to the start page (setting: startup_page)
+        startup_blocked = False
         try:
-            self.stackedWidget.setCurrentWidget(self.page_help)
+            startup = getattr(self, f"page_{startup_page(user_settings.values())}", self.page_help)
+            startup_blocked = self._needs_config(startup)  # starting on the Record page without a config: open Config instead
+            self.stackedWidget.setCurrentWidget(self.page_import if startup_blocked else startup)
         except Exception as e:
             logger.error(f"Error setting initial page: {e}")
 
         self.show()
+        if not ask_save_folder(self):  # modal: nothing else can be used until a folder is chosen
+            QTimer.singleShot(0, self.close)
+        elif startup_blocked:
+            self._warn_no_config()
 
     def register_ros_node(self, node):
         """Register a ROS node to be spun"""
@@ -176,12 +199,7 @@ class UI(QMainWindow):
         """Spin all ROS nodes to process callbacks"""
         for node in self.ros_nodes:
             try:
-                lock = getattr(node, "_spin_lock", None)
-                if lock is not None:
-                    with lock:
-                        rclpy.spin_once(node, timeout_sec=0)
-                else:
-                    rclpy.spin_once(node, timeout_sec=0)
+                rclpy.spin_once(node, timeout_sec=0)
             except Exception as e:
                 logger.debug(f"Error spinning ROS node: {e}")
 
@@ -204,17 +222,35 @@ class UI(QMainWindow):
             "btn_settings": self.page_settings,
             "btn_help": self.page_help,
             "btn_review": self.page_review,
+            "btn_train": self.page_train,
+            "btn_run": self.page_run,
         }
         if btn_name in page_mapping:
             try:
                 if btn_name == "btn_review" and hasattr(self, "page_review_ui"):
                     self.page_review_ui.sync_with_current_session()
                     self.page_review_ui.refresh_demo_list()
-                self.stackedWidget.setCurrentWidget(page_mapping[btn_name])
+                target = page_mapping[btn_name]
+                if self._needs_config(target):  # the Record page does nothing without a config
+                    self._warn_no_config()
+                    target = self.page_import
+                self.stackedWidget.setCurrentWidget(target)
             except Exception as e:
                 logger.error(f"Error switching to page for {btn_name}: {e}")
         else:
             logger.warning(f"No page mapped for button: {btn_name}")
+
+    def _needs_config(self, page) -> bool:
+        parser = getattr(getattr(self, "page_config", None), "yaml_parser", None)
+        return parser is not None and needs_config(page.objectName().removeprefix("page_"), parser.is_loaded())
+
+    def _warn_no_config(self):
+        CustomMessageBox.warning(
+            "Load a config before recording: the Record page needs one to know which topics to show and record.\n\n"
+            "Opening the Configuration page: insert a file, or build one with \"Build from ROS\".",
+            title="No config loaded",
+            parent=self,
+        )
 
     def _update_watcher_path(self, theme):
         """Atualiza o ficheiro que o watcher está a monitorizar."""
@@ -252,26 +288,15 @@ class UI(QMainWindow):
         except FileNotFoundError:
             logger.warning(f"Theme file not found: {qss_path}")
 
-    def _toggle_theme(self):
-        """Toggle between light and dark themes."""
-        current_style = self.btn_theme_toggle.text()
-        if current_style == "Light":
-            new_theme = "dark"
-            self.btn_theme_toggle.setText("Dark")
-        else:
-            new_theme = "light"
-            self.btn_theme_toggle.setText("Light")
-
-        self.load_theme(new_theme)
-
-    def on_menu_toggled(self, expanded):
-        logger.info(f"Menu toggled: {'Expanded' if expanded else 'Collapsed'}")
-        try:
-            if hasattr(self, "page_record") and self.page_record is not None:
-                if hasattr(self.page_record, "on_window_resize"):
-                    self.page_record.on_window_resize()
-        except Exception as e:
-            logger.info(f"Error in menu toggle resize: {e}")
+    def _on_settings_changed(self, settings):
+        """Apply the settings that take effect live: theme, ROS spin interval, log level."""
+        changes = live_changes(settings, self._theme, self.ros_spin_timer.interval())
+        if "theme" in changes:
+            self._theme = changes["theme"]
+            self.load_theme(self._theme)
+        if "spin_ms" in changes:
+            self.ros_spin_timer.setInterval(changes["spin_ms"])
+        apply_user_level()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -290,38 +315,15 @@ class UI(QMainWindow):
         except Exception as e:
             logger.info(f"Error handling resize: {e}")
 
-    def add_container_layout_controls(self):
-        if hasattr(self, "btn_auto_arrange"):
-            self.btn_auto_arrange.clicked.connect(self.auto_arrange_containers)
-
-        if hasattr(self, "btn_2x1_layout"):
-            self.btn_2x1_layout.clicked.connect(lambda: self.set_forced_layout(2, 1))
-
-        if hasattr(self, "btn_2x2_layout"):
-            self.btn_2x2_layout.clicked.connect(lambda: self.set_forced_layout(2, 2))
-
-        if hasattr(self, "btn_3x2_layout"):
-            self.btn_3x2_layout.clicked.connect(lambda: self.set_forced_layout(3, 2))
-
-    def auto_arrange_containers(self):
-        try:
-            if hasattr(self, "page_record") and self.page_record is not None:
-                if hasattr(self.page_record, "rearrange_containers"):
-                    self.page_record.rearrange_containers()
-        except Exception as e:
-            logger.info(f"Error in auto arrange: {e}")
-
-    def set_forced_layout(self, cols, rows):
-        try:
-            if hasattr(self, "page_record") and self.page_record is not None:
-                if hasattr(self.page_record, "set_container_grid_layout"):
-                    self.page_record.set_container_grid_layout(cols, rows)
-        except Exception as e:
-            logger.info(f"Error in forced layout: {e}")
-
     def closeEvent(self, event):
         """Clean up timers and ROS connections before closing"""
+        if not self._recording_saved_or_dropped():
+            event.ignore()
+            return
         try:
+            if getattr(self, "page_run_ui", None) is not None:  # a policy driving the robot stops first
+                self.page_run_ui.shutdown()
+
             if hasattr(self, "page_record") and self.page_record is not None:
                 # Stop TF update timerexit_code
                 if hasattr(self.page_record, "tf_update_timer"):
@@ -331,11 +333,6 @@ class UI(QMainWindow):
                 if hasattr(self.page_record, "container_visualizer"):
                     for timer in self.page_record.container_visualizer.visualization_timers.values():
                         timer.stop()
-
-                # Stop data recorder
-                if hasattr(self.page_record, "data_recorder"):
-                    if self.page_record.data_recorder.is_recording:
-                        self.page_record.data_recorder.stop_recording()
 
                 # Stop the TF listener's dedicated spin thread
                 if hasattr(self.page_record, "topic_subscribers"):
@@ -353,8 +350,38 @@ class UI(QMainWindow):
         event.accept()
 
 
+    def _recording_saved_or_dropped(self) -> bool:
+        """Stop and save a running recording. False (keep the window open) if it could not be saved
+        and the user does not want to lose it: that demo is only in memory."""
+        recorder = getattr(getattr(self, "page_record", None), "data_recorder", None)
+        if recorder is None:
+            return True
+        try:
+            if recorder.is_recording:
+                recorder.stop_recording()
+            with recorder.recording_lock:  # a Stop pressed just before may still be saving in the background: wait
+                pass
+            if not getattr(recorder, "_unsaved", False) or recorder.retry_save():
+                return True
+        except Exception as e:
+            logger.error(f"Error saving the recording on close: {e}")
+        return CustomMessageBox.question(
+            f"The last recording could not be saved to {recorder.h5_file_path} (see the log).\n"
+            "Close anyway and lose it?",
+            title="Recording not saved",
+        )
+
+
 def main(args=None):
-    rclpy.init(args=args)
+    domain = ros_domain_to_set(user_settings.values(), os.environ)  # the environment, if set, wins
+    if domain is not None:
+        os.environ["ROS_DOMAIN_ID"] = domain
+    try:  # ROS must not take Ctrl+C for itself: the window closes on it instead (see ctrl_c.py)
+        from rclpy.signals import SignalHandlerOptions
+
+        rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    except ImportError:  # an rclpy without that option
+        rclpy.init(args=args)
 
     node = Node("qt_visualizer_node")
 
@@ -362,6 +389,7 @@ def main(args=None):
     app = QApplication(sys.argv)
     logger.info("DEBUG: QApplication created, about to create UI")
     window = UI(node)
+    close_on_ctrl_c(window)
     logger.info("DEBUG: UI created, about to call app.exec_()")
     exit_code = app.exec_()
     logger.info(f"DEBUG: app.exec_() returned {exit_code}")

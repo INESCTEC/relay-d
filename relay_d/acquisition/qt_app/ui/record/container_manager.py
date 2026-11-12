@@ -1,7 +1,22 @@
 import time
 import traceback
 
+from PyQt5.QtCore import QCoreApplication, QEventLoop, QTimer
+
 from relay_d.utils.coloring_logger import logger
+
+
+def pump_events(ms: int):
+    """Wait ``ms`` milliseconds while still processing Qt events (the window stays responsive).
+
+    Falls back to a plain sleep when there is no running QCoreApplication.
+    """
+    if QCoreApplication.instance() is None:
+        time.sleep(ms / 1000.0)
+        return
+    loop = QEventLoop()
+    QTimer.singleShot(ms, loop.quit)
+    loop.exec_()
 
 
 class ContainerManager:
@@ -25,17 +40,22 @@ class ContainerManager:
         self.topic_containers = topic_containers
         self.topic_subscribers = topic_subscribers
         self.container_visualizer = container_visualizer
+        self._creating = False  # guards against re-entry while events are pumped
 
     def create_containers(self):
         """Create containers based on YAML configuration data - WITH SUBSCRIBERS AND VISUALIZATION"""
+        if self._creating:
+            logger.warning("Container creation already in progress; ignoring the request")
+            return False
+        self._creating = True
         try:
             # Clear existing containers, subscribers, and visualizations first
             self.container_visualizer.stop_all_visualizations()
             self.topic_containers.clear_all_containers()
             self.topic_subscribers.clear_all_subscribers()
 
-            # Small delay to ensure cleanup is complete
-            time.sleep(0.1)
+            # Small delay to ensure cleanup is complete (the UI keeps processing events)
+            pump_events(100)
 
             # Get configuration data from YAML parser
             input_data = self.yaml_parser.get_input_data()
@@ -56,7 +76,6 @@ class ContainerManager:
                     "input_name": input_name,
                     "topic_type_msg": None,  # Will be auto-detected from topic
                     "base_type": base_type,
-                    "output_map": input_item.get("output_map", input_name),
                 }
 
                 # Check if this is a TF lookup configuration
@@ -70,14 +89,11 @@ class ContainerManager:
                     container_data["tf_wait_timeout"] = input_item.get(
                         "tf_wait_timeout"
                     )
-                    container_data["transfer_rate"] = input_item.get(
-                        "transfer_rate", 10
-                    )
                     container_data["topic_path"] = None  # No topic for TF lookup
                     # For TF, use 'pose' or 'tf' as the container type
                     container_topic_type = "pose"
                     logger.info(
-                        f"TF lookup config: {input_name} - {input_item.get('parent_frame')} -> {input_item.get('child_frame')} -> {input_item.get('output_map')}"
+                        f"TF lookup config: {input_name} - {input_item.get('parent_frame')} -> {input_item.get('child_frame')}"
                     )
                 # Add topic path for regular topic subscriptions
                 elif "topic" in input_item:
@@ -97,7 +113,7 @@ class ContainerManager:
                 container_specs.append(container_spec)
 
                 logger.info(
-                    f"Added container spec: {input_name} -> {base_type} -> output_map: {container_data['output_map']}"
+                    f"Added container spec: {input_name} -> {base_type}"
                 )
 
             logger.info(f"Total container specs prepared: {len(container_specs)}")
@@ -168,10 +184,6 @@ class ContainerManager:
             # Force UI refresh
             self.force_ui_refresh()
 
-            # Debug container and subscriber status
-            self.topic_containers.debug_containers()
-            self.topic_subscribers.debug_subscribers()
-
             logger.info(
                 f"Successfully created {len(created_containers)} containers (subscribers will start on record)"
             )
@@ -181,6 +193,8 @@ class ContainerManager:
             logger.error(f"Exception occurred in create_containers: {e}")
             traceback.print_exc()
             return False
+        finally:
+            self._creating = False
 
     def set_statuses_by_data(self, with_data, without_data):
         """Set every container's status text depending on whether it has data."""
@@ -199,45 +213,6 @@ class ContainerManager:
                 self.topic_containers.update_container_info(
                     container, {"status": status}
                 )
-
-    def get_container_data(self, input_name):
-        """Get the latest ROS data for a container by input name"""
-        container = self.get_container_by_input_name(input_name)
-        if container:
-            return self.topic_subscribers.get_container_data(container)
-        return None
-
-    def get_container_by_input_name(self, input_name):
-        """Get container by input name"""
-        for container in self.topic_containers.containers:
-            if hasattr(container, "input_name") and container.input_name == input_name:
-                return container
-        return None
-
-    def get_all_container_info(self):
-        """Get information about all containers"""
-        return self.topic_containers.get_all_container_info()
-
-    def wait_for_all_data(self, timeout=10.0):
-        """Wait for all containers to receive data"""
-        start_time = time.time()
-
-        while time.time() - start_time < timeout:
-            all_have_data = True
-            for container in self.topic_containers.containers:
-                container_id = getattr(container, "container_id", None)
-                if container_id and not self.topic_subscribers.has_data(container_id):
-                    all_have_data = False
-                    break
-
-            if all_have_data:
-                logger.info("All containers have received data")
-                return True
-
-            time.sleep(0.1)
-
-        logger.warning("Timeout waiting for all containers to receive data")
-        return False
 
     def restart_failed_subscribers(self):
         """Restart subscribers that failed to create or stopped working"""
@@ -274,29 +249,6 @@ class ContainerManager:
         logger.info(f"Restarted {restarted_count} subscribers")
         return restarted_count
 
-    def update_container_statuses(self):
-        """Update all container statuses based on current subscriber state"""
-        for container in self.topic_containers.containers:
-            container_id = getattr(container, "container_id", None)
-            if container_id:
-                if self.topic_subscribers.has_data(container_id):
-                    message_count = self.topic_subscribers.get_message_count(
-                        container_id
-                    )
-                    status = f"Active ({message_count} msgs)"
-                else:
-                    subscriber_status = self.topic_subscribers.get_subscriber_status(
-                        container_id
-                    )
-                    if subscriber_status.get("status") == "active":
-                        status = "Waiting for Data"
-                    else:
-                        status = "No Subscriber"
-
-                self.topic_containers.update_container_info(
-                    container, {"status": status}
-                )
-
     def force_ui_refresh(self):
         """Force UI refresh"""
         try:
@@ -317,56 +269,3 @@ class ContainerManager:
                 self.topic_containers.resize_containers_to_window(window_size)
         except Exception as e:
             logger.error(f"Error handling window resize: {e}")
-
-    def debug_containers(self):
-        """Debug method to inspect container widgets"""
-        try:
-            logger.info("=== STARTING CONTAINER DEBUG ===")
-
-            if self.topic_containers and self.topic_containers.containers:
-                containers = self.topic_containers.containers
-                logger.info(f"Found {len(containers)} containers to debug")
-
-                for i, container in enumerate(containers):
-                    container_id = getattr(container, "container_id", f"container_{i}")
-                    logger.info(f"\n=== DEBUG CONTAINER {i + 1}: {container_id} ===")
-
-                    # Get all attributes
-                    all_attrs = [
-                        attr for attr in dir(container) if not attr.startswith("_")
-                    ]
-
-                    # Find widgets with setText method
-                    setText_widgets = []
-                    setPixmap_widgets = []
-
-                    for attr in all_attrs:
-                        try:
-                            obj = getattr(container, attr)
-                            if hasattr(obj, "setText"):
-                                setText_widgets.append(attr)
-                            if hasattr(obj, "setPixmap"):
-                                setPixmap_widgets.append(attr)
-                        except Exception:
-                            continue
-
-                    logger.info(
-                        f"Container size: {container.size().width()}x{container.size().height()}"
-                    )
-                    logger.info(f"Container visible: {container.isVisible()}")
-                    logger.info(f"Widgets with setText: {setText_widgets}")
-                    logger.info(f"Widgets with setPixmap: {setPixmap_widgets}")
-
-                    # Test updating first few widgets
-                    for widget_name in setText_widgets[:3]:
-                        try:
-                            widget = getattr(container, widget_name)
-                            widget.setText(f"TEST: {widget_name}")
-                            logger.info(f"SUCCESS: Updated {widget_name}")
-                        except Exception as e:
-                            logger.info(f"FAILED: {widget_name} - {e}")
-            else:
-                logger.info("No containers found to debug")
-
-        except Exception as e:
-            logger.error(f"Error in debug_containers: {e}")

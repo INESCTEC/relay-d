@@ -1,20 +1,24 @@
-import sys
 import os
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from datetime import datetime
 
 import rclpy
-from threading import Thread, current_thread
 from typing import Optional
 
 from ..qt_app.ui.config.yaml_parser import YamlParser
 from ..qt_app.ui.record.topic_subscribers import TopicSubscribers
 from ..qt_app.ui.record.data_recorder import DataRecorder
+from ..qt_app.ui.record.demo_start import start_demo
+from ..qt_app.ui.config.builder.config_check import check_config
+from ..qt_app.utils.stream_builder import StreamBuilder
+from relay_d.utils.tf_topic import TfTopicSubscriptionError
 from ..qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
 from ..qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
-from ..qt_app.ui.review.demo_validator import DemoValidator
-from relay_d.utils.coloring_logger import logger
+from ..qt_app.ui.postprocess.offline_config import load_conversion_config, write_dataset_files
+from ..qt_app.ui.postprocess.postprocess_options import dataset_output_paths
+from ..qt_app.ui.review.demo_validator import CheckStatus, DemoValidator
 from ..qt_app.utils.demo_file_ops import delete_demo_file
+from relay_d.utils import user_settings
+from relay_d.utils.coloring_logger import logger
 
 class ContainerAdapter:
     def __init__(self, data: dict):
@@ -23,11 +27,20 @@ class ContainerAdapter:
         self.input_name = data.get("name")
         self.parent_frame = data.get("parent_frame")
         self.child_frame = data.get("child_frame")
-        self.transfer_rate = data.get("transfer_rate", 10)
+        self.tf_topic = data.get("tf_topic")  # None -> /tf, /tf_static (as in the GUI's ContainerManager)
+        self.tf_static_topic = data.get("tf_static_topic")
+        self.tf_wait_timeout = data.get("tf_wait_timeout")
 
 
 class AppAPI:
-    def __init__(self, config_path: str, output_dir: Optional[str] = None):
+    def __init__(
+        self,
+        config_path: str,
+        output_dir: Optional[str] = None,
+        postprocess_config_path: Optional[str] = None,
+    ):
+        # Conversion config + format options, checked like relay-d-convert: raises before any ROS setup
+        self._load_conversion_config(config_path, postprocess_config_path)
         self._rclpy_initialized = False
         try:
             rclpy.init()
@@ -38,23 +51,13 @@ class AppAPI:
         self._yaml_parser = YamlParser()
         self._topic_subscribers = TopicSubscribers()
         self._data_recorder = DataRecorder(self._yaml_parser)
-        self._config_loader = PostprocessConfigLoader()
-        self._yaml_converter = YAMLDrivenConverter(self._config_loader)
-        if config_path:
-            self._yaml_converter.load_data_config(config_path)
-
-        if output_dir is None:
-            output_dir = os.path.join(os.path.expanduser("~"), "lfd_recordings")
-
-        # Pass the output directory to the DataRecorder instance
-        self._base_output_dir = output_dir
+        # An explicit output_dir wins; otherwise the recorder reads the hdf5_save_folder setting when a session starts,
+        # so a changed setting applies to the next recording.
         self._data_recorder.output_directory = output_dir
         self._session_h5_files: list = []
         self._validator = DemoValidator()
-        self._last_validation_results: dict = {}
 
-        self._spin_thread = None
-        self._should_spin = False
+        self._containers: list = []
         self._config_path = config_path
 
         if config_path is not None:
@@ -66,107 +69,121 @@ class AppAPI:
         if not self._yaml_parser.load_yaml_file(config_path):
             return False
 
-        for input_data in self._yaml_parser.get_input_data():
-            container = ContainerAdapter(input_data)
-            self._topic_subscribers.create_subscriber(container)
+        # The Config page's checks: refuse a dead topic / unreachable TF and a stream spec that does not parse
+        # (either would leave that input silently missing); the rest of check_config only warns, as there.
+        failures = self._topic_subscribers.unavailable_inputs(self._yaml_parser.get_input_data())
+        failures += [f"  {e}" for e in StreamBuilder(self._yaml_parser).get_build_errors()]
+        if failures:
+            self._yaml_parser.clear()
+            self._yaml_parser.current_config = self._yaml_parser.yaml_data = None  # unloaded, as the Config page does
+            logger.error("Config rejected:\n" + "\n".join(failures))
+            return False
+        problems = check_config(self._yaml_parser.yaml_data)
+        if problems:
+            logger.warning("Config check:\n" + "\n".join(f"  {p.message}" for p in problems))
 
+        # Subscribed at every start_recording, as in the GUI
+        self._containers = [ContainerAdapter(d) for d in self._yaml_parser.get_input_data()]
         self.start_spinning()
         return True
 
     def start_spinning(self):
-        self._should_spin = True
-        self._spin_thread = Thread(target=self._spin_loop, daemon=True)
-        self._spin_thread.start()
-
-    def _spin_loop(self):
-        while self._should_spin:
-            with self._topic_subscribers._spin_lock:
-                rclpy.spin_once(self._topic_subscribers, timeout_sec=0.01)
-            rclpy.spin_once(self._data_recorder, timeout_sec=0.0)
+        self._topic_subscribers.start_spinning()
 
     def start_recording(self, demo_name: Optional[str] = None) -> bool:
-        self.demo_name_ = demo_name
-        return self._data_recorder.start_recording(
-            self._topic_subscribers, demo_name, flush_stale_data=True
-        )
-
-    def pause_recording(self) -> bool:
-        return self._data_recorder.pause_recording()
-
-    def resume_recording(self) -> bool:
-        return self._data_recorder.resume_recording()
+        """Start a demo, named like the GUI's (``{dataset_name}_{ms}``) unless ``demo_name`` is given."""
+        try:
+            started = start_demo(  # same steps as the GUI's Start
+                self._data_recorder, self._topic_subscribers, self._containers,
+                self._yaml_parser.get_dataset_name(), demo_name,
+            ) is not None
+        except TfTopicSubscriptionError as e:
+            logger.error(f"Recording NOT started: a configured TF topic could not be read: {e}")
+            return False
+        if self._data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
+            self._session_h5_files.append(self._data_recorder.retried_file)
+        return started
 
     def stop_recording(self) -> bool:
         result = self._data_recorder.stop_recording()
+        if not self._data_recorder.is_recording:  # saved, or kept in memory for a retry: subscribe again at the next start
+            self._topic_subscribers.clear_all_subscribers()
         if result and self._data_recorder.h5_file_path:
             file_path = self._data_recorder.h5_file_path
             self._session_h5_files.append(file_path)
             try:
-                self._last_validation_results[file_path] = self._validator.validate(file_path)
+                check = self._validator.validate(file_path)
+                for c in check.checks:  # the GUI shows these in a dialog
+                    if c.status != CheckStatus.PASS:
+                        (logger.error if c.status == CheckStatus.FAIL else logger.warning)(
+                            f"Demo check [{c.status.value.upper()}] {c.name}: {c.message}"
+                        )
             except Exception as e:
                 logger.error(f"Error validating recording: {e}")
         return result
 
-    def get_validation_result(self, file_path: str):
-        return self._last_validation_results.get(file_path)
+    def delete_demo(self, file_path: str) -> bool:
+        """Delete a recorded demo and drop it from this session, like the GUI's Review > Delete / Reject Demo."""
+        if not delete_demo_file(file_path):
+            return False
+        self._session_h5_files = [p for p in self._session_h5_files if p != file_path]
+        return True
 
-    def delete_recording(self, file_path: str) -> bool:
-        ok = delete_demo_file(file_path)
-        if ok:
-            if file_path in self._session_h5_files:
-                self._session_h5_files.remove(file_path)
-            self._last_validation_results.pop(file_path, None)
-        return ok
+    def _load_conversion_config(self, config_path: Optional[str], options_path: Optional[str]) -> None:
+        """The converter, with the config and format options of relay-d-convert (options: ``options_path``, else a
+        postprocess_config.yaml next to the config, else the defaults). Raises ValueError if a file is unusable."""
+        self._yaml_converter = YAMLDrivenConverter(PostprocessConfigLoader())
+        self._conversion_parser = None
+        if config_path:
+            self._conversion_parser, self._yaml_converter.options = load_conversion_config(config_path, options_path)
+            self._yaml_converter.data_config = self._conversion_parser.yaml_data["config"]
 
-    def get_recording_status(self) -> dict:
-        return {
-            "is_recording": self._data_recorder.is_recording,
-            "is_paused": self._data_recorder.is_paused,
-            "file_path": self._data_recorder.h5_file_path,
-            "samples": len(self._data_recorder.timestamps),
-        }
-
-    def convert_recording_to_dataset(self) -> bool:
+    def convert_recording_to_dataset(self, output_format: str = "robomimic") -> bool:
+        """Convert this session's recordings like the Post-process page: a new ``<date>_<Format>`` folder in the
+        recordings folder with the dataset (robomimic .h5 or LeRobot v3.0 folder), the configs used and action_dispatcher/."""
         try:
             if not self._session_h5_files:
                 logger.warning("No recordings in this session to convert.")
                 return False
-            output_path = os.path.join(self._data_recorder.recorded_data_dir, "combined_dataset.h5")
+            if self._conversion_parser is None:
+                logger.error("No config loaded: nothing to convert with.")
+                return False
+            recordings = os.path.dirname(self._data_recorder.recorded_data_dir)  # the session folder's parent
+            output_dir, output_path = dataset_output_paths(recordings, output_format, datetime.now())
             success = self._yaml_converter.convert_multiple_files(
-                "robomimic", self._session_h5_files, output_path
+                output_format, self._session_h5_files, output_path
             )
-            if success:
-                logger.info(
-                    f"Successfully converted {len(self._session_h5_files)} recording(s) "
-                    f"to: {output_path}"
+            if not success:
+                logger.error(f"Dataset conversion failed: {self._yaml_converter.last_error or 'see the log above'}")
+                return False
+            logger.info(f"{self._yaml_converter.conversion_summary()} -> {output_path}")
+            try:
+                write_dataset_files(output_dir, self._conversion_parser, self._yaml_converter.options.source)
+            except Exception as e:
+                logger.warning(
+                    "The dataset was converted, but some extra files (config copies / action_dispatcher files) "
+                    f"could not be written: {str(e) or type(e).__name__}"
                 )
-            return success
+            return True
         except Exception as e:
             logger.error(f"Error converting recording to dataset: {e}")
             return False
 
-    def shutdown(self):
-        self.convert_recording_to_dataset()
-        self._should_spin = False
-
-        called_from_spin_thread = self._spin_thread is current_thread()
-
-        if called_from_spin_thread:
-            spin_thread = self._spin_thread
-            rclpy_initialized = self._rclpy_initialized
-            topic_subscribers = self._topic_subscribers
-
-            def _deferred_shutdown():
-                if spin_thread and spin_thread.is_alive():
-                    spin_thread.join(timeout=2.0)
-                topic_subscribers.close()
-                if rclpy_initialized:
-                    rclpy.shutdown()
-
-            Thread(target=_deferred_shutdown, daemon=True).start()
-        else:
-            if self._spin_thread and self._spin_thread.is_alive():
-                self._spin_thread.join(timeout=2.0)
-            self._topic_subscribers.close()
-            if self._rclpy_initialized:
-                rclpy.shutdown()
+    def shutdown(self) -> bool:
+        """Save a running recording, convert the session and stop ROS. Returns False, and leaves everything
+        running, if a recording could not be saved: its samples are only in memory (fix the disk and call again)."""
+        if self._data_recorder.is_recording:  # its samples are only in memory: save them before converting
+            self.stop_recording()
+        if getattr(self._data_recorder, "_unsaved", False):
+            if not self._data_recorder.retry_save():
+                logger.error(
+                    f"Not shutting down: the last recording could not be saved to "
+                    f"{self._data_recorder.h5_file_path} and is still only in memory."
+                )
+                return False
+            self._session_h5_files.append(self._data_recorder.retried_file)
+        self.convert_recording_to_dataset(user_settings.get("postprocess_default_format") or "robomimic")
+        self._topic_subscribers.close()  # stops its spin thread (no self-join when called from a callback)
+        if self._rclpy_initialized:
+            rclpy.shutdown()
+        return True

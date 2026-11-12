@@ -1,53 +1,20 @@
 """
 robomimic_runner.py
---------------------
-Inference backend that runs a checkpoint through robomimic's own
-RolloutPolicy (FileUtils.policy_from_checkpoint) instead of the
-from-scratch reimplementation in model_runner.py.
-
-Exposes the same minimal interface inference_node.py relies on from
-ModelRunner: get_action(obs_dict) -> np.ndarray, reset(), and an
+-------------------
+Inference backend that runs a robomimic checkpoint through robomimic's own
+RolloutPolicy (FileUtils.policy_from_checkpoint). Same interface as
+LeRobotPolicyRunner: get_action(obs_dict) -> np.ndarray, reset(), and an
 .obs_keys list.
 
-RolloutPolicy expects raw, un-normalized observations — it normalizes
-internally using the obs_normalization_stats embedded in the checkpoint,
-and denormalizes actions the same way. Do not enable `normalize: true` in
-obs_config.yaml for any key this backend consumes, or it will be
-normalized twice (same caveat already documented for robot0_joint_pos in
-the custom model_runner.py path).
-
-This is also the ONLY backend that can run camera/organized-pointcloud obs
-(ObsBuilder's "source:" passthrough entries, obs_builder.py). get_action()
-below already handles them correctly with no special-casing: `.astype(
-np.float32)` and `np.stack(..., axis=0)` operate on arbitrary-shape arrays,
-not just 1-D vectors, so an (H,W,C) image passes through unmodified (and
-frame-history-stacks into (To,H,W,C), matching what robomimic's own
-FrameStackWrapper produces for images in normal env-based rollouts).
-RolloutPolicy then runs its checkpoint's own CNN encoder internally for any
-key its shape_metadata marks as an image/depth/scan modality. The custom
-model_runner.py backend has no such encoder and will raise a clear error if
-handed one of these keys instead.
-
-Modeled directly on robomimic's own reference rollout, run_trained_agent.py
-(robomimic/scripts/run_trained_agent.py, also vendored at the repo root):
-its rollout() calls policy.start_episode() once, before the episode's first
-observation is used, then simply `act = policy(ob=obs)` once per step with a
-single current-frame, unbatched, raw obs dict — no manual batching,
-normalization, or frame-history stacking in the script itself (RolloutPolicy
-handles the first two internally).
-
-Frame-history stacking for multi-frame policies (e.g. Diffusion Policy,
-observation_horizon > 1) is NOT done by the script or RolloutPolicy either —
-in normal robomimic usage it happens one layer down, at the environment
-level: FileUtils.env_from_checkpoint wraps the env in
-robomimic.envs.wrappers.FrameStackWrapper whenever config.train.frame_stack
-> 1 (kept in sync with config.algo.horizon.observation_horizon by
-convention), so env.step()/env.reset() already return (To, D)-shaped obs per
-key by the time the script sees them. Since this ROS2 node has no EnvBase
-object for robomimic to wrap, _init_obs_history/_stack_obs_history below
-reimplement that wrapper's exact algorithm (duplicate-fill on reset,
-append + oldest-first stack on each step) directly around ObsBuilder's
-single-frame output.
+- robomimic normalizes observations and un-normalizes actions with the
+  checkpoint's stats; obs_config has no normalization.
+- Camera / organized point cloud observations (`source:` entries) reach the
+  policy unchanged: RolloutPolicy runs the checkpoint's own encoder.
+- Multi-frame policies (e.g. Diffusion Policy) get their frame history in
+  robomimic from FrameStackWrapper around the environment. There is no
+  environment here, so _init_obs_history / _stack_obs_history below repeat that
+  wrapper's algorithm (duplicate-fill on reset, append and stack oldest-first)
+  around ObsBuilder's single-frame output.
 """
 
 from __future__ import annotations
@@ -84,6 +51,13 @@ def _safe_cfg_get(obj, attr, default=None):
         return default
 
 
+def checkpoint_fps(ckpt: dict) -> Optional[float]:
+    """The rate the training data was recorded at: the converter writes it to the dataset's env_args
+    (env_kwargs.control_freq), which robomimic saves in the checkpoint as env_metadata. None for older checkpoints."""
+    env_meta = ckpt.get("env_metadata")
+    return (env_meta.get("env_kwargs") or {}).get("control_freq") if isinstance(env_meta, dict) else None
+
+
 class RobomimicPolicyRunner:
     """Runs inference via robomimic's RolloutPolicy, loaded straight from a checkpoint."""
 
@@ -91,6 +65,9 @@ class RobomimicPolicyRunner:
         torch_device = TorchUtils.get_torch_device(try_to_use_cuda=device.startswith("cuda"))
         self._policy, ckpt = FileUtils.policy_from_checkpoint(ckpt_path=checkpoint_path, device=torch_device)
         self.obs_keys: List[str] = list(ckpt["shape_metadata"]["all_obs_keys"])
+        self.action_dim: int = int(ckpt["shape_metadata"]["ac_dim"])
+        # Each predicted action is one step at this rate (None: older checkpoint, the caller picks the rate).
+        self.fps: Optional[float] = checkpoint_fps(ckpt)
 
         # observation_horizon (To) drives DiffusionPolicyUNet._get_action_trajectory
         # directly; robomimic's own shipped configs keep config.train.frame_stack
@@ -114,7 +91,7 @@ class RobomimicPolicyRunner:
 
         logger.info(
             f"[RobomimicPolicyRunner] algo={ckpt.get('algo_name')}  device={device}  "
-            f"obs_horizon={self._obs_horizon}  checkpoint={checkpoint_path}"
+            f"obs_horizon={self._obs_horizon}  fps={self.fps}  checkpoint={checkpoint_path}"
         )
         logger.info(f"[RobomimicPolicyRunner] obs_keys: {self.obs_keys}")
 

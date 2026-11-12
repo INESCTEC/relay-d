@@ -1,42 +1,52 @@
-import os
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from rclpy.duration import Duration as rclpy_duration
 import rclpy.time
 
 from relay_d.utils.coloring_logger import logger
+from relay_d.utils.numerics import stamp_to_sec
+from relay_d.utils import user_settings
+from relay_d.utils.qos import subscription_qos
 from relay_d.utils.tf_topic import (
     TfTopicSubscriptionError,
+    _TfTopicListener,
     get_or_create_tf_buffer,
     wait_for_transform,
 )
-from threading import Lock, Thread
+from threading import Lock, Thread, current_thread
 from rclpy.executors import SingleThreadedExecutor
 import importlib
 import time
 
 from sensor_msgs.msg import Image, PointCloud2, JointState, CompressedImage
-from geometry_msgs.msg import Twist, PoseStamped, TransformStamped
-from std_msgs.msg import String, Float32, Float64, Int32, Bool
-from tf2_msgs.msg import TFMessage
+from geometry_msgs.msg import Twist, PoseStamped
+from std_msgs.msg import Bool
 
 try:
-    from tf2_ros import TransformListener, Buffer
+    from tf2_ros import Buffer
 except ImportError:
-    TransformListener = None
     Buffer = None
     logger.warning("tf2_ros not available")
 
 
 class TopicSubscribers(Node):
+    # Timeouts come from the user settings, read when used so a change applies to the next subscription.
+    @property
+    def _CUSTOM_TF_WAIT_TIMEOUT(self):
+        return float(user_settings.get("tf_wait_timeout_s"))
+
+    @property
+    def _TOPIC_DISCOVERY_TIMEOUT(self):
+        return float(user_settings.get("topic_discovery_timeout_s"))
+
     def __init__(self):
         super().__init__("topic_subscribers")
         self.subscribers = {}
         self.latest_data = {}
         self.latest_timestamps = {}
         self.data_lock = Lock()
-        self._spin_lock = Lock()
+        self._spin_thread = None
+        self._should_spin = False
         self.message_type_cache = {}
         self.subscriber_status = {}
         self.tf_lookup_containers = {}
@@ -58,27 +68,20 @@ class TopicSubscribers(Node):
         # the requested transform before _create_tf_lookup treats it as
         # failed (TfTopicSubscriptionError) instead of proceeding silently.
         # Overridable per-input via the YAML `tf_wait_timeout` key.
-        self._CUSTOM_TF_WAIT_TIMEOUT = 10.0
         # How long _detect_topic_type polls the ROS graph for a topic before
         # giving up. 5s tolerates typical discovery latency right after node
         # startup without leaving the user waiting too long on a real miss.
-        self._TOPIC_DISCOVERY_TIMEOUT = 5.0
         self._TOPIC_DISCOVERY_POLL = 0.3
 
         try:
-            from tf2_ros import TransformListener, Buffer
+            from tf2_ros import Buffer
 
             self.tf_buffer = Buffer(cache_time=rclpy_duration(seconds=10.0))
 
-            # TF gets its own node + dedicated spin thread so that /tf (which
-            # can arrive in much denser bursts than regular topics, especially
-            # during rosbag replay) doesn't have to compete one-callback-at-a-time
-            # with everything else on this node's manually-driven spin_once()
-            # calls. Using a separate Node (rather than spin_thread=True on
-            # `self`) avoids racing with the shared spin_once calls elsewhere
-            # (data_recorder, AppAPI, the Qt spin timer) that also spin `self`.
+            # TF gets its own node + spin thread: /tf arrives in dense bursts (rosbag replay) and must not
+            # queue behind the topic callbacks, which run on this node's own spin thread (start_spinning).
             self._tf_node = rclpy.create_node(f"topic_subscribers_tf_listener_{id(self)}")
-            self.tf_listener = TransformListener(self.tf_buffer, self._tf_node, spin_thread=False)
+            self.tf_listener = _TfTopicListener(self.tf_buffer, self._tf_node, *self._DEFAULT_TF_KEY)
             self._tf_executor = SingleThreadedExecutor()
             self._tf_executor.add_node(self._tf_node)
             self._tf_spin_thread = Thread(target=self._tf_executor.spin, daemon=True)
@@ -91,36 +94,9 @@ class TopicSubscribers(Node):
         except Exception as e:
             logger.warning(f"Could not initialize TF2: {e}")
 
-        self.msg_type_mapping = {
-            "sensor_msgs/Image": Image,
-            "sensor_msgs/CompressedImage": CompressedImage,
-            "sensor_msgs/PointCloud2": PointCloud2,
-            "sensor_msgs/JointState": JointState,
-            "geometry_msgs/Twist": Twist,
-            "geometry_msgs/PoseStamped": PoseStamped,
-            "geometry_msgs/TransformStamped": TransformStamped,
-            "std_msgs/String": String,
-            "std_msgs/Float32": Float32,
-            "std_msgs/Float64": Float64,
-            "std_msgs/Int32": Int32,
-            "std_msgs/Bool": Bool,
-            "tf2_msgs/TFMessage": TFMessage,
-        }
-
         self._last_log_time = {}
         self._log_interval = 10.0
         logger.info("TopicSubscribers initialized")
-
-    def _list_available_topics(self):
-        try:
-            topics = self.get_topic_names_and_types()
-            logger.info(f"Available topics ({len(topics)}):")
-            for topic, types in topics[:20]:
-                logger.info(f"  {topic} -> {types[0] if types else 'unknown'}")
-            if len(topics) > 20:
-                logger.info(f"  ... and {len(topics) - 20} more")
-        except Exception as e:
-            logger.warning(f"Could not list topics: {e}")
 
     def _get_or_create_tf_buffer(self, tf_topic, tf_static_topic):
         """Return the Buffer feeding from (tf_topic, tf_static_topic), creating
@@ -155,11 +131,12 @@ class TopicSubscribers(Node):
                 getattr(container, "tf_wait_timeout", None)
                 or self._CUSTOM_TF_WAIT_TIMEOUT
             )
-            transfer_rate = getattr(container, "transfer_rate", 10)
 
             if not container_id:
                 logger.error("Container missing container_id")
                 return False
+            if container_id in self.subscribers:  # e.g. Start pressed again after a failed start: no duplicate subscription
+                self.stop_subscribing(container_id)
 
             is_tf_lookup = parent_frame and child_frame and not topic_path
 
@@ -172,7 +149,6 @@ class TopicSubscribers(Node):
                     container_id,
                     parent_frame,
                     child_frame,
-                    transfer_rate,
                     tf_topic,
                     tf_static_topic,
                     tf_wait_timeout,
@@ -199,8 +175,8 @@ class TopicSubscribers(Node):
             logger.info(f"Creating subscription: {topic_path} -> {msg_class.__name__}")
 
             callback = self._create_callback(container_id, input_name)
-            qos = QoSProfile(depth=10, reliability=QoSReliabilityPolicy.RELIABLE)
-            subscriber = self.create_subscription(
+            qos = subscription_qos(self, topic_path)
+            subscriber = self.create_subscription(  # safe while the spin thread runs: rclpy defers handle destruction/use
                 msg_class, topic_path, callback, qos_profile=qos
             )
 
@@ -267,6 +243,26 @@ class TopicSubscribers(Node):
         validation before any subscriber is actually created."""
         return self._detect_topic_type(topic_path, timeout=timeout) is not None
 
+    def unavailable_inputs(self, input_data):
+        """One line per configured input whose topic / TF transform is not available now (empty: all are).
+        The Config page and AppAPI refuse a config with any."""
+        failures = []
+        for item in input_data:
+            name = item["name"]
+            if item.get("is_tf"):
+                tf_topic = item.get("tf_topic", "/tf")
+                logger.info(f"Validating TF input '{name}': {item['parent_frame']} -> {item['child_frame']} on {tf_topic}...")
+                if not self.is_tf_available(
+                    item["parent_frame"], item["child_frame"], tf_topic=tf_topic,
+                    tf_static_topic=item.get("tf_static_topic", "/tf_static"), timeout=item.get("tf_wait_timeout"),
+                ):
+                    failures.append(f"  {name}: TF {item['parent_frame']} -> {item['child_frame']} not available on tf_topic={tf_topic}")
+            elif item.get("topic"):
+                logger.info(f"Validating input '{name}': topic {item['topic']}...")
+                if not self.is_topic_available(item["topic"]):
+                    failures.append(f"  {name}: topic {item['topic']} not found")
+        return failures
+
     def is_tf_available(
         self,
         parent_frame,
@@ -298,11 +294,6 @@ class TopicSubscribers(Node):
         try:
             if topic_path in self.message_type_cache:
                 return self.message_type_cache[topic_path]
-
-            if topic_type_msg in self.msg_type_mapping:
-                msg_class = self.msg_type_mapping[topic_type_msg]
-                self.message_type_cache[topic_path] = msg_class
-                return msg_class
 
             if topic_type_msg and "/" in topic_type_msg:
                 parts = topic_type_msg.split("/")
@@ -375,8 +366,7 @@ class TopicSubscribers(Node):
                 with self.data_lock:
                     self.latest_data[container_id] = msg
                     if hasattr(msg, "header"):
-                        s = msg.header.stamp
-                        self.latest_timestamps[container_id] = s.sec + s.nanosec * 1e-9
+                        self.latest_timestamps[container_id] = stamp_to_sec(msg.header.stamp)
                     else:
                         self.latest_timestamps[container_id] = time.time()
                     if container_id in self.subscriber_status:
@@ -426,7 +416,7 @@ class TopicSubscribers(Node):
 
             if container_id in self.subscribers:
                 sub = self.subscribers.pop(container_id)
-                if sub != "tf":
+                if sub != "tf_lookup":
                     try:
                         self.destroy_subscription(sub)
                     except Exception as e:
@@ -448,7 +438,7 @@ class TopicSubscribers(Node):
     def clear_all_subscribers(self):
         try:
             for container_id, sub in list(self.subscribers.items()):
-                if sub != "tf":
+                if sub != "tf_lookup":
                     try:
                         self.destroy_subscription(sub)
                     except Exception as e:
@@ -480,8 +470,36 @@ class TopicSubscribers(Node):
             logger.error(f"Failed to clear subscribers: {e}")
             return False
 
+    def start_spinning(self):
+        """Run this node's callbacks in a thread (GUI and AppAPI). A Qt timer doing one spin_once per node every 10 ms
+        handled ~78 of 400 msg/s, ~100 ms late. Own executor: the global one refuses a second spinning thread."""
+        if self._spin_thread is not None and self._spin_thread.is_alive():
+            return
+        self._should_spin = True
+        executor = SingleThreadedExecutor()
+        executor.add_node(self)
+        self._spin_thread = Thread(target=self._spin_loop, args=(executor,), daemon=True)
+        self._spin_thread.start()
+
+    def _spin_loop(self, executor):
+        while self._should_spin:
+            try:
+                executor.spin_once(timeout_sec=0.01)
+            except Exception as e:
+                if not rclpy.ok():
+                    break
+                self._log_throttled(f"Error spinning topic_subscribers: {e}", "spin")
+        executor.remove_node(self)
+
+    def stop_spinning(self):
+        """Stop the spin thread (no join when called from a callback on that thread)."""
+        self._should_spin = False
+        if self._spin_thread is not None and self._spin_thread is not current_thread():
+            self._spin_thread.join(timeout=2.0)
+
     def close(self):
-        """Stop the dedicated TF spin thread/executor and destroy its node."""
+        """Stop the spin threads (this node's and the TF one) and destroy the TF node."""
+        self.stop_spinning()
         try:
             if self._tf_executor is not None:
                 self._tf_executor.shutdown()
@@ -528,7 +546,6 @@ class TopicSubscribers(Node):
         container_id,
         parent_frame,
         child_frame,
-        transfer_rate=10,
         tf_topic="/tf",
         tf_static_topic="/tf_static",
         tf_wait_timeout=None,
@@ -631,8 +648,7 @@ class TopicSubscribers(Node):
 
                 with self.data_lock:
                     self.latest_data[container_id] = transform
-                    s = transform.header.stamp
-                    self.latest_timestamps[container_id] = s.sec + s.nanosec * 1e-9
+                    self.latest_timestamps[container_id] = stamp_to_sec(transform.header.stamp)
                     if container_id in self.subscriber_status:
                         status = self.subscriber_status[container_id]
                         status["message_count"] += 1
@@ -657,7 +673,7 @@ class TopicSubscribers(Node):
                         f"TF waiting: {parent_frame} -> {child_frame} ({str(e)[:60]})",
                         f"tf_{container_id}",
                     )
-        except Exception as e:
+        except Exception:
             pass
 
     def lookup_tf_at_time(self, container_id, ros_time, timeout_sec=0.05):
@@ -686,19 +702,6 @@ class TopicSubscribers(Node):
         except Exception:
             return None
 
-    def debug_subscribers(self):
-        try:
-            logger.info(f"Subscribers: {len(self.subscribers)}")
-            for container_id, status in self.subscriber_status.items():
-                logger.info(
-                    f"  {container_id}: {status.get('topic', 'unknown')} | "
-                    f"Status: {status.get('status')} | "
-                    f"Messages: {status.get('message_count', 0)} | "
-                    f"Data: {self.has_data(container_id)}"
-                )
-        except Exception as e:
-            logger.error(f"Debug error: {e}")
-
     def get_content(self, container_id=None):
         try:
             with self.data_lock:
@@ -706,12 +709,8 @@ class TopicSubscribers(Node):
                     return self.latest_data.get(container_id, None)
                 else:
                     return dict(self.latest_data)
-        except Exception as e:
+        except Exception:
             return None
-
-    def get_timestamps(self):
-        with self.data_lock:
-            return dict(self.latest_timestamps)
 
     def get_content_and_timestamps(self):
         """Atomic snapshot of both latest_data and latest_timestamps under a single lock hold.
@@ -734,45 +733,6 @@ class TopicSubscribers(Node):
             self.latest_timestamps.clear()
         logger.info("Flushed latest_data and timestamps before recording start")
 
-    def get_container_data(self, container):
-        container_id = getattr(container, "container_id", None)
-        if container_id:
-            return self.get_content(container_id)
-        return None
-
-    def get_topic_list(self):
-        return [status.get("topic", "") for status in self.subscriber_status.values()]
-
-    def get_all_data_summary(self):
-        summary = {
-            "total_subscribers": len(self.subscribers),
-            "active_subscribers": sum(
-                1
-                for s in self.subscriber_status.values()
-                if s.get("status") == "active"
-            ),
-            "containers_with_data": sum(
-                1 for cid, d in self.latest_data.items() if d is not None
-            ),
-            "total_messages_received": sum(
-                s.get("message_count", 0) for s in self.subscriber_status.values()
-            ),
-            "subscriber_details": [],
-        }
-
-        for container_id, status in self.subscriber_status.items():
-            summary["subscriber_details"].append(
-                {
-                    "container_id": container_id,
-                    "topic": status.get("topic", "unknown"),
-                    "message_count": status.get("message_count", 0),
-                    "has_data": self.has_data(container_id),
-                    "status": status.get("status", "unknown"),
-                }
-            )
-
-        return summary
-
     def get_message_count(self, container_id):
         return self.subscriber_status.get(container_id, {}).get("message_count", 0)
 
@@ -780,6 +740,3 @@ class TopicSubscribers(Node):
         if container_id:
             return self.subscriber_status.get(container_id, {})
         return dict(self.subscriber_status)
-
-    def _get_message_class_from_cache(self, topic_path):
-        return self.message_type_cache.get(topic_path)

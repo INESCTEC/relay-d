@@ -29,8 +29,9 @@ _FIXED_FRAME_PLACEHOLDER = "__PLAYBACK_FIXED_FRAME__"
 # robot_state_publisher's robot_description/joint_states use relative topic
 # names, so a plain namespace remap moves them under /playback. TF is
 # published on the absolute "/tf" regardless of namespace, so it needs an
-# explicit topic remap on every process that touches it here.
-_TF_REMAP_ARGS = ["-r", "/tf:=/playback/tf", "-r", "/tf_static:=/playback/tf_static"]
+# explicit topic remap on every process that touches it here (the DataPlayer node uses the same remap, so
+# its TF traffic lands on /playback/tf instead of colliding with a live /tf).
+TF_REMAP_ARGS = ["-r", "/tf:=/playback/tf", "-r", "/tf_static:=/playback/tf_static"]
 
 _REQUIRED_PACKAGES = ("robot_state_publisher", "rviz2")
 
@@ -80,7 +81,7 @@ class PlaybackProcessManager:
                     "--ros-args",
                     "-p", f"robot_description:={urdf_xml}",
                     "-r", "__ns:=/playback",
-                    *_TF_REMAP_ARGS,
+                    *TF_REMAP_ARGS,
                 ],
                 start_new_session=True,
             )
@@ -91,7 +92,7 @@ class PlaybackProcessManager:
                     "ros2", "run", "rviz2", "rviz2",
                     "-d", self._rviz_config_path,
                     "--ros-args",
-                    *_TF_REMAP_ARGS,
+                    *TF_REMAP_ARGS,
                 ],
                 start_new_session=True,
             )

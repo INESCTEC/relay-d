@@ -1,19 +1,5 @@
 import os
-import sys
-from PyQt5.QtWidgets import (
-    QMainWindow,
-    QApplication,
-    QLabel,
-    QTextEdit,
-    QPushButton,
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QScrollArea,
-    QFrame,
-    QGridLayout,
-    QSizePolicy,
-)
+from PyQt5.QtWidgets import QWidget, QVBoxLayout, QScrollArea, QGridLayout, QSizePolicy
 from PyQt5 import uic
 from PyQt5.QtCore import Qt
 from relay_d.utils.coloring_logger import logger
@@ -76,17 +62,9 @@ class TopicContainers:
             # Set basic properties for identification
             container.topic_type = topic_type
 
-            # Use output_map from container_data if available, otherwise use input_name
-            output_map = None
-            input_name = None
-            if container_data:
-                output_map = container_data.get("output_map")
-                input_name = container_data.get("input_name")
-
-            # Use output_map as container_id (this is the name used in HDF5 output)
-            if output_map:
-                container.container_id = output_map
-            elif input_name:
+            # The input name is the container id (and the HDF5 group it is recorded into)
+            input_name = container_data.get("input_name") if container_data else None
+            if input_name:
                 container.container_id = input_name
             else:
                 container.container_id = f"container_{self.container_count}_{topic_type}"
@@ -571,49 +549,6 @@ class TopicContainers:
 
         logger.info("Cleared all containers")
 
-    def remove_container(self, container):
-        """
-        Remove a container from the UI and tracking list
-
-        Args:
-            container (QWidget): The container to remove
-        """
-        try:
-            if container in self.containers:
-                self.containers.remove(container)
-
-            # Remove from parent widget's layout
-            parent = container.parent()
-            if parent and parent.layout():
-                parent.layout().removeWidget(container)
-
-            # Hide and delete the container
-            container.hide()
-            container.deleteLater()
-
-            logger.info(
-                f"Removed container: {getattr(container, 'container_id', 'unknown')}"
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to remove container: {e}")
-
-    def get_containers_by_type(self, topic_type):
-        """
-        Get all containers of a specific topic type
-
-        Args:
-            topic_type (str): The topic type to filter by
-
-        Returns:
-            list: List of containers matching the topic type
-        """
-        return [
-            container
-            for container in self.containers
-            if hasattr(container, "topic_type") and container.topic_type == topic_type
-        ]
-
     def create_and_add_container(
         self, topic_type, container_data=None, target_widget=None
     ):
@@ -679,94 +614,6 @@ class TopicContainers:
 
         except Exception as e:
             logger.error(f"Failed to update container info: {e}")
-
-    def get_container_count(self):
-        """Get the number of containers"""
-        return len(self.containers)
-
-    def get_container_by_id(self, container_id):
-        """Get container by its ID"""
-        for container in self.containers:
-            if (
-                hasattr(container, "container_id")
-                and container.container_id == container_id
-            ):
-                return container
-        return None
-
-    def get_container_by_attribute(self, attribute_name, attribute_value):
-        """
-        Get container by any attribute
-
-        Args:
-            attribute_name (str): Name of the attribute to search by
-            attribute_value: Value to match
-
-        Returns:
-            QWidget or None: The first container matching the criteria
-        """
-        for container in self.containers:
-            if (
-                hasattr(container, attribute_name)
-                and getattr(container, attribute_name) == attribute_value
-            ):
-                return container
-        return None
-
-    def get_containers_by_attribute(self, attribute_name, attribute_value):
-        """
-        Get all containers matching an attribute
-
-        Args:
-            attribute_name (str): Name of the attribute to search by
-            attribute_value: Value to match
-
-        Returns:
-            list: List of containers matching the criteria
-        """
-        return [
-            container
-            for container in self.containers
-            if hasattr(container, attribute_name)
-            and getattr(container, attribute_name) == attribute_value
-        ]
-
-    def update_container_status(self, container_id, status):
-        """
-        Update the status of a specific container by ID
-
-        Args:
-            container_id (str): The container ID
-            status (str): The new status
-        """
-        container = self.get_container_by_id(container_id)
-        if container:
-            self.update_container_info(container, {"status": status})
-            return True
-        return False
-
-    def get_all_container_info(self):
-        """
-        Get information about all containers
-
-        Returns:
-            list: List of dictionaries with container information
-        """
-        container_info = []
-        for container in self.containers:
-            info = {
-                "container_id": getattr(container, "container_id", "unknown"),
-                "topic_type": getattr(container, "topic_type", "unknown"),
-            }
-
-            # Add any additional attributes that exist
-            for attr_name in ["input_name", "topic_path", "topic_type_msg", "status"]:
-                if hasattr(container, attr_name):
-                    info[attr_name] = getattr(container, attr_name)
-
-            container_info.append(info)
-
-        return container_info
 
     def create_multiple_containers(self, container_specs, target_widget=None):
         """
@@ -977,82 +824,6 @@ class TopicContainers:
 
         except Exception as e:
             logger.error(f"Error in comprehensive layout update: {e}")
-
-    def handle_window_resize(self, new_size):
-        """Handle window resize events to expand containers"""
-        try:
-            logger.info(
-                f"Handling window resize to: {new_size.width()}x{new_size.height()}"
-            )
-            self.resize_containers_to_window(new_size)
-        except Exception as e:
-            logger.error(f"Error handling window resize: {e}")
-
-    def debug_containers(self):
-        """Debug method to log container information"""
-        try:
-            logger.info(f"=== Container Debug Info ===")
-            logger.info(f"Total containers tracked: {len(self.containers)}")
-
-            for i, container in enumerate(self.containers):
-                container_id = getattr(container, "container_id", "unknown")
-                is_visible = container.isVisible()
-                size = container.size()
-                pos = container.pos()
-                parent = container.parent()
-                parent_name = parent.objectName() if parent else "None"
-
-                logger.info(f"Container {i + 1}: {container_id}")
-                logger.info(f"  Visible: {is_visible}")
-                logger.info(f"  Size: {size.width()}x{size.height()}")
-                logger.info(f"  Position: ({pos.x()}, {pos.y()})")
-                logger.info(f"  Parent: {parent_name}")
-
-                # Check if container is in a layout
-                if parent and parent.layout():
-                    layout = parent.layout()
-                    if hasattr(layout, "indexOf"):
-                        index = layout.indexOf(container)
-                        logger.info(f"  Layout index: {index}")
-
-                    # For grid layouts, find the position
-                    if isinstance(layout, QGridLayout):
-                        found_position = None
-                        for row in range(layout.rowCount()):
-                            for col in range(layout.columnCount()):
-                                item = layout.itemAtPosition(row, col)
-                                if item and item.widget() == container:
-                                    found_position = (row, col)
-                                    break
-                            if found_position:
-                                break
-                        logger.info(f"  Grid position: {found_position}")
-
-            # Also debug the layout itself
-            if hasattr(self.ui, "page_start") and hasattr(
-                self.ui.page_start, "_container_layout_setup"
-            ):
-                layout = self.ui.page_start._container_layout_setup
-                logger.info(f"=== Grid Layout Debug ===")
-                logger.info(f"Grid rows: {layout.rowCount()}")
-                logger.info(f"Grid columns: {layout.columnCount()}")
-                logger.info(f"Grid item count: {layout.count()}")
-
-                # Check each position in the grid
-                widget_count_in_grid = 0
-                for row in range(layout.rowCount()):
-                    for col in range(layout.columnCount()):
-                        item = layout.itemAtPosition(row, col)
-                        if item and item.widget():
-                            widget_count_in_grid += 1
-                            widget = item.widget()
-                            widget_id = getattr(widget, "container_id", "unknown")
-                            logger.info(f"  Position ({row}, {col}): {widget_id}")
-
-                logger.info(f"Total widgets in grid: {widget_count_in_grid}")
-
-        except Exception as e:
-            logger.error(f"Error in debug_containers: {e}")
 
     def reset_layout_references(self, target_widget):
         """Reset layout references when clearing containers"""

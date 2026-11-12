@@ -1,0 +1,35 @@
+# =============================================================================
+# Postprocess options — conversion choices that are NOT part of what gets recorded
+# =============================================================================
+# Optional. Keep this file next to your acquisition config as
+# `postprocess_config.yaml` (it is picked up automatically) or load it with
+# "Load Options..." on the Post-process page. Any key left out takes its default.
+# The acquisition config itself only says what to record and how streams/actions
+# are built; nothing in here changes the recording.
+# Removed keys (robomimic.metadata, robomimic.training_model, splits.test_frac)
+# are refused: the robomimic policy is chosen on the Train tab.
+# =============================================================================
+
+postprocess:
+
+  # ---------------------------------------------------------------------------
+  # robomimic — used when converting to the Robomimic HDF5 format
+  # ---------------------------------------------------------------------------
+  robomimic:
+
+    # Fractions for the dataset's `mask/train|valid` groups (any rest also trains)
+    splits:
+      train_frac: 0.8
+      val_frac: 0.2
+
+
+  # ---------------------------------------------------------------------------
+  # lerobot — used when converting to the LeRobotDataset v3.0 format
+  # (fps comes from `recording_frequency` in the acquisition config)
+  # ---------------------------------------------------------------------------
+  lerobot:
+    task: "describe the task here"     # natural-language task text (default: dataset_name)
+    # robot_type: iiwa                 # optional, written to meta/info.json
+    # state_streams:                   # optional: which output.streams make up
+    #   - robot_joint_pos              # observation.state, in this order
+    #   - eef_translation              # (default: all numeric streams, in declaration order)

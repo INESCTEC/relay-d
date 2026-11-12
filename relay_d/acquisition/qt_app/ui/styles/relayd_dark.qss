@@ -157,34 +157,9 @@ QPushButton#btn_start_record:pressed {
 }
 
 
-/* — Pause Record (amber) — */
-
-QPushButton#btn_pause_record {
-    background-color: rgba(251, 191, 36, 0.10);
-    border: 1px solid rgba(251, 191, 36, 0.25);
-    border-left: 4px solid #FBBF24;
-    color: #FDE68A;
-    font-weight: 600;
-    border-radius: 8px;
-    padding: 10px 16px;
-    text-align: left;
-}
-
-QPushButton#btn_pause_record:hover {
-    background-color: rgba(251, 191, 36, 0.18);
-    border-color: rgba(251, 191, 36, 0.40);
-    border-left: 5px solid #F59E0B;
-}
-
-QPushButton#btn_pause_record:pressed {
-    background-color: rgba(251, 191, 36, 0.25);
-    border-left: 6px solid #D97706;
-}
-
-
 /* — Stop Record (red) — */
 
-QPushButton#btn_stop_record {
+QPushButton#btn_stop_record, QPushButton#btn_run_stop {
     background-color: rgba(248, 113, 113, 0.10);
     border: 1px solid rgba(248, 113, 113, 0.25);
     border-left: 4px solid #F87171;
@@ -195,18 +170,18 @@ QPushButton#btn_stop_record {
     text-align: left;
 }
 
-QPushButton#btn_stop_record:hover {
+QPushButton#btn_stop_record:hover, QPushButton#btn_run_stop:hover {
     background-color: rgba(248, 113, 113, 0.18);
     border-color: rgba(248, 113, 113, 0.40);
     border-left: 5px solid #EF4444;
 }
 
-QPushButton#btn_stop_record:pressed {
+QPushButton#btn_stop_record:pressed, QPushButton#btn_run_stop:pressed {
     background-color: rgba(248, 113, 113, 0.25);
     border-left: 6px solid #DC2626;
 }
 
-QPushButton#btn_stop_record:disabled {
+QPushButton#btn_stop_record:disabled, QPushButton#btn_run_stop:disabled {
     background-color: #22262E;
     color: #4B5563;
     border: 1px solid #333942;
@@ -230,13 +205,6 @@ QStackedWidget > QWidget {
     background: #151820;
     border: none;
     border-radius: 0px;
-    margin: 0px;
-}
-
-/* Start page stays fully transparent */
-QWidget#page_start {
-    background: transparent !important;
-    border: none;
     margin: 0px;
 }
 
@@ -293,16 +261,6 @@ QWidget.TopicContainer {
  * 5. PAGE TITLES & SECTION HEADERS (ORIGINAL STYLED BOXES)
  * --------------------------------------------------------------------------- */
 
-QLabel#settingsPageTitle {
-    background-color: #2A2F38;
-    border: 1px solid #333942;
-    border-radius: 10px;
-    color: #FFFFFF;
-    padding: 14px;
-    font-size: 22px;
-    font-weight: 700;
-}
-
 QLabel#label_2 {
     background-color: #2A2F38;
     border: 1px solid #333942;
@@ -333,14 +291,13 @@ QLabel#recordingSettingsLabel {
     font-weight: 600;
 }
 
-QLabel#inputStructureLabel {
-    background-color: rgba(96, 165, 250, 0.10);
-    border: 1px solid rgba(96, 165, 250, 0.30);
+QLabel#precheckError {
+    background-color: rgba(248, 113, 113, 0.10);
+    border: 1px solid rgba(248, 113, 113, 0.25);
+    border-left: 4px solid #F87171;
     border-radius: 8px;
-    color: #93C5FD;
-    padding: 10px;
-    font-size: 15px;
-    font-weight: 600;
+    color: #FCA5A5;
+    padding: 8px 12px;
 }
 
 QLabel#outputPreviewLabel {
@@ -772,9 +729,9 @@ QToolTip {
  * 14. PAGE TITLES (compact, left-aligned)
  * --------------------------------------------------------------------------- */
 
+QLabel#pageTitle,
 QLabel#dataPageTitle,
-QLabel#importPageTitle,
-QLabel#settingsPageTitle {
+QLabel#importPageTitle {
     background: transparent;
     border: none;
     color: #FFFFFF;
@@ -806,9 +763,9 @@ QLabel#recordingSettingsLabel {
  * 16. SEPARATORS
  * --------------------------------------------------------------------------- */
 
+QFrame#pageSeparator,
 QFrame#dataSeparator,
-QFrame#importSeparator,
-QFrame#settingsSeparator {
+QFrame#importSeparator {
     color: #333942;
 }
 
@@ -817,7 +774,6 @@ QFrame#settingsSeparator {
  * 17. PANEL SUB-LABELS (compact, left-aligned)
  * --------------------------------------------------------------------------- */
 
-QLabel#inputStructureLabel,
 QLabel#outputPreviewLabel {
     background: transparent;
     border: none;
@@ -995,4 +951,78 @@ QDialog#CustomMessageBox {
 QDialog#CustomMessageBox QLabel#msgBodyLabel {
     color: #9CA3AF;
     font-size: 12px;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * 20. SHARED PAGE PATTERN: group boxes, tabs, content-page buttons
+ *     (every page: 24/20 margins, QLabel#pageTitle, QFrame#pageSeparator, then content)
+ * --------------------------------------------------------------------------- */
+
+QGroupBox {
+    background: transparent;
+    border: 1px solid #333942;
+    border-radius: 8px;
+    margin-top: 14px;
+    padding: 14px 10px 10px 10px;
+    font-weight: 600;
+    color: #FFFFFF;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 12px;
+    padding: 0px 6px;
+    color: #FFFFFF;
+}
+
+QTabWidget::pane {
+    border: 1px solid #333942;
+    border-radius: 8px;
+    background: transparent;
+    top: -1px;
+}
+
+QTabBar {
+    font-weight: 600;  /* on the bar, not the tab: Qt sizes the tabs from the bar's font */
+}
+
+QTabBar::tab {
+    background: transparent;
+    color: #9AA3B2;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 18px;
+    margin-right: 4px;
+}
+
+QTabBar::tab:selected {
+    color: #FFFFFF;
+    border-bottom: 2px solid #3B82F6;
+}
+
+QTabBar::tab:hover:!selected {
+    color: #FFFFFF;
+}
+
+QStackedWidget QPushButton {
+    min-height: 28px;
+}
+
+/* scroll areas inside pages (Settings tabs, ...) show the page background, not the system palette */
+QStackedWidget QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QStackedWidget QScrollArea > QWidget > QWidget {
+    background: transparent;
+}
+
+/* hint shown on a page that has nothing to show yet (Record page without a config) */
+QLabel#pageHint {
+    color: #9AA3B2;
+    font-size: 14px;
+    padding: 4px 0px;
 }
