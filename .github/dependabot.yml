@@ -4,8 +4,12 @@ updates:
   - package-ecosystem: "pip"
     directory: "/"
     schedule:
-      interval: "weekly"
-    open-pull-requests-limit: 10
+      interval: "monthly"
+    # One grouped PR (one branch) per ecosystem, so the repo isn't flooded
+    open-pull-requests-limit: 1
+    groups:
+      pip-dependencies:
+        patterns: ["*"]
     labels:
       - "dependencies"
 
@@ -13,7 +17,11 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
+    open-pull-requests-limit: 1
+    groups:
+      github-actions:
+        patterns: ["*"]
     labels:
       - "dependencies"
       - "ci"
