@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Form implementation generated from reading ui file 'mainWindow.ui'
+# Form implementation generated from reading ui file '/home/pascd/Documents/git-repos/relay-d/relay_d/acquisition/qt_app/ui/containers/mainWindow.ui'
 #
 # Created by: PyQt5 UI code generator 5.15.11
 #
