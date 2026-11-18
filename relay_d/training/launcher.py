@@ -334,7 +334,7 @@ echo "Relay-D training run: {name}"
 printf '$ %s\n\n' {quoted}
 # Ctrl+C reaches the training (same process group) but must not kill this script before it records the end.
 trap 'interrupted=1' INT
-{command} 2>&1 | tee -a train.log
+{command} 2>&1 | tee -i -a train.log  # -i: Ctrl+C must not kill tee before the training's last output
 code=${{PIPESTATUS[0]}}
 # robomimic catches its own crash, prints "run failed with error" and returns 0: that is a failure
 if [ "$code" = 0 ] && grep -q "run failed with error" train.log 2>/dev/null; then code=1; fi

@@ -64,7 +64,7 @@ trap 'interrupted=1' INT
 {{
 echo "Relay-D: {fmt} environment in" {env_dir}  # env_dir is shlex-quoted: never inside double quotes
 {steps}
-}} 2>&1 | tee {log}
+}} 2>&1 | tee -i {log}  # -i: Ctrl+C must not kill tee before the last output
 code=${{PIPESTATUS[0]}}
 if [ -n "$interrupted" ]; then echo 130 > {exit_file}; exit 0; fi
 echo $code > {exit_file}

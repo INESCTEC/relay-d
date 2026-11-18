@@ -172,7 +172,8 @@ def _next_step(obs: np.ndarray) -> np.ndarray:
 # where inference reads the rate the policy was trained at.
 ENV_ARGS = {"env_name": "relay_d", "type": 1, "env_kwargs": {}}
 
-FPS_REQUIRED = "A positive 'recording_frequency' is required in the config (used as the fps)."
+FPS_REQUIRED = ("A positive, whole-number 'recording_frequency' is required in the config for LeRobot "
+                "(it is the dataset fps, an integer).")
 
 
 def natural_key(path: str) -> List:
@@ -297,6 +298,7 @@ class YAMLDrivenConverter:
         # Demos of the last conversion: how many were written, and "file::demo" of each one dropped.
         self.converted_demos: int = 0
         self.skipped_demos: List[str] = []
+        self.skipped_files: List[str] = []  # files that could not be read at all: their demos are not counted
         # Bridge-map keys with zero data anywhere in the current batch and no
         # way to infer a shape for them — excluded from output entirely.
         self._excluded_keys: Set[str] = set()
@@ -419,7 +421,7 @@ class YAMLDrivenConverter:
             dropped and the remaining ones are still converted.
         """
         self.last_error = None
-        self.converted_demos, self.skipped_demos = 0, []
+        self.converted_demos, self.skipped_demos, self.skipped_files = 0, [], []
         if format_name == "lerobot":
             return self.convert_to_lerobot(
                 input_files, output_path, data_config=data_config
@@ -442,7 +444,7 @@ class YAMLDrivenConverter:
                 data_grp = out_f.create_group("data")
                 total_demos = 0
                 processed: List[str] = []
-                skipped: List[str] = []
+                skipped = self.skipped_files
                 counter = 0
 
                 for file_path in sorted_files:
@@ -581,7 +583,7 @@ class YAMLDrivenConverter:
         )
 
         self.last_error = None
-        self.converted_demos, self.skipped_demos = 0, []
+        self.converted_demos, self.skipped_demos, self.skipped_files = 0, [], []
         prepared = self._prepare_batch("lerobot", input_files, data_config)
         if prepared is None:
             return False
@@ -626,7 +628,7 @@ class YAMLDrivenConverter:
         task_text = self._lerobot_task(task)
 
         written = 0
-        skipped: List[str] = []
+        skipped = self.skipped_files
         try:
             with LeRobotDatasetWriter(
                 output_dir, fps=fps, robot_type=lerobot_cfg.get("robot_type"),
@@ -725,7 +727,10 @@ class YAMLDrivenConverter:
         """One line for the GUI / CLI: how many demos of the last conversion were written."""
         total = self.converted_demos + len(self.skipped_demos)
         text = f"Converted {self.converted_demos} of {total} demos"
-        return text + (f" ({len(self.skipped_demos)} skipped, see log)" if self.skipped_demos else "")
+        text += f" ({len(self.skipped_demos)} skipped, see log)" if self.skipped_demos else ""
+        # an unreadable file's demos are unknown: name the files, or "3 of 3" would look complete
+        return text + (f"; {len(self.skipped_files)} file(s) could not be read: {', '.join(self.skipped_files)}"
+                       if self.skipped_files else "")
 
     # ------------------------------------------------------------------
     # Pre-check: what a conversion would do, nothing written
@@ -891,18 +896,11 @@ class YAMLDrivenConverter:
             value = float(raw)
         except (TypeError, ValueError):
             value = 0.0
-        if value <= 0:
-            logger.error(
-                "LeRobot output needs a positive `recording_frequency` in the "
-                "acquisition config (used as the dataset fps)."
-            )
+        if value <= 0 or value != round(value):
+            # rounding 7.5 Hz to 8 would play the dataset 6.7% fast (and 2.5 -> 2 rejects every demo as off-rate)
+            logger.error(f"LeRobot output needs a positive whole-number `recording_frequency` (the dataset fps), got {raw!r}.")
             return None
-        if value != round(value):
-            logger.warning(
-                f"recording_frequency {value} is not an integer; LeRobot requires an "
-                f"integer fps, using {int(round(value))}."
-            )
-        return int(round(value))
+        return int(value)
 
     def _lerobot_split_obs(
         self, demo: Dict, state_streams: Optional[List[str]]

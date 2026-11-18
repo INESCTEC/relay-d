@@ -143,3 +143,16 @@ def test_recorder_and_live_obs_read_joints_in_the_same_order_over_ros(ros, tmp_p
     sb.evaluate({"js": published})
     recorded = sb.finalize()["q"][0]
     np.testing.assert_allclose(live, recorded)  # was [1, 2, 3] live vs [3, 2, 1] in the dataset
+
+
+def test_message_classes_are_cached_by_type_and_never_guessed_from_the_topic_name():
+    from sensor_msgs.msg import JointState as JS
+    from std_msgs.msg import Float64
+
+    subs = TopicSubscribers.__new__(TopicSubscribers)  # skip ROS setup: only the lookup is used
+    subs.message_type_cache = {}
+    assert subs._get_message_class("sensor_msgs/msg/JointState", "/gripper") is JS
+    # the same topic with another type in another config: was the cached JointState (no data would arrive)
+    assert subs._get_message_class("std_msgs/msg/Float64", "/gripper") is Float64
+    # a custom package that is not sourced: was guessed from the name ("gripper" -> Bool), which never receives anything
+    assert subs._get_message_class("my_robot_msgs/msg/GripperState", "/gripper") is None

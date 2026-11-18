@@ -216,3 +216,14 @@ def test_episode_recorded_slower_than_the_dataset_fps_is_skipped(tmp_path, conve
     assert converter.convert_multiple_files("lerobot", [str(rec)], str(out))
     info = json.loads((out / "meta/info.json").read_text())
     assert info["total_episodes"] == 1 and info["total_frames"] == LENGTHS[0]  # its time base would be 1.4x too fast
+
+
+@pytest.mark.parametrize("hz", [7.5, 2.5])
+def test_a_non_integer_recording_frequency_is_refused_not_rounded(tmp_path, converter, hz):
+    """7.5 Hz rounded to 8 played the dataset 6.7% fast; 2.5 -> 2 then rejected every demo as recorded at the wrong rate."""
+    rec = tmp_path / "recording_0.h5"
+    write_recording(rec, LENGTHS)
+    converter.data_config["recording_frequency"] = hz
+    assert not converter.convert_multiple_files("lerobot", [str(rec)], str(tmp_path / "ds"))
+    assert "whole-number" in converter.last_error
+    assert not (tmp_path / "ds").exists()

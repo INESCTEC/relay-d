@@ -126,10 +126,10 @@ SETTINGS: Tuple[Setting, ...] = (
     _s("train_lerobot_num_workers", "Training", "LeRobot default data workers", "int", 4, "", minimum=0, maximum=64),
     _s("train_lerobot_seed", "Training", "LeRobot default seed", "int", 1000, "", minimum=0, maximum=2_000_000_000),
     # ---- Inference
-    _s("infer_device", "Inference", "Default device", "choice", "cuda", "Default of lfd-inference-node --device (the Python API keeps its own default).",
+    _s("infer_device", "Inference", "Default device", "choice", "cuda", "Default of lfd-inference-node --device and of the Python API (InferenceSession device=).",
        ("cuda", "cpu")),
     _s("infer_hz", "Inference", "Default control rate (Hz, 0 = as fast as possible)", "float", 10.0,
-       "Default of lfd-inference-node --hz for a policy without a rate of its own (robomimic); a LeRobot policy runs at its dataset fps. The Python API runs unthrottled unless told otherwise.", minimum=0.0, maximum=1000.0),
+       "Control rate for a policy without a rate of its own (an older robomimic checkpoint), for lfd-inference-node --hz and the Python API (InferenceSession.run hz=); a policy that knows its training rate runs at it.", minimum=0.0, maximum=1000.0),
     _s("infer_max_obs_age_s", "Inference", "Stale input limit (s)", "float", 1.0,
        "Default of --max-obs-age: no commands are sent while an input is older than this.", minimum=0.05, maximum=60.0),
     _s("infer_obs_wait_s", "Inference", "Wait for observations at start (s)", "float", 10.0,
@@ -159,10 +159,12 @@ def defaults() -> Dict[str, Any]:
 def _valid(setting: Setting, value: Any) -> bool:
     if setting.kind == "bool":
         return isinstance(value, bool)
-    if setting.kind == "int":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if setting.kind == "float":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if setting.kind in ("int", "float"):
+        if isinstance(value, bool) or not isinstance(value, int if setting.kind == "int" else (int, float)):
+            return False
+        # the Settings page enforces the range; a hand-edited file must not (e.g. a huge stale limit turns the check off)
+        return ((setting.minimum is None or value >= setting.minimum)
+                and (setting.maximum is None or value <= setting.maximum))
     if setting.kind == "choice":
         return value in setting.choices
     return isinstance(value, str)

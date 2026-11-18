@@ -28,10 +28,10 @@ def test_defaults_without_a_file(settings_file):
 def test_save_merges_keeps_unknown_keys_and_leaves_no_temp_file(settings_file):
     settings_file.write_text(json.dumps({"some_future_key": 1, "theme": "dark"}))
     us.reload()
-    result = us.save({"rec_default_max_buffer_mb": 60})
+    result = us.save({"rec_default_max_buffer_mb": 128})
     on_disk = json.loads(settings_file.read_text())
-    assert on_disk == {"some_future_key": 1, "theme": "dark", "rec_default_max_buffer_mb": 60}
-    assert result["rec_default_max_buffer_mb"] == 60 and us.get("theme") == "dark"
+    assert on_disk == {"some_future_key": 1, "theme": "dark", "rec_default_max_buffer_mb": 128}
+    assert result["rec_default_max_buffer_mb"] == 128 and us.get("theme") == "dark"
     assert [p.name for p in settings_file.parent.iterdir()] == ["settings.json"]
 
 
@@ -77,8 +77,8 @@ def test_restart_keys_and_compression_kwargs(settings_file):
 
 
 def test_values_equal_to_the_default_are_not_stored(settings_file):
-    us.save({"rec_default_max_buffer_mb": 60, "theme": "light", "infer_hz": 10.0})
-    assert json.loads(settings_file.read_text()) == {"rec_default_max_buffer_mb": 60}
+    us.save({"rec_default_max_buffer_mb": 128, "theme": "light", "infer_hz": 10.0})
+    assert json.loads(settings_file.read_text()) == {"rec_default_max_buffer_mb": 128}
     us.save({"rec_default_max_buffer_mb": 4096})  # back to the default: the key disappears
     assert json.loads(settings_file.read_text()) == {}
     assert us.get("rec_default_max_buffer_mb") == 4096
@@ -89,3 +89,13 @@ def test_resetting_a_migrated_setting_does_not_bring_the_old_value_back(settings
     assert us.reload()["visualizer_update_rate"] == 12
     us.save({"visualizer_update_rate": 20})
     assert us.get("visualizer_update_rate") == 20 and "update_rate" not in json.loads(settings_file.read_text())
+
+
+def test_out_of_range_values_in_the_file_fall_back_to_the_default(settings_file):
+    """The Settings page enforces min/max; a hand-edited file used to bypass it (1e9 s turned the stale check off)."""
+    settings_file.write_text(json.dumps({"infer_max_obs_age_s": 1e9, "infer_hz": -5.0}))
+    loaded = us.reload()
+    assert loaded["infer_max_obs_age_s"] == us.defaults()["infer_max_obs_age_s"]
+    assert loaded["infer_hz"] == us.defaults()["infer_hz"]
+    with pytest.raises(ValueError):
+        us.save({"infer_hz": -5.0})

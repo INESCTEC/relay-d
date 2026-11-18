@@ -257,3 +257,16 @@ def test_robomimic_copies_a_camera_without_reading_it_whole(tmp_path, monkeypatc
     monkeypatch.setattr(h5py.Dataset, "__getitem__", counting)
     assert _converter().convert_multiple_files("robomimic", [str(rec)], str(out))
     assert reads and max(reads) <= 64  # was np.array() of all 200 frames
+
+
+@pytest.mark.parametrize("fmt", ["robomimic", "lerobot"])
+def test_an_unreadable_file_is_named_in_the_summary(tmp_path, fmt):
+    """Its demos are unknown: without this the summary read "Converted 2 of 2 demos" with a whole file missing."""
+    good, broken = tmp_path / "a_good.h5", tmp_path / "b_broken.h5"
+    write_recording(good, LENGTHS)
+    broken.write_bytes(b"not an hdf5 file")
+    conv = _converter()
+    out = tmp_path / ("out.h5" if fmt == "robomimic" else "out")
+    assert conv.convert_multiple_files(fmt, [str(good), str(broken)], str(out))
+    assert conv.conversion_summary() == (f"Converted {len(LENGTHS)} of {len(LENGTHS)} demos; "
+                                         "1 file(s) could not be read: b_broken.h5")

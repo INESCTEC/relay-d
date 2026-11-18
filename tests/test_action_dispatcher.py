@@ -449,3 +449,28 @@ def test_a_topic_that_cannot_be_filled_stops_everything(d):
         type("M", (), {"x": values[0], "y": 0.0})) or True)
     d.dispatch(np.array([0.5]))
     assert published == [("arm", 0.5, 0.0), ("arm", 0.0, 0.0)]  # the arm is stopped, not left moving alone
+
+
+def test_a_late_rejection_does_not_make_a_newer_goal_resend(d):
+    """on_timeout: warn -> goal A times out, B is sent; A's rejection arriving now must not forget B (B would pre-empt itself)."""
+    from types import SimpleNamespace
+
+    d._action_configs = {"grip": {"indices": [0], "action": True}}
+    d._last_sent = {}
+    sent, keys = [], []
+
+    def send(name, cfg, values):
+        sent.append(float(values[0]))
+        keys.append(d._last_sent.get(name))
+        return True
+
+    d._dispatch_action = send
+    d.dispatch(np.array([1.0]))  # goal A
+    d.dispatch(np.array([2.0]))  # goal B
+    rejected = SimpleNamespace(result=lambda: SimpleNamespace(accepted=False))
+    d._goal_response_callback(rejected, "grip", keys[0])  # A's rejection, late
+    d.dispatch(np.array([2.0]))
+    assert sent == [1.0, 2.0]  # was [1.0, 2.0, 2.0]: B re-sent
+    d._goal_response_callback(rejected, "grip", keys[1])  # B itself rejected: retried
+    d.dispatch(np.array([2.0]))
+    assert sent == [1.0, 2.0, 2.0]

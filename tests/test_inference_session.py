@@ -336,3 +336,53 @@ def test_sync_threshold_zero_means_off_as_when_recording(tmp_path):
             ob.destroy_node()
     finally:
         rclpy.shutdown()
+
+
+def test_only_robot_clock_stamps_take_part_in_the_live_sync_check():
+    """As when recording: the node clock next to header stamps (sim time, bag replay) held every mixed observation."""
+    import threading
+
+    from geometry_msgs.msg import TransformStamped
+    from sensor_msgs.msg import JointState
+    from std_msgs.msg import Float64
+
+    from relay_d.dispatch.obs_builder import ObsBuilder
+
+    ob = ObsBuilder.__new__(ObsBuilder)  # skip ROS setup
+    ob._lock, ob._passthrough_sources, ob._joint_filters = threading.Lock(), set(), {}
+    ob._latest_inputs, ob._input_timestamps, ob._arrival = {}, {}, {}
+    ob.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: SimpleNamespace(sec=10**9, nanosec=0)))
+    js = JointState()
+    js.header.stamp.sec = 5
+    ob._topic_callback(Float64(data=1.0), "grip")
+    ob._topic_callback(js, "arm")
+    static = TransformStamped()  # a chain of only static transforms is stamped 0
+    ob._tf_inputs, ob._input_cfg = {"base_cam"}, {"base_cam": {"parent_frame": "base", "child_frame": "cam"}}
+    ob._tf_input_buffer = {"base_cam": SimpleNamespace(lookup_transform=lambda *a: static)}
+    ob._tf_callback()
+    assert ob._input_timestamps == {"arm": 5.0}  # was also grip / base_cam at the node clock: 1e9 s apart
+    assert set(ob._arrival) == {"grip", "arm", "base_cam"}  # all still fresh for the stale check
+
+
+def test_a_zero_quaternion_holds_the_last_rpy_value_instead_of_nan():
+    import threading
+
+    from relay_d.dispatch.obs_builder import ObsBuilder
+
+    ob = ObsBuilder.__new__(ObsBuilder)  # skip ROS setup
+    specs = ["tf.rotation.x", "tf.rotation.y", "tf.rotation.z", "tf.rotation.w"]
+    ob._obs_cfg = {"ee_rpy": {"specs": specs, "rotation_format": "rpy"}}
+    ob._input_cfg, ob._tf_inputs, ob._static_inputs = {"tf": {"parent_frame": "a", "child_frame": "b"}}, {"tf"}, set()
+    ob._extractors, ob._rotation_format, ob._obs_input_names, ob._passthrough_obs = {}, {}, {}, {}
+    ob._build_extractors()
+    ob._lock, ob._sync_threshold, ob._latest, ob._obs_refreshed = threading.Lock(), None, {}, {}
+    ob._input_timestamps = {}
+
+    def feed(x, y, z, w):
+        rot = SimpleNamespace(x=x, y=y, z=z, w=w)
+        ob._latest_inputs = {"tf": SimpleNamespace(transform=SimpleNamespace(rotation=rot))}
+        ob._evaluate_all()
+
+    feed(0.0, 0.0, 0.0, 1.0)
+    feed(0.0, 0.0, 0.0, 0.0)  # e.g. an uninitialised pose
+    assert np.isfinite(ob._latest["ee_rpy"]).all() and ob._latest["ee_rpy"].tolist() == [0.0, 0.0, 0.0]

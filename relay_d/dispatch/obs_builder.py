@@ -449,12 +449,10 @@ class ObsBuilder(Node):
         return decoded
 
     def _topic_callback(self, msg: Any, input_name: str) -> None:
-        # Capture timestamp before any wrapping (e.g. _JointStateView) hides
-        # the original message's header.
-        if hasattr(msg, "header"):
-            ts = stamp_to_sec(msg.header.stamp)
-        else:
-            ts = stamp_to_sec(self.get_clock().now().to_msg())
+        # Capture timestamp before any wrapping (e.g. _JointStateView) hides the original message's header.
+        # Only a header stamp takes part in the sync check, as when recording: the node's clock next to
+        # robot-clock stamps (sim time, bag replay) would hold every observation that mixes the two.
+        ts = stamp_to_sec(msg.header.stamp) if hasattr(msg, "header") else None
 
         if input_name in self._passthrough_sources:
             decoded = self._decode_passthrough(input_name, msg)
@@ -462,7 +460,8 @@ class ObsBuilder(Node):
                 return   # sample-and-hold: leave any previous value untouched
             with self._lock:
                 self._latest_inputs[input_name] = decoded
-                self._input_timestamps[input_name] = ts
+                if ts is not None:
+                    self._input_timestamps[input_name] = ts
                 self._arrival[input_name] = time.monotonic()
             return
 
@@ -487,7 +486,8 @@ class ObsBuilder(Node):
             msg = _JointStateView(msg, jnames)
         with self._lock:
             self._latest_inputs[input_name] = msg
-            self._input_timestamps[input_name] = ts
+            if ts is not None:
+                self._input_timestamps[input_name] = ts
             self._arrival[input_name] = time.monotonic()
 
     def _tf_callback(self) -> None:
@@ -502,10 +502,7 @@ class ObsBuilder(Node):
                     rclpy.time.Time(),
                 )
                 updates[name] = enriched_tf(tf)
-                ts = stamp_to_sec(tf.header.stamp)
-                # A chain of only static transforms comes back stamped 0 and never changes:
-                # treat it as always fresh instead of stale forever.
-                ts_updates[name] = ts if ts != 0.0 else stamp_to_sec(self.get_clock().now().to_msg())
+                ts_updates[name] = stamp_to_sec(tf.header.stamp)
             except Exception as exc:
                 if name not in self._tf_warned:
                     self._tf_warned.add(name)
@@ -518,9 +515,14 @@ class ObsBuilder(Node):
                 self._latest_inputs.update(updates)
                 # a TF lookup keeps returning the last transform: only a new stamp is fresh data
                 for name, ts in ts_updates.items():
-                    if self._input_timestamps.get(name) != ts:
+                    if ts == 0.0:
+                        # A chain of only static transforms comes back stamped 0 and never changes: always fresh
+                        # (not stale forever), and no time to sync on (the node clock is not the robot's).
                         self._arrival[name] = time.monotonic()
-                self._input_timestamps.update(ts_updates)
+                        self._input_timestamps.pop(name, None)
+                    elif self._input_timestamps.get(name) != ts:
+                        self._arrival[name] = time.monotonic()
+                        self._input_timestamps[name] = ts
 
     # ------------------------------------------------------------------
     # Stream evaluation
@@ -590,10 +592,13 @@ class ObsBuilder(Node):
                     ok = False
                     break
 
-            if ok:
-                if self._rotation_format.get(obs_name) == "rpy":
-                    # 4 raw quaternion floats -> (roll, pitch, yaw)
+            if ok and self._rotation_format.get(obs_name) == "rpy":
+                # 4 raw quaternion floats -> (roll, pitch, yaw); a zero / NaN quaternion gives NaN, which the
+                # conversion refuses too: hold the last value (it goes stale) instead of feeding NaN to the policy
+                with np.errstate(invalid="ignore", divide="ignore"):  # a zero quaternion: handled just below
                     row = [float(v) for v in quat_to_euler(row)]
+                ok = bool(np.isfinite(row).all())
+            if ok:
                 new_vals[obs_name] = np.array(row, dtype=np.float32)
 
         # Passthrough obs (camera/organized-pointcloud): the decoded array is

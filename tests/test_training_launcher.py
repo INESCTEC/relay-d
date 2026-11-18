@@ -323,3 +323,17 @@ def test_robomimic_does_not_normalize_each_pixel(folder, policy):
     run_dir = folder / "training_runs" / policy
     launcher.build_command(TrainJob(_robomimic(folder), "py", policy), run_dir)
     assert json.loads((run_dir / "robomimic_config.json").read_text())["train"]["hdf5_normalize_obs"] is False
+
+
+def test_ctrl_c_keeps_the_trainings_last_output_in_the_log(folder, tmp_path):
+    """tee is in the same foreground group: without -i it died on Ctrl+C and the training's last lines
+    (its traceback or final checkpoint save) never reached train.log."""
+    import signal
+
+    py = _fake_python(tmp_path, "trap 'echo saved-final-checkpoint; exit 1' INT\nwhile :; do sleep 0.05; done")
+    run_dir = launcher.start(TrainJob(_robomimic(folder), py, "bc_rnn_gmm"), terminal=False)
+    assert wait_until(lambda: runs.read_run(run_dir).status == runs.RUNNING)
+    pid = int((run_dir / "pid").read_text())
+    os.killpg(os.getpgid(pid), signal.SIGINT)
+    assert wait_until(lambda: not runs._alive(pid), seconds=5)
+    assert "saved-final-checkpoint" in (run_dir / "train.log").read_text()

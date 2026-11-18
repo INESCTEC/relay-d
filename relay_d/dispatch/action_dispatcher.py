@@ -27,7 +27,7 @@ import numpy as np
 from action_msgs.msg import GoalStatus
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from typing import Dict, Any
+from typing import Any, Dict, Optional
 
 from rosidl_runtime_py.utilities import get_message
 from relay_d.utils.coloring_logger import logger
@@ -562,8 +562,9 @@ class ActionDispatcher:
         fb_cfg = cfg.get("feedback")
         if fb_cfg is None:
             future = client.send_goal_async(goal)
+            key = self._last_sent.get(name)  # this goal's: a late rejection must not forget a newer one
             future.add_done_callback(
-                lambda f, n=name: self._goal_response_callback(f, n)
+                lambda f, n=name, k=key: self._goal_response_callback(f, n, k)
             )
             return True
 
@@ -595,6 +596,7 @@ class ActionDispatcher:
         source = fb_cfg.get("source", "result")
         ev = threading.Event()
         holder: Dict[str, Any] = {}
+        key = self._last_sent.get(name)  # this goal's: a rejection after a timeout must not forget a newer one
 
         def _on_feedback(feedback_msg):
             if source == "feedback" and _check_success(feedback_msg.feedback, fb_cfg):
@@ -605,7 +607,7 @@ class ActionDispatcher:
             goal_handle = f.result()
             if not goal_handle.accepted:
                 logger.warning(f"[ActionDispatcher] Goal rejected by '{name}'")
-                self._last_sent.pop(name, None)  # not sent after all: retry it next tick
+                self._forget_sent(name, key)  # not sent after all: retry it next tick
                 holder["rejected"] = True
                 ev.set()
                 return
@@ -711,12 +713,17 @@ class ActionDispatcher:
         else:
             raise ValueError(f"[ActionDispatcher] Unknown transform type: '{t}'")
 
-    def _goal_response_callback(self, future: Any, name: str) -> None:
+    def _goal_response_callback(self, future: Any, name: str, key: Optional[str] = None) -> None:
         goal_handle = future.result()
         if not goal_handle.accepted:
             logger.warning(
                 f"[ActionDispatcher] Goal rejected by '{name}'"
             )
-            self._last_sent.pop(name, None)  # not sent after all: retry it next tick
+            self._forget_sent(name, key)  # not sent after all: retry it next tick
             return
         self._track_goal(name, goal_handle)
+
+    def _forget_sent(self, name: str, key: Optional[str]) -> None:
+        """Let a rejected goal be sent again, unless a newer goal (another key) was sent meanwhile."""
+        if key is None or self._last_sent.get(name) == key:
+            self._last_sent.pop(name, None)

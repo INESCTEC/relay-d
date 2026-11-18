@@ -18,10 +18,6 @@ from rclpy.executors import SingleThreadedExecutor
 import importlib
 import time
 
-from sensor_msgs.msg import Image, PointCloud2, JointState, CompressedImage
-from geometry_msgs.msg import Twist, PoseStamped
-from std_msgs.msg import Bool
-
 
 class TopicSubscribers(Node):
     # Timeouts come from the user settings, read when used so a change applies to the next subscription.
@@ -285,62 +281,20 @@ class TopicSubscribers(Node):
         )
 
     def _get_message_class(self, topic_type_msg, topic_path):
+        """The class of a detected type such as ``sensor_msgs/msg/Image``, cached by type (the same topic may have
+        another type in another config). None if its package cannot be imported: never guessed from the topic name,
+        since a wrong type subscribes fine and then never receives a message."""
+        if topic_type_msg in self.message_type_cache:
+            return self.message_type_cache[topic_type_msg]
+        parts = (topic_type_msg or "").split("/")
         try:
-            if topic_path in self.message_type_cache:
-                return self.message_type_cache[topic_path]
-
-            if topic_type_msg and "/" in topic_type_msg:
-                parts = topic_type_msg.split("/")
-                if len(parts) >= 2:
-                    package = parts[0]
-                    msg_name = parts[-1]
-                    module_name = f"{package}.msg"
-                    try:
-                        module = importlib.import_module(module_name)
-                        msg_class = getattr(module, msg_name)
-                        self.message_type_cache[topic_path] = msg_class
-                        return msg_class
-                    except Exception as e:
-                        logger.debug(f"Could not import {topic_type_msg}: {e}")
-                        pass
-
-            # Fallback: try to infer from topic name
-            topic_lower = topic_path.lower()
-            if "image" in topic_lower:
-                if "compressed" in topic_lower:
-                    msg_class = CompressedImage
-                else:
-                    msg_class = Image
-            elif "joint" in topic_lower:
-                msg_class = JointState
-            elif "pointcloud" in topic_lower or "cloud" in topic_lower:
-                msg_class = PointCloud2
-            elif (
-                "gripper" in topic_lower
-                or "bool" in topic_lower
-                or "open" in topic_lower
-                or "close" in topic_lower
-            ):
-                msg_class = Bool
-            elif "pose" in topic_lower:
-                msg_class = PoseStamped
-            elif "twist" in topic_lower or "cmd_vel" in topic_lower:
-                msg_class = Twist
-            else:
-                return None
-
-            if msg_class:
-                self.message_type_cache[topic_path] = msg_class
-                logger.info(f"Successfully inferred type for {topic_path}: {msg_class}")
-                return msg_class
-
-            logger.warning(
-                f"Could not determine message type for {topic_path} (detected: {topic_type_msg})"
-            )
-            return None
+            msg_class = getattr(importlib.import_module(f"{parts[0]}.msg"), parts[-1])
         except Exception as e:
-            logger.warning(f"Could not get message class for {topic_path}: {e}")
+            logger.error(f"Cannot import the message type {topic_type_msg!r} of {topic_path}: {e}. "
+                         f"Source the workspace that defines it, then restart.")
             return None
+        self.message_type_cache[topic_type_msg] = msg_class
+        return msg_class
 
     def _log_throttled(self, message, key=None):
         try:
