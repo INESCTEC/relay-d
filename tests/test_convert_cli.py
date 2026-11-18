@@ -106,3 +106,18 @@ def test_removed_option_exits_2(workspace, capsys):
     assert main(["--config", str(cfg), "--format", "robomimic", "--input", str(tmp / "recordings"),
                  "--output", str(tmp / "out" / "d.h5")]) == 2
     assert "robomimic.training_model" in capsys.readouterr().err
+
+
+def test_a_folder_holding_another_configs_files_is_refused(workspace, capsys):
+    tmp, cfg = workspace
+    out_dir = tmp / "out"
+    args = ["--format", "robomimic", "--input", str(tmp / "recordings")]
+    assert main(["--config", str(cfg), *args, "--output", str(out_dir / "a.h5")]) == 0
+    assert main(["--config", str(cfg), *args, "--output", str(out_dir / "b.h5")]) == 0  # same config: same files
+    other = tmp / "other.yaml"
+    other.write_text(yaml.safe_dump({"config": {**DATA_CONFIG, "recording_frequency": 20}}))
+    before = (out_dir / "action_dispatcher" / "obs_config.yaml").read_bytes()
+    assert main(["--config", str(other), *args, "--output", str(out_dir / "c.h5")]) == 2
+    assert not (out_dir / "c.h5").exists()
+    assert (out_dir / "action_dispatcher" / "obs_config.yaml").read_bytes() == before  # a.h5 keeps its obs layout
+    assert "another config" in capsys.readouterr().err

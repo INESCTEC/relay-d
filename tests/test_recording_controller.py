@@ -222,3 +222,27 @@ def test_a_failed_recording_loop_is_reported_like_a_full_buffer(env):
     env.ctrl._check_buffer_full()
     assert "Press Stop" in env.box.error.call_args.args[0]
     assert not env.ctrl._buffer_timer.isActive()  # told once
+
+
+def test_an_input_that_cannot_be_subscribed_blocks_recording(env):
+    env.subscribers.create_subscribers_for_containers.return_value = {"cam": True, "joints": False}
+    assert env.ctrl.start_recording() is False
+    assert not env.ctrl.is_recording
+    env.recorder.start_recording.assert_not_called()  # a demo without 'joints' would look valid until conversion
+
+
+def test_start_shows_no_blocking_dialog_and_stop_is_available_at_once(env):
+    env.ctrl.set_config_loaded(True)
+    assert env.ctrl.start_recording() is True
+    env.box.info.assert_not_called()  # a modal dialog here would block Stop while samples are recorded
+    assert _states(env.ui) == (False, True)
+
+
+def test_restart_subscribers_is_refused_while_recording():
+    pytest.importorskip("PyQt5.QtMultimedia")  # record_page imports the camera widgets
+    from relay_d.acquisition.qt_app.ui.record.record_page import RecordPage
+
+    page = RecordPage.__new__(RecordPage)  # skip the UI setup: only the guard is used
+    page.recording, page.container_manager = SimpleNamespace(is_recording=True), MagicMock()
+    assert page.restart_failed_subscribers() == 0
+    page.container_manager.restart_failed_subscribers.assert_not_called()  # it would shift a new input against time

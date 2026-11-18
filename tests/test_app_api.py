@@ -170,3 +170,13 @@ def test_delete_demo_removes_the_file_and_drops_it_from_the_session(tmp_path):
     assert api._session_h5_files == [str(kept)]  # shutdown() no longer converts a missing file
     assert api.delete_demo(str(rejected)) is False  # already gone: nothing changes
     assert api._session_h5_files == [str(kept)]
+
+
+def test_the_demo_being_recorded_cannot_be_deleted(tmp_path):
+    api = _recording_api()
+    live = tmp_path / "stack_1.h5"
+    live.write_bytes(b"x")
+    api._data_recorder.h5_file, api._data_recorder.h5_file_path = object(), str(live)  # open for writing
+    assert api.delete_demo(str(live)) is False and live.exists()  # Stop would report it saved
+    api._data_recorder.h5_file = None  # saved and closed
+    assert api.delete_demo(str(live)) and not live.exists()

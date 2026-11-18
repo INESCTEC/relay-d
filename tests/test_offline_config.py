@@ -6,7 +6,6 @@ import pytest
 import yaml
 
 from relay_d.acquisition.qt_app.ui.postprocess.offline_config import load_offline_config
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
 from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
 
 pytest.importorskip("av")
@@ -59,7 +58,7 @@ def test_offline_config_drives_lerobot_conversion(tmp_path):
     rec = tmp_path / "recording_0.h5"
     write_recording(rec, LENGTHS)
     parser, _ = load_offline_config(_write_cfg(tmp_path / "c.yaml", DATA_CONFIG))
-    converter = YAMLDrivenConverter(PostprocessConfigLoader(), data_config=parser.yaml_data["config"])
+    converter = YAMLDrivenConverter(data_config=parser.yaml_data["config"])
     out = tmp_path / "ds"
     assert converter.convert_multiple_files("lerobot", [str(rec)], str(out))
     assert json.loads((out / "meta/info.json").read_text())["total_episodes"] == len(LENGTHS)

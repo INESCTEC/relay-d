@@ -31,6 +31,7 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile
 from tf2_msgs.msg import TFMessage
 
 from relay_d.utils.coloring_logger import logger
+from relay_d.utils.numerics import stamp_to_ns
 from relay_d.utils.tf_filter import StaleTfFilter
 
 try:
@@ -88,7 +89,7 @@ class _TfTopicListener:
     def _callback(self, data):
         for transform in data.transforms:
             stamp = transform.header.stamp
-            if self._filter.accept(transform.child_frame_id, stamp.sec * 10**9 + stamp.nanosec):
+            if self._filter.accept(transform.child_frame_id, stamp_to_ns(stamp)):
                 self.buffer.set_transform(transform, "default_authority")
 
     def _static_callback(self, data):

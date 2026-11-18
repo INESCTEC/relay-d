@@ -7,6 +7,7 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 rclpy = pytest.importorskip("rclpy")
@@ -87,3 +88,58 @@ def test_the_record_page_spins_its_subscribers_in_their_own_thread_not_the_qt_ti
         page.tf_update_timer.stop()
         page.topic_subscribers.close()  # what MainWindow.closeEvent calls
     assert not page.topic_subscribers._spin_thread.is_alive()
+
+
+def test_a_header_less_message_does_not_take_part_in_the_sync_check():
+    """A wall-clock receive time next to robot-clock stamps made strict sync drop every tick."""
+    from std_msgs.msg import Float64
+
+    subs = TopicSubscribers.__new__(TopicSubscribers)  # skip ROS setup: only the callback is used
+    subs.data_lock, subs.latest_data, subs.latest_timestamps, subs.subscriber_status = threading.Lock(), {}, {}, {}
+    subs._create_callback("grip", "grip")(Float64(data=1.0))
+    js = JointState()
+    js.header.stamp.sec = 5
+    subs._create_callback("arm", "arm")(js)
+    assert subs.latest_data["grip"].data == 1.0
+    assert subs.latest_timestamps == {"arm": 5.0}
+
+
+def test_recorder_and_live_obs_read_joints_in_the_same_order_over_ros(ros, tmp_path):
+    """End to end over a real topic: the robot publishes joints in another order than joint_names lists them."""
+    import yaml
+
+    from relay_d.acquisition.qt_app.utils.stream_builder import StreamBuilder
+    from relay_d.dispatch.obs_builder import ObsBuilder
+
+    joint_names = ["shoulder_pan", "shoulder_lift", "elbow"]
+    published = JointState(name=["elbow", "shoulder_lift", "shoulder_pan"], position=[3.0, 2.0, 1.0])
+    cfg = tmp_path / "obs_config.yaml"
+    cfg.write_text(yaml.safe_dump({"config": {
+        "input": {"js": {"topic": "/parity_js", "joint_names": joint_names}},
+        "observations": {"q": ["js.position[:]"]},
+    }}))
+    ob = ObsBuilder(str(cfg))
+    pub_node = rclpy.create_node("parity_pub")
+    pub = pub_node.create_publisher(JointState, "/parity_js", 10)
+    executor = SingleThreadedExecutor()
+    executor.add_node(ob)
+    executor.add_node(pub_node)
+    try:
+        deadline = time.monotonic() + 5.0
+        while "q" not in ob.get_obs() and time.monotonic() < deadline:
+            pub.publish(published)
+            executor.spin_once(timeout_sec=0.05)
+        live = ob.get_obs()["q"]
+    finally:
+        executor.shutdown()
+        ob.destroy_node()
+        pub_node.destroy_node()
+
+    sb = StreamBuilder(SimpleNamespace(
+        yaml_data={"config": {"input": {"js": {"topic": "/parity_js", "joint_names": joint_names}}}},
+        get_input_data=lambda: [{"name": "js", "joint_names": joint_names}],
+        get_streams=lambda: {"q": ["js.position[:]"]},
+    ))
+    sb.evaluate({"js": published})
+    recorded = sb.finalize()["q"][0]
+    np.testing.assert_allclose(live, recorded)  # was [1, 2, 3] live vs [3, 2, 1] in the dataset

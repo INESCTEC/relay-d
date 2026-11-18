@@ -135,6 +135,7 @@ def test_a_failed_close_keeps_the_demo_for_a_retry(recorder_cls, tmp_path):
     assert rec.retry_save() is True and rec._unsaved is False
     with h5py.File(rec.retried_file) as f:
         assert f["data/d/arm/joint_positions"].shape == (2, 1)
+    assert list(tmp_path.rglob("*.partial")) == []  # the half-written file of the failed save is gone
 
 
 @pytest.mark.parametrize("encoding, image", [
@@ -218,3 +219,36 @@ def test_recorded_streams_match_the_live_obs(monkeypatch):
 
     assert recorded.shape == live.shape == (13,)
     np.testing.assert_allclose(recorded, live, rtol=1e-6)
+
+
+def test_tf_is_looked_up_at_the_topic_stamp_not_its_own(recorder_cls, monkeypatch):
+    """TF runs faster than a camera: its own (newest) stamp must not become the reference time."""
+    rec = _loop_ready(recorder_cls, monkeypatch)
+    stamp = lambda sec: SimpleNamespace(header=SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=0)))  # noqa: E731
+    subs = _FakeSubscribers(rec, [{"cam": stamp(10), "tf": stamp(12)}], {"cam": None, "tf": None})
+    subs.tf_lookup_containers = {"tf": {}}
+    monkeypatch.setattr(sys.modules[recorder_cls.__module__].rclpy.time, "Time",
+                        lambda seconds, nanoseconds: (seconds, nanoseconds))  # rclpy is mocked here
+    looked_up = []
+    subs.lookup_tf_at_time = lambda cid, t, timeout_sec: looked_up.append(t) or None
+    rec.topic_subscribers = subs
+    rec._standard_recording_loop(subs)
+    assert looked_up == [(10, 0)]  # was 12 s: TF aligned to itself, not to the camera frame
+
+
+def test_strict_sync_counts_and_reports_dropped_ticks(recorder_cls, monkeypatch, tmp_path):
+    msgs = _real_message_classes(recorder_cls)
+    config = {"config": {"recording_frequency": 1000, "sync_mode": "strict", "sync_tolerance_sec": 0.05,
+                         "input": {"a": {"topic": "/a"}, "b": {"topic": "/b"}}}}
+    rec = _loop_ready(recorder_cls, monkeypatch, _config_parser(config))
+    rec.output_directory = str(tmp_path)
+    js = msgs.JointState()
+    js.name, js.position = ["j"], [1.0]
+    subs = _FakeSubscribers(rec, [{"a": js, "b": js}] * 5, {"a": msgs.JointState, "b": msgs.JointState})
+    subs.get_content_and_timestamps = lambda f=subs.get_content_and_timestamps: (f()[0], {"a": 1.0, "b": 2.0})  # 1 s apart
+    subs.flush_latest_data = lambda: None
+    assert rec.start_recording(subs, "d") is True
+    rec.recording_thread.join(5)
+    rec.stop_recording()
+    assert rec._strict_drops == 5 and rec.timestamps == []
+    assert rec.recording_metadata["strict_sync_dropped_ticks"] == 5  # stored with the demo, not only logged

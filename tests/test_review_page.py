@@ -125,3 +125,19 @@ def test_decode_generic_and_numeric_fields():
     fields = rp.numeric_fields([{"fields": {"data": [1.0, 2.0], "n": 3, "s": "x"}},
                                 {"fields": {"data": [3.0, 4.0], "n": 4, "s": "y"}}])
     assert {k: v.shape for k, v in fields.items()} == {"data": (2, 2), "n": (2,)}
+
+
+def test_the_demo_being_recorded_cannot_be_deleted_from_review(make_page, tmp_path, monkeypatch):
+    """Linux removes a file h5py still writes: Stop would then report the lost demo as saved."""
+    live = tmp_path / "stack_1.h5"
+    with h5py.File(live, "w") as f:
+        f.create_group("data/demo_0")
+    page = make_page(tmp_path)
+    page.record_page = SimpleNamespace(data_recorder=SimpleNamespace(h5_file=object(), h5_file_path=str(live)),
+                                       remove_session_file=lambda p: None)
+    page.list_demos.setCurrentRow(0)
+    errors = []
+    monkeypatch.setattr(rp.user_settings, "get", lambda k: False if k == "confirm_destructive" else None)
+    monkeypatch.setattr(rp.CustomMessageBox, "error", lambda msg, *a, **k: errors.append(msg))
+    page.delete_selected_demo()
+    assert live.exists() and errors  # refused, and the user is told

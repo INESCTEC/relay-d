@@ -781,7 +781,7 @@ class ReviewPage:
 
         self._close_current_file()
 
-        if delete_demo_file(path):
+        if delete_demo_file(path, getattr(self.record_page, "data_recorder", None)):
             if self.record_page is not None:
                 self.record_page.remove_session_file(path)
             self.refresh_demo_list()

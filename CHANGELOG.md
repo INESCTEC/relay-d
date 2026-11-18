@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Upgrade notes (read first)
+- **robomimic policies no longer normalize observations (`train.hdf5_normalize_obs: false`, robomimic's own default).** With it on,
+  robomimic normalizes per element: each camera pixel was divided by its own standard deviation (floor 0.001), so a pixel that barely
+  changes across demos (a still background) turned a 0.02 change in noise, brightness or compression into ~20 standard deviations.
+  That made camera policies (Diffusion Policy, BC-RNN-GMM, BC-Transformer-GMM) fragile to image changes, unlike LeRobot's per-channel
+  normalization. **Retrain to compare robustness**; checkpoints trained before still run as they are (their stats are in the checkpoint).
 - **Re-convert your datasets and retrain.** An absolute action is now the target of the next step (`action[t] = value[t+1]`), see *Changed*. Datasets converted before this release taught the policy to hold still.
 - **LeRobot environment:** press **Set up lerobot environment** (Train tab) again: it adds `lerobot[smolvla]`. The `.[lerobot]` extra now needs `pyarrow<21` (pyarrow 21+ needs NumPy 2, ROS Jazzy has 1.26).
 - **`relay_d.dispatch.DispatcherHelpers` is gone:** use `save_dispatch_templates(output_dir)`.
@@ -29,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Action template:** only `move_arm_joint` and `robotiq_gripper` are live (`move_eef` became a commented example); before, a copied
   template commanded the arm twice per tick, as a pose and as joint deltas.
 - **New folder names:** recording sessions end in `_Recording`, Post-process outputs in `_Robomimic` / `_Lerobot`. Existing folders keep their names.
+- **Joint order at inference now follows the message, as recorded.** With `joint_names` listed in a different order than the
+  robot publishes, the live policy used to get the joints in the config's order while the dataset holds them in message order.
+  Policies trained on such data now get the right order; nothing to re-convert.
+- **Re-convert datasets that use `delta_actions` on an `rpy` stream:** the deltas used to jump by about 2π when an angle crossed ±π.
+- **Start refuses to record** while an input cannot be subscribed (it was left out of the demo silently).
 
 ### Added
 - **Review shows everything that was recorded.**
@@ -65,6 +75,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The app logo is a small PNG (11 KB instead of 3.9 MB), so `resources_rc.py` shrinks by about 250k lines; duplicate icon entries are removed from `resources.qrc`.
 
 ### Fixed
+- **robomimic camera policies trained with `train.hdf5_normalize_obs` failed every inference call** (`shape mismatch in @normalize_obs`, no command sent): robomimic's `RolloutPolicy` normalizes images before it converts them to CHW in [0, 1], but training computed the stats on converted images. The inference runner now converts the images itself and tells `RolloutPolicy` not to convert them again. Policies trained without that option behave as before; no retraining needed. A robomimic whose `RolloutPolicy` lacks the `postprocess_visual_obs` argument this relies on is refused when the node starts.
+- **Inference:** a goal cancelled by a safe stop is sent again when inference resumes; a topic message that cannot be filled
+  stops every output instead of leaving the others moving; `sync.threshold: 0` means off (as when recording) instead of
+  "exact match"; `rotation_format: quat` is accepted; the stale and pre-flight checks only cover the inputs the policy reads.
+- **Recording:** TF is looked up at the camera/topic stamp, not at its own latest stamp; messages without a header no longer
+  take part in the sync check (strict mode dropped every tick under sim time), and dropped ticks are logged and stored as
+  `strict_sync_dropped_ticks`; "Restart Subscribers" is refused while recording; the demo being recorded cannot be deleted;
+  a failed save is renamed to `.h5.partial` (removed once a retry saves it); Stop is available at once after Start.
+- **Conversion:** a 1-wide action or state in a LeRobot dataset is a plain value column (LeRobot failed to load it); an
+  existing robomimic output is never truncated; camera frames are copied in slices instead of loaded whole; the GUI converts
+  in the background; `relay-d-convert` refuses a folder that holds another config's `acquisition_config.yaml`.
+- **Training:** robomimic validation is turned off when the validation split is smaller than one batch (it crashed after epoch 1).
 - **robomimic environment:** the setup now installs `six` and `packaging`, which robomimic imports without declaring them; on a fresh machine the environment failed its check with `No module named 'six'`. Press **Set up robomimic environment** again.
 - **robomimic environment had no OpenCV:** `lfd-inference-node` re-executes into it with Relay-D on `PYTHONPATH` but not Relay-D's dependencies, so every camera frame failed (`No module named 'cv2'`). "Set up robomimic environment" now installs `opencv-python-headless` and checks `import cv2`; press it again to update an existing environment.
 - **`lfd-inference-node` kept its rate with several cameras:** the node spun its inputs with rclpy's `MultiThreadedExecutor`, which could not keep up with 3 cameras + 4 other inputs at 20 Hz next to the inference loop: inputs went stale for seconds and only ~6 commands/s were sent. It now spins with a `SingleThreadedExecutor`, like the recorder (measured 19.95 Hz, no stale input).
@@ -84,6 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Environment setup:** the folder name in the setup script is shell-quoted correctly.
 
 ### Removed
+- `YAMLDrivenConverter(config_loader, ...)`: the unused first argument is gone (`YAMLDrivenConverter(data_config=...)`), with
+  `load_data_config`. The training launcher no longer looks for `<dataset>_acquisition_config.yaml` (nothing wrote it).
 - `relay_d.dispatch.DispatcherHelpers` (replaced by `save_dispatch_templates`).
 - The converter's field-scan fallback (`_scan_for_field`) and the resampling of datasets of the wrong length (`_resize_data`): both hid broken data (see *Fixed*).
 

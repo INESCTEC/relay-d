@@ -31,7 +31,6 @@ from ...utils.background import run_in_background
 from ...utils.custom_message_box import CustomMessageBox
 from relay_d.acquisition.convert_cli import collect_inputs
 from ...utils.default_configs import generate_default_configs
-from ..postprocess.postprocess_config_loader import PostprocessConfigLoader
 from ..postprocess.postprocess_options import dataset_output_paths
 from ..postprocess.offline_config import load_offline_config, write_dataset_files
 from ..postprocess.postprocess_options import PostprocessOptions
@@ -70,8 +69,9 @@ class PostProcessPage(QWidget):
         self.output_format = ""
         self._precheck_gen = 0  # bumped by every refresh: only the newest pre-check result is shown
         self._report = None  # last pre-check report (None: not run / running)
+        self._converting = False  # a conversion runs in the background: Convert stays disabled
 
-        self.yaml_converter = YAMLDrivenConverter(PostprocessConfigLoader())
+        self.yaml_converter = YAMLDrivenConverter()
         self.format_buttons = {}
         self.format_names = {
             "btn_format_robomimic": "robomimic",
@@ -524,6 +524,8 @@ class PostProcessPage(QWidget):
 
     def _convert_block_reason(self, checking=False):
         """Why Convert is disabled ("" when it is enabled)."""
+        if self._converting:
+            return "Converting..."
         if reason := self._blocked_before_check():
             return reason
         if checking or self._report is None:
@@ -588,6 +590,8 @@ class PostProcessPage(QWidget):
     # ------------------------------------------------------------------
 
     def convert_dataset(self):
+        if self._converting:  # a click queued while the last one ran
+            return
         self._sync_data_config_from_parser()  # always use freshest config before converting
 
         logger.info(
@@ -625,23 +629,35 @@ class PostProcessPage(QWidget):
         output_dir, combined_output_path = dataset_output_paths(save_folder, self.output_format, datetime.now())
         os.makedirs(output_dir, exist_ok=True)
 
-        success = self.yaml_converter.convert_multiple_files(
-            self.output_format,
-            self.h5_files,
-            combined_output_path,
-        )
+        # In a thread: a LeRobot video encode takes minutes, and the GUI thread also spins ROS.
+        # Its own copy, as the pre-check: a config loaded meanwhile must not change a running conversion.
+        conv = copy.copy(self.yaml_converter)
+        conv.data_config = copy.deepcopy(self.yaml_converter.data_config)
+        fmt, files, parser = self.output_format, list(self.h5_files), self._active_parser()
 
-        # Keep the configs used next to the dataset, plus the dispatcher files.
-        post_error = None
-        if success:
-            try:
-                write_dataset_files(output_dir, self._active_parser(), self.yaml_converter.options.source)
+        def work():
+            if not conv.convert_multiple_files(fmt, files, combined_output_path):
+                return False, None
+            try:  # keep the configs used next to the dataset, plus the dispatcher files
+                write_dataset_files(output_dir, parser, conv.options.source)
             except Exception as e:
-                post_error = str(e) or type(e).__name__
-                logger.error(
-                    f"Failed to write the config copies / action_dispatcher files: {e}"
-                )
+                logger.error(f"Failed to write the config copies / action_dispatcher files: {e}")
+                return True, str(e) or type(e).__name__
+            return True, None
 
+        def busy(delta):
+            self._converting = delta > 0
+            self._show_report()
+
+        run_in_background(self.ui.page_data, work,
+                          lambda result, error: self._on_converted(conv, fmt, result, error, combined_output_path), busy)
+
+    def _on_converted(self, conv, fmt, result, error, combined_output_path):
+        if error is not None:
+            logger.error(f"Conversion crashed: {error}")
+            CustomMessageBox.error(f"Failed to convert dataset.\n\n{error}")
+            return
+        success, post_error = result
         if success:
             logger.info("Dataset successfully converted and validated!")
             if post_error:
@@ -650,12 +666,12 @@ class PostProcessPage(QWidget):
                     f"action_dispatcher files) could not be written:\n\n{post_error}"
                 )
             CustomMessageBox.info(
-                f"Dataset converted to {self.output_format} format.\n\n{self.yaml_converter.conversion_summary()}"
+                f"Dataset converted to {fmt} format.\n\n{conv.conversion_summary()}"
                 f"\n\nOutput file: {combined_output_path}",
             )
         else:
             logger.error("Dataset conversion failed")
-            reason = self.yaml_converter.last_error
+            reason = conv.last_error
             CustomMessageBox.error(
                 "Failed to convert dataset." + (f"\n\n{reason}" if reason else "")
             )

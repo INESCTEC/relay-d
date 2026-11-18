@@ -15,10 +15,18 @@ LeRobotPolicyRunner: get_action(obs_dict) -> np.ndarray, reset(), and an
   environment here, so _init_obs_history / _stack_obs_history below repeat that
   wrapper's algorithm (duplicate-fill on reset, append and stack oldest-first)
   around ObsBuilder's single-frame output.
+- Images are processed here (HWC uint8 -> CHW float in [0, 1]) before the
+  policy sees them, and RolloutPolicy is told not to process them again:
+  RolloutPolicy normalizes before it processes, but training computed the
+  stats on processed images, so a camera policy trained with
+  train.hdf5_normalize_obs failed every call ("shape mismatch in
+  @normalize_obs"). Without normalization the result is the same as before.
 """
 
 from __future__ import annotations
 
+import functools
+import inspect
 from collections import deque
 from typing import Dict, List, Optional
 
@@ -26,6 +34,7 @@ import numpy as np
 
 try:
     import robomimic.utils.file_utils as FileUtils
+    import robomimic.utils.obs_utils as ObsUtils
     import robomimic.utils.torch_utils as TorchUtils
 except ImportError as e:
     raise ImportError(
@@ -64,6 +73,15 @@ class RobomimicPolicyRunner:
     def __init__(self, checkpoint_path: str, device: str = "cpu"):
         torch_device = TorchUtils.get_torch_device(try_to_use_cuda=device.startswith("cuda"))
         self._policy, ckpt = FileUtils.policy_from_checkpoint(ckpt_path=checkpoint_path, device=torch_device)
+        # get_action processes the images itself (see the module docstring). This uses a private robomimic method:
+        # refuse a robomimic without it here, at startup, not at the first call on the robot.
+        if "postprocess_visual_obs" not in inspect.signature(type(self._policy)._prepare_observation).parameters:
+            raise RuntimeError(
+                "[RobomimicPolicyRunner] this robomimic's RolloutPolicy._prepare_observation has no postprocess_visual_obs "
+                "argument, needed to feed camera observations in training order: install robomimic >= 0.4 (see README.md)."
+            )
+        self._policy._prepare_observation = functools.partial(
+            type(self._policy)._prepare_observation, self._policy, postprocess_visual_obs=False)
         self.obs_keys: List[str] = list(ckpt["shape_metadata"]["all_obs_keys"])
         self.action_dim: int = int(ckpt["shape_metadata"]["ac_dim"])
         # Each predicted action is one step at this rate (None: older checkpoint, the caller picks the rate).
@@ -121,7 +139,7 @@ class RobomimicPolicyRunner:
                 raise KeyError(
                     f"[RobomimicPolicyRunner] Missing obs key '{k}'. Expected: {self.obs_keys}"
                 )
-            frame[k] = obs_dict[k].astype(np.float32)
+            frame[k] = ObsUtils.process_obs(obs_dict[k].astype(np.float32), obs_key=k)
 
         if self._obs_horizon <= 1:
             stacked = frame

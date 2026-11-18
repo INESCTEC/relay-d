@@ -10,9 +10,6 @@ pytest.importorskip("av")
 
 from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser  # noqa: E402
 from relay_d.acquisition.qt_app.ui.postprocess import postprocess_options as po  # noqa: E402
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import (  # noqa: E402
-    PostprocessConfigLoader,
-)
 from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import (  # noqa: E402
     YAMLDrivenConverter,
 )
@@ -93,7 +90,7 @@ def test_templates_are_valid():
 
 def _converter(config=None):
     cfg = json.loads(json.dumps(config or DATA_CONFIG))
-    return YAMLDrivenConverter(PostprocessConfigLoader(), data_config=cfg)
+    return YAMLDrivenConverter(data_config=cfg)
 
 
 def test_robomimic_uses_options_file(tmp_path):

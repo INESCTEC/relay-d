@@ -205,21 +205,44 @@ def test_old_custom_backend_setting_falls_back_to_auto(settings_file):
     assert us.reload()["infer_backend"] == "auto"
 
 
-def _robomimic_runner_module(monkeypatch, ckpt):
+class _RolloutPolicy:
+    """Stand-in for robomimic's RolloutPolicy: records what reaches _prepare_observation (the real one normalizes
+    the observation, then converts images to CHW in [0, 1] if postprocess_visual_obs)."""
+
+    policy = None
+
+    def __init__(self):
+        self.seen = []
+
+    def start_episode(self):
+        pass
+
+    def _prepare_observation(self, ob, batched_ob=False, postprocess_visual_obs=True):
+        self.seen.append((ob, postprocess_visual_obs))
+        return ob
+
+    def __call__(self, ob, goal=None, batched_ob=False):
+        self._prepare_observation(ob, batched_ob=batched_ob)
+        return np.zeros(2)
+
+
+def _robomimic_runner_module(monkeypatch, ckpt, policy=None):
     """relay_d.dispatch.robomimic_runner loaded against stand-in robomimic modules (robomimic is not installed here)."""
     import importlib.util
     import sys
 
-    policy = types.SimpleNamespace(policy=None, start_episode=lambda: None)
+    policy = policy or _RolloutPolicy()
     file_utils = types.ModuleType("robomimic.utils.file_utils")
     file_utils.policy_from_checkpoint = lambda ckpt_path, device: (policy, ckpt)
     torch_utils = types.ModuleType("robomimic.utils.torch_utils")
     torch_utils.get_torch_device = lambda try_to_use_cuda: "cpu"
+    obs_utils = types.ModuleType("robomimic.utils.obs_utils")  # rgb: [0, 255] HWC -> [0, 1] CHW; low_dim unchanged
+    obs_utils.process_obs = lambda obs, obs_key: np.moveaxis(obs / 255.0, -1, -3) if obs_key.endswith("image") else obs
     utils = types.ModuleType("robomimic.utils")
-    utils.file_utils, utils.torch_utils = file_utils, torch_utils
+    utils.file_utils, utils.torch_utils, utils.obs_utils = file_utils, torch_utils, obs_utils
     robomimic = types.ModuleType("robomimic")
     robomimic.utils = utils
-    for module in (robomimic, utils, file_utils, torch_utils):
+    for module in (robomimic, utils, file_utils, torch_utils, obs_utils):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     spec = importlib.util.find_spec("relay_d.dispatch.robomimic_runner")
     module = importlib.util.module_from_spec(spec)  # not put in sys.modules: other tests never see the stand-ins
@@ -235,3 +258,67 @@ def test_robomimic_runner_reads_the_rate_and_action_size_from_the_checkpoint(mon
     assert runner.fps == 30.0 and runner.action_dim == 7  # the rate the data was recorded at, as for LeRobot
     assert rr.checkpoint_fps({"env_metadata": {"env_name": "relay_d", "type": 1, "env_kwargs": {}}}) is None  # older checkpoint
     assert rr.checkpoint_fps({}) is None and rr.checkpoint_fps({"env_metadata": [ckpt["env_metadata"]] * 2}) is None
+
+
+def test_robomimic_runner_gives_the_policy_processed_images_and_stops_robomimic_processing_them_again(monkeypatch):
+    # robomimic normalizes before it processes images, but training computed the stats on processed images: a camera
+    # policy trained with train.hdf5_normalize_obs failed every call with "shape mismatch in @normalize_obs"
+    policy = _RolloutPolicy()
+    ckpt = {"shape_metadata": {"all_obs_keys": ["cam_image", "joints"], "ac_dim": 2}}
+    runner = _robomimic_runner_module(monkeypatch, ckpt, policy).RobomimicPolicyRunner("model.pth")
+    runner.get_action({"cam_image": np.full((4, 6, 3), 255, np.uint8), "joints": np.arange(3.0)})
+    ob, postprocess = policy.seen[-1]
+    assert postprocess is False
+    assert ob["cam_image"].shape == (3, 4, 6) and ob["cam_image"].max() == 1.0
+    np.testing.assert_array_equal(ob["joints"], np.arange(3.0))
+
+
+def test_robomimic_without_postprocess_visual_obs_is_refused_at_load(monkeypatch):
+    """The fix relies on a private robomimic argument: an older robomimic must fail when the node starts, not on the robot."""
+
+    class OldRolloutPolicy(_RolloutPolicy):
+        def _prepare_observation(self, ob, batched_ob=False):
+            return ob
+
+    ckpt = {"shape_metadata": {"all_obs_keys": ["cam_image"], "ac_dim": 2}}
+    with pytest.raises(RuntimeError, match="postprocess_visual_obs"):
+        _robomimic_runner_module(monkeypatch, ckpt, OldRolloutPolicy()).RobomimicPolicyRunner("model.pth")
+
+
+def test_robomimic_camera_obs_are_normalized_like_in_training_with_real_robomimic(monkeypatch):
+    """With robomimic's own RolloutPolicy: training normalizes processed images (CHW, [0, 1]) with stats computed on them.
+    Runs only where robomimic is installed (e.g. ~/.relayd/envs/robomimic site-packages on PYTHONPATH)."""
+    pytest.importorskip("robomimic")
+    torch = pytest.importorskip("torch")
+    import robomimic.utils.obs_utils as ObsUtils
+    from robomimic.algo.algo import RolloutPolicy
+
+    from relay_d.dispatch import robomimic_runner as rr
+
+    ObsUtils.initialize_obs_modality_mapping_from_dict({"low_dim": ["joints"], "rgb": ["cam_image"]})
+    rng = np.random.default_rng(0)
+    images = rng.integers(0, 255, (20, 8, 6, 3), dtype=np.uint8)
+    processed = ObsUtils.process_obs(images.astype(np.float32), obs_key="cam_image")  # as robomimic's dataset does
+    stats = {"cam_image": {"offset": processed.mean(0, keepdims=True), "scale": processed.std(0, keepdims=True) + 1e-3},
+             "joints": {"offset": np.zeros((1, 3), np.float32), "scale": np.ones((1, 3), np.float32)}}
+
+    seen = {}
+
+    class Algo:  # the parts of the trained algo RolloutPolicy uses
+        device = torch.device("cpu")
+        global_config = types.SimpleNamespace(all_obs_keys=["cam_image", "joints"])
+        algo_config = None
+
+        def get_action(self, obs_dict, goal_dict=None):
+            seen.update(obs_dict)
+            return torch.zeros((1, 2))
+
+    policy = RolloutPolicy(Algo(), obs_normalization_stats=stats)
+    policy.start_episode = lambda: None
+    ckpt = {"shape_metadata": {"all_obs_keys": ["cam_image", "joints"], "ac_dim": 2}}
+    monkeypatch.setattr(rr.FileUtils, "policy_from_checkpoint", lambda ckpt_path, device: (policy, ckpt))
+    runner = rr.RobomimicPolicyRunner("model.pth")
+    runner.get_action({"cam_image": images[3], "joints": np.zeros(3)})  # was: AssertionError "shape mismatch in @normalize_obs"
+
+    expected = (processed[3] - stats["cam_image"]["offset"][0]) / stats["cam_image"]["scale"][0]
+    np.testing.assert_allclose(seen["cam_image"][0].numpy(), expected, atol=1e-6)

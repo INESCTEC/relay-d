@@ -354,8 +354,11 @@ class ActionDispatcher:
                     self._last_sent.pop(name, None)
 
             # Publisher path: sent every tick (controllers with a watchdog need a stream).
-            else:
-                self._dispatch_topic(name, cfg, transformed)
+            # A message that cannot be filled (e.g. -1 into a uint8 field) must not leave the other
+            # entries moving on their own: stop everything instead.
+            elif not self._dispatch_topic(name, cfg, transformed):
+                self.send_stop()
+                return
 
     def send_stop(self) -> None:
         """Send each entry's ``stop:`` values once, e.g. a zero velocity: called when inference stops sending (inputs
@@ -368,6 +371,7 @@ class ActionDispatcher:
         with self._goals_lock:
             self._stopped = True
             goals, self._goals = self._goals, []
+            self._last_sent.clear()  # the cancelled goals must be sent again when inference resumes
         for name, goal_handle in goals:
             self._cancel_goal(name, goal_handle)
         for name, cfg in self._action_configs.items():

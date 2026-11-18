@@ -4,7 +4,6 @@ import h5py
 import numpy as np
 import pytest
 
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
 from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import (
     YAMLDrivenConverter,
 )
@@ -56,7 +55,7 @@ def test_read_scalar_takes_one_float_and_applies_trig():
 
 @pytest.fixture
 def converter():
-    return YAMLDrivenConverter(PostprocessConfigLoader())
+    return YAMLDrivenConverter()
 
 
 def _mask(converter, n, train, val):
@@ -117,3 +116,14 @@ def test_median_rate_ignores_a_pause_and_needs_two_samples():
     ts = [0, 50e6, 100e6, 150e6, 2_150e6, 2_200e6]  # 20 Hz with a 2 s pause in the middle
     assert median_rate(ts) == pytest.approx(20.0)
     assert median_rate([5]) is None and median_rate([]) is None
+
+
+def test_rpy_delta_action_wraps_at_pi():
+    from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import _action_part
+
+    yaws = np.array([3.13, -3.13])  # crosses +-pi: really a +0.023 rad turn
+    q = np.stack([np.zeros(2), np.zeros(2), np.sin(yaws / 2), np.cos(yaws / 2)], axis=1)  # x, y, z, w
+    raw = {"ee": {"specs": ["t.x", "t.y", "t.z", "t.w"], "rotation_format": "rpy"}}
+    out = _action_part(q, "ee", raw, ["ee"])
+    assert out.shape == (2, 3)
+    assert abs(out[0, 2] - (2 * np.pi - 6.26)) < 1e-6 and out[1].tolist() == [0.0, 0.0, 0.0]

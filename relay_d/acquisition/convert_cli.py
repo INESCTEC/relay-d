@@ -20,9 +20,9 @@ import os
 import sys
 from typing import List, Optional
 
+import yaml
 
 from .qt_app.ui.postprocess.offline_config import load_conversion_config, write_dataset_files
-from .qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
 from .qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter, natural_key
 
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
@@ -101,9 +101,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not inputs:
         return _fail("no .h5 files found in the given inputs", EXIT_USAGE)
 
-    converter = YAMLDrivenConverter(
-        PostprocessConfigLoader(), data_config=parser.yaml_data["config"]
-    )
+    converter = YAMLDrivenConverter(data_config=parser.yaml_data["config"])
     converter.options = options
 
     if args.check:
@@ -122,6 +120,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _fail(f"output already exists, refusing to overwrite: {output}", EXIT_USAGE)
         os.makedirs(os.path.dirname(output), exist_ok=True)
 
+    # The config copies and action_dispatcher/ go next to the dataset (where the launcher and Run tab look): a folder
+    # that already holds another config's copies would end up with a dataset paired with the wrong obs layout.
+    dest_dir = os.path.dirname(output)
+    existing = os.path.join(dest_dir, "acquisition_config.yaml")
+    if os.path.isfile(existing):
+        with open(existing) as f:
+            if yaml.safe_load(f) != parser.yaml_data:
+                return _fail(f"{dest_dir} already holds the files of a dataset converted with another config "
+                             f"(acquisition_config.yaml, action_dispatcher/): use another output folder", EXIT_USAGE)
+
     print(f"Converting {len(inputs)} file(s) to {args.format} -> {output}")
     if args.format == "lerobot":
         ok = converter.convert_to_lerobot(inputs, output, task=args.task)
@@ -131,9 +139,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _fail(converter.last_error or "conversion failed (see the log above)", EXIT_FAILED)
 
     # The configs used and action_dispatcher/, like the GUI: next to the .h5, above the LeRobot folder.
-    dest_dir = os.path.dirname(output)
-    if os.path.exists(os.path.join(dest_dir, "acquisition_config.yaml")):
-        print(f"warning: replacing the config copies / action_dispatcher files already in {dest_dir}", file=sys.stderr)
     try:
         write_dataset_files(dest_dir, parser, options.source)
     except Exception as e:

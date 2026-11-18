@@ -22,12 +22,6 @@ from sensor_msgs.msg import Image, PointCloud2, JointState, CompressedImage
 from geometry_msgs.msg import Twist, PoseStamped
 from std_msgs.msg import Bool
 
-try:
-    from tf2_ros import Buffer
-except ImportError:
-    Buffer = None
-    logger.warning("tf2_ros not available")
-
 
 class TopicSubscribers(Node):
     # Timeouts come from the user settings, read when used so a change applies to the next subscription.
@@ -365,10 +359,10 @@ class TopicSubscribers(Node):
             try:
                 with self.data_lock:
                     self.latest_data[container_id] = msg
+                    # Only a header stamp takes part in the sync check: a receive time (wall clock) next to
+                    # robot-clock stamps (sim time, bag replay) would make every tick look out of sync.
                     if hasattr(msg, "header"):
                         self.latest_timestamps[container_id] = stamp_to_sec(msg.header.stamp)
-                    else:
-                        self.latest_timestamps[container_id] = time.time()
                     if container_id in self.subscriber_status:
                         self.subscriber_status[container_id]["message_count"] += 1
                         self.subscriber_status[container_id]["last_message_time"] = (

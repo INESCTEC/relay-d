@@ -14,7 +14,7 @@ import types as _types
 import numpy as np
 
 from relay_d.utils.coloring_logger import logger
-from relay_d.utils.numerics import enriched_tf, read_scalar, strip_trig
+from relay_d.utils.numerics import enriched_tf, read_scalar, select_joints, stream_entry, strip_trig
 
 try:
     from sensor_msgs.msg import CompressedImage, Image, PointCloud2
@@ -120,9 +120,8 @@ class StreamBuilder:
             return input_name, operator.attrgetter(field_path), is_slice
 
         streams = self.yaml_parser.get_streams()
-        for stream_name, specs in streams.items():
-            if isinstance(specs, dict):  # dict form — extract spec list, ignore rotation_format
-                specs = specs.get("specs", [])
+        for stream_name, entry in streams.items():
+            specs = stream_entry(entry)[0]  # rotation_format is applied at conversion
             extractor_list = []
             for spec in specs:
                 # sin(...)/cos(...) enclosing the whole spec, e.g. sin(joint_1.position[:]) or sin(a.x - b.x)
@@ -194,15 +193,8 @@ class StreamBuilder:
                     f"  Tip: ros2 topic echo /joint_states --once | grep -A20 name"
                 )
             return msg
-        n = len(indices)
-        filtered = _types.SimpleNamespace()
-        filtered.name     = [names[i] for i in indices]
-        # An array not filled for every joint (e.g. no velocity) reads as zeros instead of raising IndexError.
-        full = len(names)
-        filtered.position = [msg.position[i] for i in indices] if len(msg.position) == full else [0.0] * n
-        filtered.velocity = [msg.velocity[i] for i in indices] if len(msg.velocity) == full else [0.0] * n
-        filtered.effort   = [msg.effort[i]   for i in indices] if len(msg.effort)   == full else [0.0] * n
-        filtered.header   = msg.header
+        filtered = _types.SimpleNamespace(header=msg.header)
+        filtered.name, filtered.position, filtered.velocity, filtered.effort = select_joints(msg, allowed)
         return filtered
 
     def _warn_unsupported_type(self, stream_name: str, input_name: str, msg) -> None:

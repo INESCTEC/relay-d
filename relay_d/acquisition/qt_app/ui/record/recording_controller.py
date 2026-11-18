@@ -113,11 +113,7 @@ class RecordingController:
                 self.session_h5_files.append(self.data_recorder.retried_file)
 
             if success:
-                CustomMessageBox.info(
-                    "Please check Record Page to visualize the topics.",
-                    title="Started Recording",
-                )
-
+                # The sampling thread already runs: set the state (and enable Stop) before any dialog.
                 self.is_recording = True
                 self.recording_start_time = time.time()
                 self._buffer_timer.start()

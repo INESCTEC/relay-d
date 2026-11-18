@@ -426,3 +426,26 @@ def test_dry_run_logs_the_cancel_of_a_sent_goal(tmp_path, monkeypatch):
     d.dispatch(np.array([3.0]))
     d.send_stop()
     assert len([m for m in logged if "[DRY RUN]" in m and "'fib'" in m and "cancel" in m]) == 1
+
+
+def test_goal_cancelled_by_a_stop_is_sent_again(d):
+    """A gripper 'close' cut short by a stop must close when inference resumes with the same output."""
+    _stop_dispatcher(d, {"grip": {"indices": [0], "action": True}})
+    sent = []
+    d._dispatch_action = lambda name, cfg, values: sent.append(name) or True
+    d.dispatch(np.array([1.0]))
+    d.dispatch(np.array([1.0]))  # same goal: not re-sent
+    d.send_stop()
+    d.dispatch(np.array([1.0]))
+    assert sent == ["grip", "grip"]
+
+
+def test_a_topic_that_cannot_be_filled_stops_everything(d):
+    published = _stop_dispatcher(d, {
+        "arm": {"indices": [0], "topic": "/arm", "mapping": {"x": 0}, "stop": [0]},
+        "tool": {"indices": [0], "topic": "/tool", "mapping": {"x": 0}},
+    })
+    d._dispatch_topic = lambda name, cfg, values: name == "arm" and (d._publishers[name].publish(
+        type("M", (), {"x": values[0], "y": 0.0})) or True)
+    d.dispatch(np.array([0.5]))
+    assert published == [("arm", 0.5, 0.0), ("arm", 0.0, 0.0)]  # the arm is stopped, not left moving alone

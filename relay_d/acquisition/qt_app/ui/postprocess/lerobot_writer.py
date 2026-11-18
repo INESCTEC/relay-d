@@ -130,14 +130,32 @@ def _vector_stats(arr: np.ndarray) -> Dict[str, np.ndarray]:
     return out
 
 
-def _image_stats(frames: np.ndarray) -> Dict[str, np.ndarray]:
+class _Frames:
+    """(N, H, W, 3) RGB frames read from `src` (an array or an h5py dataset) a few at a time, converted from BGR and
+    cropped to even size on the fly: a long camera episode (15 GB for 3 min of 720p) never sits in RAM whole."""
+
+    ndim, dtype, _BATCH = 4, np.dtype(np.uint8), 64
+
+    def __init__(self, src, bgr: bool, h: int, w: int):
+        self.src, self.bgr, self.shape = src, bgr, (src.shape[0], h, w, 3)
+
+    def __getitem__(self, idx):
+        """Frames `idx` (int, slice or increasing index array) along the first axis."""
+        out = np.asarray(self.src[idx])[..., : self.shape[1], : self.shape[2], :]
+        return out[..., ::-1] if self.bgr else out
+
+    def __iter__(self):
+        for i in range(0, self.shape[0], self._BATCH):
+            yield from self[i : i + self._BATCH]
+
+
+def _image_stats(frames: _Frames) -> Dict[str, np.ndarray]:
     """Per-channel stats over sampled frames, scaled to [0, 1], shape (C, 1, 1)."""
     n = frames.shape[0]
     idx = np.unique(np.linspace(0, n - 1, min(n, _MAX_STAT_FRAMES)).astype(int))
     h, w = frames.shape[1:3]
     step = max(1, max(h, w) // _MAX_STAT_SIDE)
-    # one strided indexing op: never materializes the full-resolution sampled frames
-    sampled = frames[idx, ::step, ::step, :].astype(np.float64) / 255.0
+    sampled = frames[idx][:, ::step, ::step, :].astype(np.float64) / 255.0
     # (S, h, w, C) -> (C, S*h*w)
     flat = sampled.transpose(3, 0, 1, 2).reshape(sampled.shape[3], -1)
     out = {
@@ -423,21 +441,18 @@ class LeRobotDatasetWriter:
 
     # ----------------------------------------------------------------- schema
 
-    def _prepare_frames(self, key: str, frames: np.ndarray, n: int) -> np.ndarray:
-        frames = np.asarray(frames)
-        if frames.ndim != 4 or frames.shape[3] != 3 or frames.dtype != np.uint8:
+    def _prepare_frames(self, key: str, frames, n: int) -> _Frames:
+        """`frames` (an array or an h5py dataset, read lazily) as RGB with even dimensions."""
+        if not hasattr(frames, "shape"):
+            frames = np.asarray(frames)
+        if len(frames.shape) != 4 or frames.shape[3] != 3 or frames.dtype != np.uint8:
             raise LeRobotWriterError(
                 f"Camera '{key}' must be (N, H, W, 3) uint8, got {frames.shape} {frames.dtype}"
             )
         if frames.shape[0] != n:
             raise LeRobotWriterError(f"Camera '{key}' has {frames.shape[0]} frames, expected {n}")
-        if self.images_are_bgr:
-            frames = frames[..., ::-1]
         h, w = frames.shape[1], frames.shape[2]
-        eh, ew = h - (h % 2), w - (w % 2)  # yuv420p needs even dimensions
-        if (eh, ew) != (h, w):
-            frames = frames[:, :eh, :ew]
-        return frames
+        return _Frames(frames, self.images_are_bgr, h - (h % 2), w - (w % 2))  # yuv420p needs even dimensions
 
     def _init_schema(self, state, action, images, state_names, action_names) -> None:
         def names(prefix, given, dim):
@@ -484,8 +499,8 @@ class LeRobotDatasetWriter:
             feats[key] = {"dtype": "int64", "shape": [1], "names": None}
         self._features = feats
 
-        def vec(dim):
-            return pa.list_(pa.float32(), dim)
+        def vec(dim):  # LeRobot reads a (1,) feature as a plain value, not a 1-element list
+            return pa.float32() if dim == 1 else pa.list_(pa.float32(), dim)
 
         fields = [
             pa.field("observation.state", vec(state.shape[1])),
@@ -561,7 +576,7 @@ class LeRobotDatasetWriter:
                     pa.FixedSizeListArray.from_arrays(pa.array(arr.reshape(-1), type=pa.float32()), dim)
                 )
             else:
-                arrays.append(pa.array(arr, type=field.type))
+                arrays.append(pa.array(arr.reshape(-1) if arr.ndim > 1 else arr, type=field.type))
         self._data_writer.write_table(pa.Table.from_arrays(arrays, schema=self._arrow_schema))
         self._data_file_frames += n
         return {
@@ -576,7 +591,7 @@ class LeRobotDatasetWriter:
     def _video_path(self, key: str, chunk: int, file: int) -> Path:
         return self.root / VIDEO_PATH.format(video_key=key, chunk_index=chunk, file_index=file)
 
-    def _write_video(self, key: str, frames: np.ndarray) -> Dict:
+    def _write_video(self, key: str, frames: _Frames) -> Dict:
         assert self._features is not None
         h, w, _ = self._features[key]["shape"]
         n = frames.shape[0]

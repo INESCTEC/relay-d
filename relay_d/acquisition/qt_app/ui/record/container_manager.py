@@ -206,14 +206,6 @@ class ContainerManager:
                 status = without_data
             self.topic_containers.update_container_info(container, {"status": status})
 
-    def set_status_for_all(self, status):
-        """Set the same status text on every container that has an id."""
-        for container in self.topic_containers.containers:
-            if getattr(container, "container_id", None):
-                self.topic_containers.update_container_info(
-                    container, {"status": status}
-                )
-
     def restart_failed_subscribers(self):
         """Restart subscribers that failed to create or stopped working"""
         restarted_count = 0

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 import h5py
 
 from relay_d.utils import user_settings
+from relay_d.utils.coloring_logger import logger
 from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
 from relay_d.acquisition.qt_app.ui.postprocess.robomimic_config_handler import (
     RobomimicConfigHandler,
@@ -106,11 +107,13 @@ def _robomimic_summary(path: Path) -> Optional[Dict[str, Any]]:
             demos = [k for k in f["data"] if isinstance(f["data"][k], h5py.Group)]
             obs_keys = list(f["data"][demos[0]]["obs"]) if demos and "obs" in f["data"][demos[0]] else []
             frames = lambda names: int(sum(f["data"][d].attrs.get("num_samples", 0) for d in names if d in f["data"]))  # noqa: E731
-            train = [k.decode() if isinstance(k, bytes) else str(k) for k in f["mask"]["train"][:]] if "train" in f["mask"] else demos
+            names = lambda key: [k.decode() if isinstance(k, bytes) else str(k) for k in f["mask"][key][:]]  # noqa: E731
+            train = names("train") if "train" in f["mask"] else demos
             return {
                 "episodes": len(demos),
                 "frames": frames(demos),
                 "train_frames": frames(train),  # what one epoch is made of
+                "valid_frames": frames(names("valid")) if "valid" in f["mask"] else 0,
                 "has_valid": "valid" in f["mask"],
                 "obs_keys": obs_keys,
             }
@@ -169,15 +172,9 @@ def _set_path(cfg: dict, dotted: str, value) -> None:
 
 
 def _config_file(dataset: "DatasetInfo", name: str) -> Optional[Path]:
-    """``name`` (e.g. ``acquisition_config.yaml``) that belongs to ``dataset``, next to it.
-
-    ``relay-d-convert`` writes ``<output name>_<name>``, so a folder can hold several pairs: take the one named after
-    this dataset, else the plain file the GUI writes, else any ``*<name>``.
-    """
-    for candidate in (dataset.base / f"{dataset.path.stem}_{name}", dataset.base / name):
-        if candidate.is_file():
-            return candidate
-    return next(iter(sorted(dataset.base.glob(f"*{name}"))), None)
+    """``name`` (e.g. ``acquisition_config.yaml``) next to ``dataset``: where the GUI, AppAPI and relay-d-convert write it."""
+    candidate = dataset.base / name
+    return candidate if candidate.is_file() else None
 
 
 def _robomimic_policy(dataset: DatasetInfo, policy: Optional[str]) -> str:
@@ -286,7 +283,12 @@ def build_command(job: TrainJob, run_dir: Path, write: bool = True) -> List[str]
         _set_path(cfg, "train.data", str(ds.path))
         _set_path(cfg, "train.output_dir", str(run_dir / "output"))
         _set_path(cfg, "experiment.name", name)
-        if not ds.summary.get("has_valid", True):  # no validation split in the file: nothing to validate on
+        valid_frames, batch = ds.summary.get("valid_frames"), _get_path(cfg, ROBOMIMIC_PARAMS["batch_size"][0])
+        # Validation also drops the incomplete batch: fewer frames than one batch would crash after epoch 1 (StopIteration).
+        too_small = valid_frames is not None and batch and valid_frames < batch
+        if too_small and ds.summary.get("has_valid", True):
+            logger.warning(f"validation split has {valid_frames} frames, fewer than the batch size {batch}: validation is off")
+        if not ds.summary.get("has_valid", True) or too_small:  # nothing (or not one batch) to validate on
             _set_path(cfg, "experiment.validate", False)
             _set_path(cfg, "train.hdf5_validation_filter_key", None)  # robomimic refuses a filter key when validation is off
         config_path = run_dir / "robomimic_config.json"

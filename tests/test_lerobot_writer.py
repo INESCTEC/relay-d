@@ -184,3 +184,44 @@ def test_failed_conversion_removes_partial_output(tmp_path):
     with LeRobotDatasetWriter(root, fps=10) as w:
         w.add_episode(np.zeros((5, 3)), np.zeros((5, 2)), None, task="t")
     assert (root / "meta/info.json").exists()
+
+
+def test_a_one_wide_action_is_a_plain_value_column(tmp_path):
+    """LeRobot loads a (1,) feature as datasets.Value: a 1-element list column fails to cast at training."""
+    import pyarrow as pa
+
+    state, action, _ = _episode(6, state_dim=1, action_dim=1)
+    with LeRobotDatasetWriter(tmp_path / "ds", fps=FPS) as writer:
+        writer.add_episode(state, action, None, task="t")
+    table = pq.read_table(next((tmp_path / "ds/data").rglob("*.parquet")))
+    assert table.schema.field("action").type == pa.float32()
+    assert table.schema.field("observation.state").type == pa.float32()
+    np.testing.assert_allclose(table.column("action").to_numpy(), action[:, 0])
+    hf = json.loads(table.schema.metadata[b"huggingface"])["info"]["features"]
+    assert hf["action"]["_type"] == "Value"  # metadata and column agree
+
+
+class _CountingFrames:
+    """A frame source (like an h5py dataset) that records how many frames each read takes."""
+
+    def __init__(self, arr):
+        self.arr, self.shape, self.dtype, self.reads = arr, arr.shape, arr.dtype, []
+
+    def __getitem__(self, idx):
+        out = self.arr[idx]
+        self.reads.append(len(out) if out.ndim == 4 else 1)
+        return out
+
+
+def test_camera_frames_are_read_a_few_at_a_time(tmp_path):
+    """A 3-minute 720p episode is ~15 GB: it must never be read whole."""
+    from relay_d.acquisition.qt_app.ui.postprocess import lerobot_writer as lw
+
+    state, action, images = _episode(200)
+    src = _CountingFrames(images["observation.images.cam"])
+    with LeRobotDatasetWriter(tmp_path / "ds", fps=FPS) as writer:
+        writer.add_episode(state, action, {"observation.images.cam": src}, task="t")
+    assert src.reads and max(src.reads) <= max(64, lw._MAX_STAT_FRAMES)  # was one read of all 200
+    assert sum(src.reads) >= 200  # every frame was still encoded
+    video = next((tmp_path / "ds/videos").rglob("*.mp4"))
+    assert _video_frames(video) == 200

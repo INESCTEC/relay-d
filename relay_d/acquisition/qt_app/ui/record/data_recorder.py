@@ -7,7 +7,7 @@ from rclpy.node import Node
 from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 from ...utils.stream_builder import StreamBuilder
-from relay_d.utils.numerics import inputs_in_sync, stamp_to_sec
+from relay_d.utils.numerics import inputs_in_sync, stamp_to_ns, stamp_to_sec
 from ..config.builder.config_check import RECORDING_CHANGING, removed_keys
 import time
 import json
@@ -72,6 +72,8 @@ class DataRecorder(Node):
         self._fill_gaps_containers = set()
         self._fill_count_summary = {}
         self._held_counts = defaultdict(int)  # per input: ticks recorded without a fresh sample
+        self._strict_drops = 0  # ticks skipped by sync_mode: strict
+        self._partial_files = []  # half-written demos set aside by a failed save
         self._modalities = {}
 
         self.topic_subscribers = None
@@ -154,6 +156,7 @@ class DataRecorder(Node):
 
                 self.recorded_data.clear()
                 self._held_counts.clear()
+                self._strict_drops = 0
                 self._buffered_bytes = 0
                 self.buffer_full = False
                 self.loop_failed = False
@@ -245,10 +248,14 @@ class DataRecorder(Node):
                     # timestamp without any additional subscriptions.
                     ref_ros_time = None
                     ref_nsec = 0
-                    for msg in all_data.values():
+                    for cid, msg in all_data.items():
+                        # Not the TF entries themselves: they hold the latest transform, whose stamp
+                        # would become the reference and TF would never be aligned to a camera frame.
+                        if cid in topic_subscribers.tf_lookup_containers:
+                            continue
                         if msg is not None and hasattr(msg, "header"):
                             s = msg.header.stamp
-                            nsec = s.sec * 1_000_000_000 + s.nanosec
+                            nsec = stamp_to_ns(s)
                             if nsec > ref_nsec:
                                 ref_nsec = nsec
                                 ref_ros_time = rclpy.time.Time(
@@ -267,7 +274,7 @@ class DataRecorder(Node):
                     # the new header.stamp ≈ ref_ros_time → spread ≈ 0 → no false warning.
                     # If it failed, all_data[tf_cid] kept the raw broadcaster timestamp
                     # → snap_timestamps stays stale → warning fires correctly.
-                    for tf_cid in topic_subscribers.tf_lookup_containers:
+                    for tf_cid in list(topic_subscribers.tf_lookup_containers):
                         tf_val = all_data.get(tf_cid)
                         if tf_val is not None and hasattr(tf_val, "header"):
                             snap_timestamps[tf_cid] = stamp_to_sec(tf_val.header.stamp)
@@ -299,6 +306,7 @@ class DataRecorder(Node):
                                     f"{self._sync_tolerance}s\n  {lag_parts}"
                                 )
                                 if self._sync_mode == "strict":
+                                    self._strict_drops += 1
                                     next_tick += interval
                                     sleep_time = next_tick - time.monotonic()
                                     if sleep_time > 0:
@@ -307,9 +315,7 @@ class DataRecorder(Node):
                                         next_tick = time.monotonic()
                                     continue
                     current_time = self._clock.now().to_msg()
-                    timestamp_nsec = (
-                        current_time.sec * 1000000000 + current_time.nanosec
-                    )
+                    timestamp_nsec = stamp_to_ns(current_time)
 
                     # Encode the whole tick first, append it only once all of it worked: a tick that
                     # fails half way would leave some inputs one sample behind the timestamps for good.
@@ -427,6 +433,12 @@ class DataRecorder(Node):
                     - self.recording_metadata["start_time"]
                 )
                 self.recording_metadata["total_samples"] = len(self.timestamps)
+                self.recording_metadata["strict_sync_dropped_ticks"] = self._strict_drops
+                if self._strict_drops:
+                    logger.error(
+                        f"sync_mode strict dropped {self._strict_drops} ticks "
+                        f"({len(self.timestamps)} kept): inputs were more than {self._sync_tolerance}s apart."
+                    )
 
                 self._unsaved = True  # until the file is saved AND closed: a failed close must not lose the demo at the next Start
                 saved = self._save_recorded_data()
@@ -450,6 +462,7 @@ class DataRecorder(Node):
 
                 if not saved:
                     logger.error(f"Recording NOT saved to {self.h5_file_path}; data is still in memory")
+                    self._set_aside_partial()
                     return False
                 self._unsaved = False
 
@@ -482,11 +495,29 @@ class DataRecorder(Node):
             except Exception:
                 pass
         self.h5_file = None
-        if saved:
-            self._unsaved = False
-            self.retried_file = self.h5_file_path  # the caller adds it to its session list
-            self.current_demo_number += 1
-        return saved
+        if not saved:
+            self._set_aside_partial()
+            return False
+        self._unsaved = False
+        self.retried_file = self.h5_file_path  # the caller adds it to its session list
+        self.current_demo_number += 1
+        for path in self._partial_files:  # the full demo is saved now
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        self._partial_files = []
+        return True
+
+    def _set_aside_partial(self):
+        """Rename a half-written demo to ``<name>.h5.partial``: as a .h5 the Review page and the converters would
+        take it for a demo. Removed once a retry saves the whole demo; kept (for inspection) after "Close anyway"."""
+        if self.h5_file_path and os.path.exists(self.h5_file_path):
+            try:
+                os.replace(self.h5_file_path, self.h5_file_path + ".partial")
+                self._partial_files.append(self.h5_file_path + ".partial")
+            except OSError as e:
+                logger.error(f"Could not rename the partial demo {self.h5_file_path}: {e}")
 
     def _recordings_base(self):
         """Folder the sessions go into, read when a demo starts: an explicit ``output_directory`` (AppAPI), else the setting."""

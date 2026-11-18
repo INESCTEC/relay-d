@@ -8,7 +8,6 @@ import pytest
 import yaml
 
 from relay_d.acquisition.convert_cli import main as cli_main
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
 from relay_d.acquisition.qt_app.ui.postprocess.postprocess_options import PostprocessOptions
 from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
 
@@ -16,7 +15,7 @@ from helpers import DATA_CONFIG, FPS, write_recording
 
 
 def _converter(cfg=None):
-    return YAMLDrivenConverter(PostprocessConfigLoader(), data_config=cfg or json.loads(json.dumps(DATA_CONFIG)))
+    return YAMLDrivenConverter(data_config=cfg or json.loads(json.dumps(DATA_CONFIG)))
 
 
 def _stamp(demo, rate, recorded_hz=None, config="/somewhere/config_peter.yaml"):

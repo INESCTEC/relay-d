@@ -11,7 +11,7 @@ import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Set
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils import user_settings
-from relay_d.utils.numerics import RATE_TOLERANCE, median_rate, quat_to_euler
+from relay_d.utils.numerics import RATE_TOLERANCE, median_rate, quat_to_euler, stream_entry
 from relay_d.acquisition.qt_app.ui.config.builder.config_check import normalization_error, stream_width
 from .postprocess_options import FORMAT_SUFFIX, PostprocessOptions, removed_key_errors
 from .robomimic_config_handler import explicit_modalities
@@ -19,19 +19,6 @@ import re
 import json
 import os
 import traceback
-import yaml
-
-
-def _parse_stream_entry(stream_val):
-    """Return (spec_list, rotation_format).
-
-    Accepts plain-list form (list of strings) or dict form:
-      specs: [...]
-      rotation_format: quat | rpy            # quat (default) or roll-pitch-yaw radians
-    """
-    if isinstance(stream_val, dict):
-        return stream_val.get("specs", []), str(stream_val.get("rotation_format", "quat")).lower()
-    return stream_val, "quat"
 
 
 def _stream_output_width(data_config: Dict, stream_name: str) -> Optional[int]:
@@ -41,7 +28,7 @@ def _stream_output_width(data_config: Dict, stream_name: str) -> Optional[int]:
     3 columns (roll, pitch, yaw) from its 4 quaternion specs.
     """
     streams = data_config.get("output", {}).get("streams", {})
-    spec_list, rot_fmt = _parse_stream_entry(streams.get(stream_name, []))
+    spec_list, rot_fmt = stream_entry(streams.get(stream_name, []))
     inputs = {n: v for n, v in (data_config.get("input") or {}).items() if isinstance(v, dict)}
     width = stream_width([str(x) for x in spec_list], inputs)
     if rot_fmt == "rpy":
@@ -60,9 +47,13 @@ def _action_part(part: np.ndarray, key: str, stream_configs: dict, delta_actions
     (the value at t is the current state, which would teach the policy to stand still).
     Shared by both output formats."""
     part = part if part.ndim > 1 else part[:, np.newaxis]
-    _, rot_fmt = _parse_stream_entry(stream_configs.get(key, []))
+    _, rot_fmt = stream_entry(stream_configs.get(key, []))
     part = _apply_rotation_format(part, rot_fmt, key)
-    return _compute_delta(part) if key in delta_actions else _next_step(part)
+    if key not in delta_actions:
+        return _next_step(part)
+    delta = _compute_delta(part)
+    # An angle going from +3.13 to -3.13 rad moved +0.02, not -6.26.
+    return (delta + np.pi) % (2 * np.pi) - np.pi if rot_fmt == "rpy" else delta
 
 
 def _compute_delta(data: np.ndarray) -> np.ndarray:
@@ -293,12 +284,7 @@ class YAMLDrivenConverter:
     converts each demo to Robomimic 1.0 format, and writes the output.
     """
 
-    def __init__(
-        self,
-        config_loader,
-        data_config: Optional[Dict] = None,
-    ):
-        self.config_loader = config_loader
+    def __init__(self, data_config: Optional[Dict] = None):
         # data_config is the `config` sub-dict from data_config.yaml
         self.data_config: Dict = data_config or {}
         # Per-batch cache: logical_key -> (feature_shape, dtype), built by
@@ -322,29 +308,6 @@ class YAMLDrivenConverter:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-
-    def load_data_config(self, data_config_path: str) -> bool:
-        """
-        Load (or reload) the data_config.yaml bridge map.
-
-        Args:
-            data_config_path: Absolute path to data_config.yaml
-
-        Returns:
-            True on success, False on error.
-        """
-        try:
-            with open(data_config_path, "r") as f:
-                raw = yaml.safe_load(f)
-            self.data_config = raw.get("config", raw)
-            logger.info(
-                f"Loaded data_config from {data_config_path} "
-                f"({len(self.data_config.get('output', {}))} bridge entries)"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to load data_config.yaml: {e}")
-            return False
 
     def _prepare_batch(
         self,
@@ -469,9 +432,13 @@ class YAMLDrivenConverter:
         freq = float(self.data_config.get("recording_frequency") or 0)  # required by the config check; 0 = no rate check
 
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        if os.path.exists(output_path):  # e.g. two conversions in the same second: never truncate a dataset
+            self.last_error = f"{output_path} already exists; not overwriting it."
+            logger.error(self.last_error)
+            return False
 
         try:
-            with h5py.File(output_path, "w") as out_f:
+            with h5py.File(output_path, "w-") as out_f:
                 data_grp = out_f.create_group("data")
                 total_demos = 0
                 processed: List[str] = []
@@ -822,7 +789,7 @@ class YAMLDrivenConverter:
         obs: Dict[str, Tuple[Tuple[int, ...], np.dtype]] = {}  # key -> (feature shape, dtype) as written
         for key, entry in streams_cfg.items():
             shape = self._shape_cache[key][0]
-            obs[key] = ((3,) if _parse_stream_entry(entry)[1] == "rpy" else shape, np.dtype(np.float32))
+            obs[key] = ((3,) if stream_entry(entry)[1] == "rpy" else shape, np.dtype(np.float32))
         for key in sorted(engine.bridge_map):
             if key not in self._excluded_keys and key not in obs:
                 shape, dtype = self._shape_cache[key]
@@ -956,7 +923,8 @@ class YAMLDrivenConverter:
         images: Dict[str, np.ndarray] = {}
         numeric: Dict[str, np.ndarray] = {}
         for key, arr in obs.items():
-            arr = np.asarray(arr)
+            if not isinstance(arr, h5py.Dataset):  # a camera stays an h5py dataset: the writer reads it in slices
+                arr = np.asarray(arr)
             modality = self._modality_map.get(key)
             if modality in ("depth", "scan"):
                 logger.warning(f"Skipping '{key}': {modality} is not supported in LeRobot output yet.")
@@ -968,7 +936,7 @@ class YAMLDrivenConverter:
                     f"not a numeric vector or an RGB/BGR image."
                 )
             else:
-                numeric[key] = arr.astype(np.float32).reshape(n, -1)
+                numeric[key] = np.asarray(arr, dtype=np.float32).reshape(n, -1)
 
         if state_streams:
             unknown = [k for k in state_streams if k not in numeric]
@@ -1047,7 +1015,7 @@ class YAMLDrivenConverter:
 
             stream_configs = self.data_config.get("output", {}).get("streams", {})
             for stream_name in stream_names:
-                _, rot_fmt = _parse_stream_entry(stream_configs.get(stream_name, []))
+                _, rot_fmt = stream_entry(stream_configs.get(stream_name, []))
                 if stream_name in streams_grp:
                     data = np.array(streams_grp[stream_name], dtype=np.float32)
                     data = _apply_rotation_format(data, rot_fmt, stream_name)
@@ -1137,7 +1105,8 @@ class YAMLDrivenConverter:
                 # `input.*.modality` field, since their dtype (uint16/
                 # float32) isn't distinguishable from low_dim data by itself.
                 is_image = dataset.dtype == np.uint8 or obs_key in self._modality_map
-                raw = np.array(dataset) if is_image else np.array(dataset, dtype=np.float32)
+                # Images stay in the (open) recording and are copied a few frames at a time when written.
+                raw = dataset if is_image else np.array(dataset, dtype=np.float32)
 
                 demo["obs"][obs_key] = raw
                 continue
@@ -1211,7 +1180,12 @@ class YAMLDrivenConverter:
                 # Per-frame chunking for efficient sequential reads during training
                 kwargs["chunks"] = (1,) + data.shape[1:]
 
-            grp.create_dataset(key, data=data, **kwargs)
+            if isinstance(data, h5py.Dataset):  # a camera still in the recording: copy it in slices, not whole
+                out = grp.create_dataset(key, shape=data.shape, **kwargs)
+                for i in range(0, data.shape[0], 64):
+                    out[i:i + 64] = data[i:i + 64]
+            else:
+                grp.create_dataset(key, data=data, **kwargs)
 
     def _create_data_mask(self, mask_group: h5py.Group, demo_names: List[str], train: float, val: float):
         """mask/train and mask/valid; demos left over by rounding or train + val < 1 also train."""

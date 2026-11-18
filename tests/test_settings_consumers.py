@@ -97,7 +97,6 @@ def test_postprocess_defaults_come_from_settings_and_the_file_wins(settings, tmp
 def test_lerobot_encoder_settings_reach_the_dataset(settings, tmp_path):
     pytest.importorskip("av")
     pytest.importorskip("pyarrow")
-    from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
     from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
 
     settings({"lerobot_video_crf": 30, "lerobot_gop": 4, "lerobot_video_preset": "ultrafast", "lerobot_chunks_size": 7})
@@ -113,7 +112,7 @@ def test_lerobot_encoder_settings_reach_the_dataset(settings, tmp_path):
         d.create_group("streams").create_dataset("j", data=rng.normal(size=(8, 3)).astype(np.float32))
         d.create_group("cam").create_dataset("images", data=rng.integers(0, 255, (8, 16, 16, 3), dtype=np.uint8))
     out = tmp_path / "ds"
-    assert YAMLDrivenConverter(PostprocessConfigLoader(), data_config=cfg).convert_to_lerobot([str(rec)], str(out))
+    assert YAMLDrivenConverter(data_config=cfg).convert_to_lerobot([str(rec)], str(out))
     info = json.loads((out / "meta" / "info.json").read_text())
     cam = next(v for k, v in info["features"].items() if v["dtype"] == "video")
     assert (cam["info"]["video.crf"], cam["info"]["video.g"], cam["info"]["video.preset"]) == (30, 4, "ultrafast")

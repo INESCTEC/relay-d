@@ -15,6 +15,35 @@ def stamp_to_sec(stamp) -> float:
     return stamp.sec + stamp.nanosec * 1e-9
 
 
+def stream_entry(stream_val):
+    """An ``output.streams`` entry as (spec list, rotation_format). Accepts the plain-list form or the dict form
+    ``{specs: [...], rotation_format: quat | rpy}`` (quat, the default, keeps the values as they are). Recording,
+    conversion and inference all read streams through this, so they cannot disagree on a stream's layout."""
+    if isinstance(stream_val, dict):
+        return stream_val.get("specs", []), str(stream_val.get("rotation_format", "quat")).lower()
+    return stream_val, "quat"
+
+
+def stamp_to_ns(stamp) -> int:
+    """builtin_interfaces/Time (sec, nanosec) -> integer nanoseconds."""
+    return stamp.sec * 1_000_000_000 + stamp.nanosec
+
+
+def select_joints(msg, wanted):
+    """A JointState's joints that are in `wanted`, as (names, position, velocity, effort) lists.
+
+    Kept in the message's order: that is how the recorder stores them, so live inference must read
+    them the same way. An array not filled for every joint (some drivers send no velocity) reads as zeros.
+    """
+    names = list(msg.name)
+    idx = [i for i, n in enumerate(names) if n in wanted]
+
+    def pick(arr):
+        return [float(arr[i]) for i in idx] if len(arr) == len(names) else [0.0] * len(idx)
+
+    return [names[i] for i in idx], pick(msg.position), pick(msg.velocity), pick(msg.effort)
+
+
 def quat_to_euler(q) -> np.ndarray:
     """Quaternion(s) (..., 4) as (x, y, z, w) -> (..., 3) roll, pitch, yaw in radians (extrinsic xyz)."""
     q = np.asarray(q, dtype=np.float64)

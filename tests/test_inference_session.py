@@ -61,13 +61,21 @@ def test_run_lets_a_dispatch_error_through(monkeypatch):
     assert stops
 
 
-def test_joint_view_keeps_configured_order_and_skips_partial_arrays():
+def test_joint_view_reads_joints_like_the_recorder():
+    """Live inference must see the same joint order and zero-fill as the recorded dataset."""
+    from relay_d.acquisition.qt_app.utils.stream_builder import StreamBuilder
     from relay_d.dispatch.obs_builder import _JointStateView
 
-    msg = SimpleNamespace(name=["j3", "j1", "j2"], position=[3.0, 1.0, 2.0], velocity=[0.1], effort=[])
+    msg = SimpleNamespace(name=["j3", "j1", "j2"], position=[3.0, 1.0, 2.0], velocity=[0.1], effort=[],
+                          header=None)
     v = _JointStateView(msg, ["j1", "j2", "j3"])
-    assert (v.name, v.position) == (["j1", "j2", "j3"], [1.0, 2.0, 3.0])
-    assert v.velocity == [] and v.effort == []  # a 1-value velocity for 3 joints is not read
+    assert (v.name, v.position) == (["j3", "j1", "j2"], [3.0, 1.0, 2.0])  # message order, as recorded
+    assert v.velocity == [0.0] * 3 and v.effort == [0.0] * 3  # a 1-value velocity for 3 joints is not read
+
+    sb = StreamBuilder.__new__(StreamBuilder)
+    sb._joint_name_filters, sb._joint_filter_warned = {"js": frozenset(["j1", "j2", "j3"])}, {}
+    rec = sb.apply_joint_filter("js", msg)
+    assert (rec.name, rec.position, rec.velocity, rec.effort) == (v.name, v.position, v.velocity, v.effort)
 
 
 def test_message_missing_a_joint_keeps_the_last_good_value():
@@ -214,12 +222,12 @@ def test_device_defaults_to_the_infer_device_setting(monkeypatch):
     real_get = api.user_settings.get
     monkeypatch.setattr(api.user_settings, "get", lambda k: "cuda:7" if k == "infer_device" else real_get(k))
     monkeypatch.setattr(api.rclpy, "ok", lambda: True)
-    monkeypatch.setattr(api, "ObsBuilder", lambda cfg: SimpleNamespace(low_dim_obs_names=[],
+    monkeypatch.setattr(api, "ObsBuilder", lambda cfg: SimpleNamespace(low_dim_obs_names=[], use_only=lambda keys: None,
                                                                        get_logger=lambda: SimpleNamespace(info=print)))
     monkeypatch.setattr(api, "ActionDispatcher", lambda *a, **k: SimpleNamespace(_action_configs={}))
     executors = []
     monkeypatch.setattr(api, "SingleThreadedExecutor", lambda: executors.append(1) or SimpleNamespace(add_node=lambda n: None))
-    monkeypatch.setattr(lr, "LeRobotPolicyRunner", lambda ckpt, device, **k: devices.append(device) or SimpleNamespace())
+    monkeypatch.setattr(lr, "LeRobotPolicyRunner", lambda ckpt, device, **k: devices.append(device) or SimpleNamespace(obs_keys=[]))
     InferenceSession("m", "o.yaml", "a.yaml", backend="lerobot")
     InferenceSession("m", "o.yaml", "a.yaml", device="cpu", backend="lerobot")
     assert devices == ["cuda:7", "cpu"]  # the API runs where the CLI and the Run tab run
@@ -279,3 +287,52 @@ def test_sigterm_takes_the_safe_stop_path():
     p.send_signal(signal.SIGTERM)
     out, _ = p.communicate(timeout=20)
     assert "STOP PUBLISHED" in out, out  # rclpy's default SIGTERM handling exits without running finally
+
+
+def test_quat_rotation_format_is_accepted_like_when_recording():
+    from relay_d.dispatch.obs_builder import ObsBuilder
+
+    ob = ObsBuilder.__new__(ObsBuilder)  # skip ROS setup
+    ob._obs_cfg = {"q": {"specs": ["tf.transform.rotation.x", "tf.transform.rotation.y",
+                                   "tf.transform.rotation.z", "tf.transform.rotation.w"], "rotation_format": "quat"}}
+    ob._input_cfg = {"tf": {"parent_frame": "base", "child_frame": "tool"}}
+    ob._tf_inputs, ob._static_inputs = {"tf"}, set()
+    ob._extractors, ob._rotation_format, ob._obs_input_names, ob._passthrough_obs = {}, {}, {}, {}
+    ob._build_extractors()
+    assert ob._rotation_format["q"] is None  # values used as recorded
+
+
+def test_inputs_the_policy_does_not_read_are_not_checked():
+    import threading
+    import time
+
+    from relay_d.dispatch.obs_builder import ObsBuilder
+
+    ob = ObsBuilder.__new__(ObsBuilder)  # skip ROS setup
+    ob._obs_input_names = {"q": {"js"}, "teleop_action": {"teleop"}}
+    ob._passthrough_obs = {"agentview_image": "cam", "wrist_image": "wrist_cam"}
+    ob._used_inputs, ob._lock = None, threading.Lock()
+    now = time.monotonic()
+    ob._arrival = {"js": now, "teleop": now - 60, "cam": now, "wrist_cam": now - 60}
+    assert set(ob.get_input_ages()) == {"js", "teleop", "cam", "wrist_cam"}  # before use_only: all
+    ob.use_only(["q", "agentview_image"])
+    assert set(ob.get_input_ages()) == {"js", "cam"}  # a dead teleop topic or unused camera no longer stops the robot
+
+
+def test_sync_threshold_zero_means_off_as_when_recording(tmp_path):
+    import rclpy
+    import yaml
+
+    from relay_d.dispatch.obs_builder import ObsBuilder
+
+    path = tmp_path / "obs_config.yaml"
+    path.write_text(yaml.safe_dump({"config": {"sync": {"threshold": 0}, "input": {}, "observations": {}}}))
+    rclpy.init()
+    try:
+        ob = ObsBuilder(str(path))
+        try:
+            assert ob._sync_threshold is None  # was 0.0: every 2-input observation was held forever
+        finally:
+            ob.destroy_node()
+    finally:
+        rclpy.shutdown()

@@ -30,17 +30,14 @@ from relay_d.utils.numerics import (
     inputs_in_sync,
     quat_to_euler,
     read_scalar,
+    select_joints,
     stamp_to_sec,
+    stream_entry,
     strip_trig,
 )
 from relay_d.utils.qos import subscription_qos
 from relay_d.utils.ros_media_codec import decode_image, decode_organized_pointcloud
 from relay_d.utils.tf_topic import _TfTopicListener, get_or_create_tf_buffer
-
-
-def _get_specs(stream_def) -> List[str]:
-    """Return the spec list from either a plain list or a dict stream definition."""
-    return stream_def if isinstance(stream_def, list) else stream_def.get("specs", [])
 
 
 # ---------------------------------------------------------------------------
@@ -65,21 +62,11 @@ _BINOP_RE = re.compile(r"^(.+?)\s+([+\-*/])\s+(.+)$")
 # ---------------------------------------------------------------------------
 
 class _JointStateView:
-    """
-    Wraps a JointState message and presents filtered, ordered arrays based on
-    a configured joint_names list.  attrgetter("position")(view) yields the
-    filtered/ordered list instead of the full robot joint array.
-    """
+    """A JointState reduced to the configured joint_names, so attrgetter("position")(view) yields
+    only those joints. Same order and zero-fill as the recorder (numerics.select_joints)."""
 
     def __init__(self, msg, joint_names: List[str]):
-        all_names = list(msg.name)
-        indices = [all_names.index(n) for n in joint_names]  # caller checks that every joint is there
-        n = len(all_names)
-        self.name     = list(joint_names)
-        # An array not filled for every joint (some drivers send no velocity) is left empty, never misread.
-        self.position = [float(msg.position[i]) for i in indices] if len(msg.position) == n else []
-        self.velocity = [float(msg.velocity[i]) for i in indices] if len(msg.velocity) == n else []
-        self.effort   = [float(msg.effort[i])   for i in indices] if len(msg.effort)   == n else []
+        self.name, self.position, self.velocity, self.effort = select_joints(msg, set(joint_names))
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +109,7 @@ class ObsBuilder(Node):
         self._obs_cfg:   Dict[str, List[str]] = cfg.get("observations", {})
 
         sync_cfg = cfg.get("sync", {}) or {}
-        self._sync_threshold: Optional[float] = sync_cfg.get("threshold")
+        self._sync_threshold: Optional[float] = sync_cfg.get("threshold") or None  # missing or 0 = off, as when recording
 
         self._lock = threading.Lock()
         self._latest_inputs: Dict[str, Any]        = {}   # raw messages / enriched TF
@@ -151,6 +138,7 @@ class ObsBuilder(Node):
         self._rotation_format: Dict[str, Optional[str]]         = {}
         self._obs_input_names: Dict[str, set]                   = {}
         self._passthrough_obs: Dict[str, str]                   = {}  # obs_name -> input_name
+        self._used_inputs: Optional[set] = None  # None = all; set by use_only()
         self._build_extractors()
         # Inputs whose live messages must be decoded (Image/organized
         # PointCloud2) into a plain array instead of stored as a raw ROS
@@ -241,15 +229,17 @@ class ObsBuilder(Node):
                 rot_fmt = stream_def.get("rotation_format")
                 if rot_fmt is not None:
                     rot_fmt = str(rot_fmt).strip().lower()
-                    if rot_fmt != "rpy":
+                    if rot_fmt == "quat":  # the default when recording: the values are used as they are
+                        rot_fmt = None
+                    elif rot_fmt != "rpy":
                         raise ValueError(
                             f"obs '{obs_name}': unsupported rotation_format "
-                            f"'{stream_def['rotation_format']}' — only 'rpy' "
+                            f"'{stream_def['rotation_format']}' — only 'quat' or 'rpy' "
                             f"(quaternion x,y,z,w -> roll,pitch,yaw) is supported."
                         )
             self._rotation_format[obs_name] = rot_fmt
 
-            specs = _get_specs(stream_def)
+            specs = stream_entry(stream_def)[0]
             entries: List[_Entry] = []
             for raw_spec in specs:
                 spec = raw_spec.strip()
@@ -653,11 +643,24 @@ class ObsBuilder(Node):
         with self._lock:
             return {k: v.copy() for k, v in self._latest.items()}
 
+    def use_only(self, obs_keys) -> None:
+        """Limit validate_inputs() and get_input_ages() to the inputs behind these observations (the policy's):
+        obs_config lists every recorded stream, and an unused one that is not published must not stop the robot."""
+        used = set()
+        for k in obs_keys:
+            used |= self._obs_input_names.get(k, set())
+            if k in self._passthrough_obs:
+                used.add(self._passthrough_obs[k])
+        self._used_inputs = used
+
+    def _is_used(self, input_name: str) -> bool:
+        return self._used_inputs is None or input_name in self._used_inputs
+
     def get_input_ages(self) -> Dict[str, float]:
-        """Seconds since each live input (topic or TF) last received new data."""
+        """Seconds since each live input (topic or TF) the policy uses last received new data."""
         now = time.monotonic()
         with self._lock:
-            return {k: now - t for k, t in self._arrival.items()}
+            return {k: now - t for k, t in self._arrival.items() if self._is_used(k)}
 
     def get_obs_ages(self) -> Dict[str, float]:
         """Seconds since each observation was last rewritten. Unlike get_input_ages(), this
@@ -667,7 +670,7 @@ class ObsBuilder(Node):
             return {k: now - t for k, t in self._obs_refreshed.items()}
 
     def validate_inputs(self, timeout: float = 10.0) -> Tuple[bool, dict]:
-        """Check that every configured input source is reachable.
+        """Check that every configured input source (the policy's, after use_only()) is reachable.
 
         Polls the ROS graph for topic inputs and calls lookup_transform for TF
         inputs, retrying until timeout. Must be called after the executor is
@@ -683,12 +686,12 @@ class ObsBuilder(Node):
         topic_inputs = {
             name: self._input_cfg[name]["topic"]
             for name in self._input_cfg
-            if name not in self._tf_inputs
+            if name not in self._tf_inputs and self._is_used(name)
         }
         pending_topics = set(topic_inputs)
 
         # TF inputs — probe via lookup_transform with retries
-        pending_tf = set(self._tf_inputs)
+        pending_tf = {n for n in self._tf_inputs if self._is_used(n)}
 
         while (pending_topics or pending_tf) and time.monotonic() < deadline:
             if pending_topics:

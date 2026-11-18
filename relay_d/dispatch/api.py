@@ -152,6 +152,7 @@ class InferenceSession:
                 fallback_state_keys=self.obs_node.low_dim_obs_names, task=task,
             )
 
+        self.obs_node.use_only(self.model.obs_keys)  # stale and pre-flight checks: only what the policy reads
         self.dispatcher = ActionDispatcher(self.obs_node, action_config, dry_run=dry_run)
         self._check_action_layout()
         self._was_stale = False  # after stale inputs the policy restarts: no queued actions or frames from before the gap

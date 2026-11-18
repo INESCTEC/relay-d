@@ -137,3 +137,17 @@ def test_a_new_demo_never_overwrites_an_existing_file(recorder_cls, tmp_path):
         rec._create_h5_file("demo_0")  # e.g. the counter restarted in a reused session folder
     rec._create_h5_file("demo_0", mode="w")  # retry_save rewrites its own partial file
     rec.h5_file.close()
+
+
+def test_a_failed_save_is_set_aside_and_removed_once_a_retry_saves_it(recorder_cls, tmp_path):
+    ragged = {"type": "pose", "position": [0.0, 0.0, 0.0], "orientation": [0.0]}
+    rec = make_recorder(recorder_cls, tmp_path, [1, 2], {"pose": [ragged, {**ragged, "orientation": [0.0, 1.0]}]})
+    rec.h5_file_path = str(tmp_path / "demo.h5")
+    rec.is_recording, rec.recording_metadata["start_time"] = True, 0.0
+    assert rec.stop_recording() is False
+    assert not (tmp_path / "demo.h5").exists()  # a .h5 would be listed as a demo by Review and the converters
+    assert (tmp_path / "demo.h5.partial").exists()
+    rec.recorded_data["pose"] = [ragged, ragged]  # the retry can save it now
+    rec.output_directory = str(tmp_path)
+    assert rec.retry_save() is True
+    assert not (tmp_path / "demo.h5.partial").exists() and os.path.exists(rec.retried_file)

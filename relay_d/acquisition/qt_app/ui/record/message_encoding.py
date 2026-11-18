@@ -8,6 +8,7 @@ from sensor_msgs.msg import Image, CompressedImage, PointCloud2, JointState
 from geometry_msgs.msg import PoseStamped, Twist, TransformStamped
 from std_msgs.msg import String, Float32, Float64, Int32, Bool
 
+from relay_d.utils.numerics import stamp_to_ns
 from relay_d.utils.ros_media_codec import decode_image, decode_organized_pointcloud
 
 
@@ -42,8 +43,7 @@ def _encode_image(img_msg, modality):
             "format": img_msg.format,
             "data": np.frombuffer(img_msg.data, np.uint8),
             "header": {
-                "stamp": img_msg.header.stamp.sec * 1000000000
-                + img_msg.header.stamp.nanosec,
+                "stamp": stamp_to_ns(img_msg.header.stamp),
                 "frame_id": img_msg.header.frame_id,
             },
         }
@@ -59,8 +59,7 @@ def _encode_image(img_msg, modality):
             "height": img_msg.height,
             "data": cv_image,
             "header": {
-                "stamp": img_msg.header.stamp.sec * 1000000000
-                + img_msg.header.stamp.nanosec,
+                "stamp": stamp_to_ns(img_msg.header.stamp),
                 "frame_id": img_msg.header.frame_id,
             },
         }
@@ -86,8 +85,7 @@ def _encode_pointcloud(pc_msg, modality):
         "fields": field_names,
         "points": points,
         "header": {
-            "stamp": pc_msg.header.stamp.sec * 1000000000
-            + pc_msg.header.stamp.nanosec,
+            "stamp": stamp_to_ns(pc_msg.header.stamp),
             "frame_id": pc_msg.header.frame_id,
         },
     }
@@ -110,8 +108,7 @@ def _encode_joint_state(joint_msg):
         "velocities": velocities,
         "efforts": efforts,
         "header": {
-            "stamp": joint_msg.header.stamp.sec * 1000000000
-            + joint_msg.header.stamp.nanosec,
+            "stamp": stamp_to_ns(joint_msg.header.stamp),
             "frame_id": joint_msg.header.frame_id,
         },
     }
@@ -132,8 +129,7 @@ def _encode_pose(pose_msg):
             pose_msg.pose.orientation.w,
         ],
         "header": {
-            "stamp": pose_msg.header.stamp.sec * 1000000000
-            + pose_msg.header.stamp.nanosec,
+            "stamp": stamp_to_ns(pose_msg.header.stamp),
             "frame_id": pose_msg.header.frame_id,
         },
     }
@@ -168,8 +164,7 @@ def _encode_transform_stamped(transform_msg):
             transform_msg.transform.rotation.w,
         ],
         "header": {
-            "stamp": transform_msg.header.stamp.sec * 1000000000
-            + transform_msg.header.stamp.nanosec,
+            "stamp": stamp_to_ns(transform_msg.header.stamp),
             "frame_id": transform_msg.header.frame_id,
         },
     }

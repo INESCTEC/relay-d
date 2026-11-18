@@ -242,18 +242,13 @@ def test_run_falls_back_to_background_when_every_terminal_fails(folder, tmp_path
     assert wait_until(lambda: runs.read_run(run_dir).status == runs.FINISHED)
 
 
-def test_the_config_files_of_the_selected_dataset_are_used(tmp_path):
-    """relay-d-convert writes <output>_acquisition_config.yaml, so one folder can hold several datasets."""
-    for name in ("a", "b"):
-        _robomimic_file(tmp_path / f"{name}.h5")
-        (tmp_path / f"{name}_acquisition_config.yaml").write_text("config: {}\n")
-    by_name = {d.path.stem: d for d in launcher.find_datasets(tmp_path)}
-    assert launcher._config_file(by_name["b"], "acquisition_config.yaml").name == "b_acquisition_config.yaml"
-    assert launcher._config_file(by_name["a"], "acquisition_config.yaml").name == "a_acquisition_config.yaml"
+def test_the_config_file_next_to_the_dataset_is_used(tmp_path):
+    _robomimic_file(tmp_path / "a.h5")
+    ds = launcher.find_datasets(tmp_path)[0]
+    (tmp_path / "other_acquisition_config.yaml").write_text("config: {}\n")  # not this dataset's
+    assert launcher._config_file(ds, "acquisition_config.yaml") is None
     (tmp_path / "acquisition_config.yaml").write_text("config: {}\n")
-    _robomimic_file(tmp_path / "c.h5")
-    c = next(d for d in launcher.find_datasets(tmp_path) if d.path.stem == "c")
-    assert launcher._config_file(c, "acquisition_config.yaml").name == "acquisition_config.yaml"  # the plain one the GUI writes
+    assert launcher._config_file(ds, "acquisition_config.yaml").name == "acquisition_config.yaml"
 
 
 def test_robomimic_policy_is_chosen_on_the_train_tab_not_by_postprocess_options(folder):
@@ -306,3 +301,25 @@ def test_run_script_reports_a_failure_that_robomimic_swallows(tmp_path):
     assert run("echo all good") == "0"
     assert run("echo run failed with error: x") == "1"
     assert run("exit 3") == "3"
+
+
+def test_robomimic_validation_split_smaller_than_a_batch_turns_validation_off(tmp_path):
+    _robomimic_file(tmp_path / "d.h5", frames=150)  # 150 train frames (demo_0), 150 valid (demo_1)
+    ds = launcher.find_datasets(tmp_path)[0]
+    launcher.build_command(TrainJob(ds, "py", "bc_rnn_gmm", {"batch_size": 100}), tmp_path / "ok")
+    assert json.loads((tmp_path / "ok" / "robomimic_config.json").read_text())["experiment"]["validate"] is True
+    ds.summary.update(train_frames=400, valid_frames=100)  # e.g. 5 demos x 100 frames, val_frac 0.2
+    launcher.build_command(TrainJob(ds, "py", "bc_rnn_gmm", {"batch_size": 256}), tmp_path / "run")
+    cfg = json.loads((tmp_path / "run" / "robomimic_config.json").read_text())
+    assert cfg["experiment"]["validate"] is False  # was: StopIteration after epoch 1
+    assert cfg["train"]["hdf5_validation_filter_key"] is None
+    assert launcher.find_datasets(tmp_path)[0].summary["valid_frames"] == 150  # counted from mask/valid
+
+
+@pytest.mark.parametrize("policy", launcher.ROBOMIMIC_POLICIES)
+def test_robomimic_does_not_normalize_each_pixel(folder, policy):
+    """robomimic's obs normalization is per element: each pixel divided by its own std (floor 0.001), so a near-constant
+    background turns a 0.02 brightness change into ~20 std. robomimic's own templates leave it off."""
+    run_dir = folder / "training_runs" / policy
+    launcher.build_command(TrainJob(_robomimic(folder), "py", policy), run_dir)
+    assert json.loads((run_dir / "robomimic_config.json").read_text())["train"]["hdf5_normalize_obs"] is False

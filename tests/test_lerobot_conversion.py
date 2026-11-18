@@ -9,9 +9,6 @@ import pytest
 
 pytest.importorskip("av")
 
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import (  # noqa: E402
-    PostprocessConfigLoader,
-)
 from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import (  # noqa: E402
     YAMLDrivenConverter,
 )
@@ -21,7 +18,7 @@ from helpers import DATA_CONFIG, FPS, LENGTHS, write_recording  # noqa: E402
 
 @pytest.fixture
 def converter():
-    return YAMLDrivenConverter(PostprocessConfigLoader(), data_config=json.loads(json.dumps(DATA_CONFIG)))
+    return YAMLDrivenConverter(data_config=json.loads(json.dumps(DATA_CONFIG)))
 
 
 def test_convert_to_lerobot(tmp_path, converter):
@@ -203,7 +200,7 @@ def test_one_broken_file_is_skipped_not_the_whole_dataset_deleted(tmp_path, conv
 def test_missing_action_stream_fails_the_demo_instead_of_narrowing_the_action(tmp_path):
     cfg = json.loads(json.dumps(DATA_CONFIG))
     cfg["actions_to_extract"] = ["robot_joint_pos", "gripper"]  # gripper never recorded
-    converter = YAMLDrivenConverter(PostprocessConfigLoader(), data_config=cfg)
+    converter = YAMLDrivenConverter(data_config=cfg)
     rec = tmp_path / "recording_0.h5"
     write_recording(rec, LENGTHS)
     assert not converter.convert_multiple_files("lerobot", [str(rec)], str(tmp_path / "out"))  # was 4-wide actions

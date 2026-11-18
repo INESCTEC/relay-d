@@ -199,7 +199,11 @@ class RecordPage:
         return self.recording.last_validation_result
 
     def restart_failed_subscribers(self):
-        """Restart subscribers that failed to create or stopped working"""
+        """Restart subscribers that failed to create or stopped working. Refused while recording: an input
+        subscribed mid-demo would be saved shorter than the timestamps, shifted in time."""
+        if self.recording.is_recording:
+            logger.warning("Restart Subscribers ignored: a recording is in progress. Stop it first.")
+            return 0
         return self.container_manager.restart_failed_subscribers()
 
     def force_ui_refresh(self):

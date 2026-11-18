@@ -12,7 +12,6 @@ from ..qt_app.ui.config.builder.config_check import check_config
 from ..qt_app.utils.stream_builder import StreamBuilder
 from relay_d.utils.tf_topic import TfTopicSubscriptionError
 from ..qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
-from ..qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
 from ..qt_app.ui.postprocess.offline_config import load_conversion_config, write_dataset_files
 from ..qt_app.ui.postprocess.postprocess_options import dataset_output_paths
 from ..qt_app.ui.review.demo_validator import CheckStatus, DemoValidator
@@ -124,7 +123,7 @@ class AppAPI:
 
     def delete_demo(self, file_path: str) -> bool:
         """Delete a recorded demo and drop it from this session, like the GUI's Review > Delete / Reject Demo."""
-        if not delete_demo_file(file_path):
+        if not delete_demo_file(file_path, self._data_recorder):
             return False
         self._session_h5_files = [p for p in self._session_h5_files if p != file_path]
         return True
@@ -132,7 +131,7 @@ class AppAPI:
     def _load_conversion_config(self, config_path: Optional[str], options_path: Optional[str]) -> None:
         """The converter, with the config and format options of relay-d-convert (options: ``options_path``, else a
         postprocess_config.yaml next to the config, else the defaults). Raises ValueError if a file is unusable."""
-        self._yaml_converter = YAMLDrivenConverter(PostprocessConfigLoader())
+        self._yaml_converter = YAMLDrivenConverter()
         self._conversion_parser = None
         if config_path:
             self._conversion_parser, self._yaml_converter.options = load_conversion_config(config_path, options_path)

@@ -12,7 +12,6 @@ pytest.importorskip("av")
 
 from relay_d.acquisition.convert_cli import main as cli_main  # noqa: E402
 from relay_d.acquisition.qt_app.ui.postprocess import offline_config  # noqa: E402
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader  # noqa: E402
 from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter  # noqa: E402
 from helpers import DATA_CONFIG, LENGTHS, write_recording  # noqa: E402
 
@@ -173,7 +172,7 @@ def test_gui_refuses_to_convert_with_a_broken_options_file_next_to_the_config(wo
 def _converter():
     import json
 
-    return YAMLDrivenConverter(PostprocessConfigLoader(), data_config=json.loads(json.dumps(DATA_CONFIG)))
+    return YAMLDrivenConverter(data_config=json.loads(json.dumps(DATA_CONFIG)))
 
 
 def test_converted_robomimic_files_in_the_inputs_are_skipped(tmp_path):
@@ -196,3 +195,65 @@ def test_same_named_files_of_several_sessions_sort_by_folder(tmp_path):
     assert _converter().convert_multiple_files("robomimic", [str(tmp_path / "s2/rec.h5"), str(tmp_path / "s1/rec.h5")], str(out))
     with h5py.File(out, "r") as f:
         assert f["data/demo_0/actions"].shape[0] == 5
+
+
+def test_an_existing_robomimic_dataset_is_never_overwritten(tmp_path):
+    rec = tmp_path / "rec.h5"
+    write_recording(rec, LENGTHS)
+    out = tmp_path / "out.h5"
+    conv = _converter()
+    assert conv.convert_multiple_files("robomimic", [str(rec)], str(out))
+    before = out.read_bytes()
+    assert not conv.convert_multiple_files("robomimic", [str(rec)], str(out))  # e.g. two API calls in one second
+    assert out.read_bytes() == before and "already exists" in conv.last_error
+
+
+def test_gui_converts_in_the_background_with_convert_disabled(workspace, page, monkeypatch):
+    from relay_d.acquisition.qt_app.ui.postprocess import postprocess_page as pp
+
+    tmp, cfg, rec_dir = workspace
+    page.load_postprocess_config_from_path(str(cfg))
+    page.output_format, page.h5_files = "robomimic", [str(rec_dir / "stack_cubes_1.h5")]
+    page.settings_page = SimpleNamespace(get_hdf5_save_folder=lambda: str(tmp / "out"))
+    infos, enabled_while_running = [], []
+    monkeypatch.setattr(pp.CustomMessageBox, "info", lambda msg, *a, **k: infos.append(msg))
+
+    def run_now(parent, work, on_done, busy):
+        busy(+1)
+        enabled_while_running.append(page.btn_convert.isEnabled())
+        page.convert_dataset()  # a second click while it runs: ignored
+        value = work()
+        busy(-1)
+        on_done(value, None)
+
+    monkeypatch.setattr(pp, "run_in_background", run_now)
+    page.convert_dataset()
+    assert enabled_while_running == [False]
+    assert len(infos) == 1 and "Converted" in infos[0]
+    assert len(list((tmp / "out").rglob("*.h5"))) == 1
+
+
+def test_camera_frames_are_copied_exactly_across_slices(tmp_path):
+    """Images are copied 64 frames at a time (a long camera demo would not fit in RAM whole)."""
+    rec, out = tmp_path / "rec.h5", tmp_path / "out.h5"
+    write_recording(rec, [130])
+    assert _converter().convert_multiple_files("robomimic", [str(rec)], str(out))
+    with h5py.File(rec, "r") as src, h5py.File(out, "r") as dst:
+        assert (dst["data/demo_0/obs/agentview_image"][:] == src["data/demo_0/camera_rgb/images"][:]).all()
+
+
+def test_robomimic_copies_a_camera_without_reading_it_whole(tmp_path, monkeypatch):
+    rec, out = tmp_path / "rec.h5", tmp_path / "out.h5"
+    write_recording(rec, [200])
+    reads = []
+    real = h5py.Dataset.__getitem__
+
+    def counting(self, idx):
+        value = real(self, idx)
+        if self.name.endswith("camera_rgb/images") and getattr(value, "ndim", 0) == 4:
+            reads.append(len(value))
+        return value
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", counting)
+    assert _converter().convert_multiple_files("robomimic", [str(rec)], str(out))
+    assert reads and max(reads) <= 64  # was np.array() of all 200 frames
