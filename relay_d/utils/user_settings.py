@@ -58,7 +58,7 @@ SETTINGS: Tuple[Setting, ...] = (
        "How often the GUI processes ROS messages for its own pages (recorded topics have their own thread). Lower is more responsive and uses more CPU.",
        minimum=1, maximum=100),
     _s("ros_domain_id", "General", "ROS domain id (-1 = environment)", "int", -1,
-       "Sets ROS_DOMAIN_ID for this app. Ignored if the variable is already set, or -1.",
+       "Sets ROS_DOMAIN_ID for the app, AppAPI and lfd-inference-node. Ignored if the variable is already set, or -1.",
        minimum=-1, maximum=232, applies=RESTART),
     # ---- Recording
     _s("rec_default_max_buffer_mb", "Recording", "Default memory buffer (MB)", "int", 4096,
@@ -251,3 +251,11 @@ def h5_compression() -> Dict[str, Any]:
     if kind == "lzf":
         return {"compression": "lzf"}
     return {}
+
+
+def apply_ros_domain(environ=os.environ) -> None:
+    """Set ROS_DOMAIN_ID from the ``ros_domain_id`` setting, before rclpy.init(): the GUI, AppAPI and the inference
+    node all do, so they share one domain. An environment that already has the variable wins; -1 leaves it alone."""
+    domain = int(get("ros_domain_id", -1))
+    if domain >= 0 and "ROS_DOMAIN_ID" not in environ:
+        environ["ROS_DOMAIN_ID"] = str(domain)

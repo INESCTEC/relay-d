@@ -15,7 +15,7 @@ from PyQt5.QtCore import QTimer, QFileSystemWatcher
 from relay_d.utils import user_settings
 from .ctrl_c import close_on_ctrl_c
 from .first_run import ask_save_folder
-from .settings_apply import live_changes, needs_config, ros_domain_to_set, startup_page
+from .settings_apply import live_changes, needs_config, startup_page
 from .ui.settings.config_manager import config
 from .utils.custom_message_box import CustomMessageBox
 
@@ -363,9 +363,7 @@ class UI(QMainWindow):
 
 
 def main(args=None):
-    domain = ros_domain_to_set(user_settings.values(), os.environ)  # the environment, if set, wins
-    if domain is not None:
-        os.environ["ROS_DOMAIN_ID"] = domain
+    user_settings.apply_ros_domain()  # the environment, if set, wins
     try:  # ROS must not take Ctrl+C for itself: the window closes on it instead (see ctrl_c.py)
         from rclpy.signals import SignalHandlerOptions
 

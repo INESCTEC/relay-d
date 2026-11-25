@@ -139,6 +139,7 @@ class InferenceSession:
             raise ValueError(f"unknown backend '{backend}' (choose from {BACKENDS} or 'auto')")
         self._rclpy_initialized = not rclpy.ok()  # shut down in close() only if this session started it
         if self._rclpy_initialized:
+            user_settings.apply_ros_domain()  # same domain as the GUI and AppAPI
             rclpy.init()
 
         self.obs_node = ObsBuilder(obs_config)

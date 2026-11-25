@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from helpers import wait_until
-from relay_d.training import runs
-from relay_d.training.train_cli import EXIT_OK, EXIT_USAGE, main
+from relay_d.training import launcher, runs
+from relay_d.training.train_cli import EXIT_FAILED, EXIT_OK, EXIT_USAGE, main
 
 
 @pytest.fixture
@@ -43,7 +43,8 @@ def test_usage_errors(folder, capsys, args, message):
     assert message in capsys.readouterr().err
 
 
-def test_start_list_and_stop_headless(folder, tmp_path, capsys):
+def test_start_list_and_stop_headless(folder, tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(launcher, "check_environment", lambda python, fmt: {"ok": True, "error": None})
     py = tmp_path / "fakepython"
     py.write_text("#!/bin/sh\nsleep 60\n")
     py.chmod(py.stat().st_mode | stat.S_IEXEC)
@@ -56,3 +57,10 @@ def test_start_list_and_stop_headless(folder, tmp_path, capsys):
     assert main(["--folder", str(folder), "--stop", run.path.name]) == EXIT_OK
     assert runs.read_run(run.path).status == runs.STOPPED
     assert main(["--folder", str(folder), "--stop", "nope"]) == EXIT_USAGE
+
+
+def test_a_python_without_the_package_is_refused_before_starting(folder, capsys, monkeypatch):
+    monkeypatch.setattr(launcher, "check_environment", lambda python, fmt: {"ok": False, "error": "'robomimic' is not installed"})
+    assert main(["--folder", str(folder), "--no-terminal"]) == EXIT_FAILED  # the Train tab refuses too
+    assert "not installed" in capsys.readouterr().err
+    assert not (folder / "training_runs").exists()

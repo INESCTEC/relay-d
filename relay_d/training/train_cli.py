@@ -105,6 +105,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.dry_run:
             print(" ".join(launcher.build_command(job, launcher.new_run_dir(dataset.base, dataset.format), write=False)))
             return EXIT_OK
+        env = launcher.check_environment(python, dataset.format)  # as the Train tab does before Start
+        if not env["ok"]:
+            return _fail(f"cannot start training: {env['error']}", EXIT_FAILED)
         run_dir = launcher.start(job, terminal=user_settings.get("train_use_terminal") and not args.no_terminal)
     except launcher.TrainingError as e:
         return _fail(str(e), EXIT_USAGE)

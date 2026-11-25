@@ -97,6 +97,7 @@ def _recording_api(inputs=({"name": "cam", "topic": "/cam"},), subscribers=None,
         yaml_data={"config": {}}, get_streams=dict, clear=lambda: None,
     )
     api.start_spinning = lambda: None
+    api._options_path, api._conversion_for = None, lambda config, options: ("converter", config)  # no files read
     names = []
     api._data_recorder = SimpleNamespace(
         start_recording=lambda subs, name=None: names.append(name) or True, retried_file=None, names=names,
@@ -182,3 +183,65 @@ def test_the_demo_being_recorded_cannot_be_deleted(tmp_path):
     assert api.delete_demo(str(live)) is False and live.exists()  # Stop would report it saved
     api._data_recorder.h5_file = None  # saved and closed
     assert api.delete_demo(str(live)) and not live.exists()
+
+
+# --- the GUI's behaviour, kept by the API
+
+
+def test_start_during_a_recording_is_refused_before_touching_the_subscribers():
+    api = _recording_api()
+    assert api.initialize("cfg.yaml")
+    api._data_recorder.is_recording = True
+    assert api.start_recording() is False
+    assert api._topic_subscribers.subscribed == []  # the running demo keeps its subscriptions (the GUI's Start is disabled)
+
+
+def test_a_config_load_during_a_recording_is_refused():
+    api = _recording_api()
+    assert api.initialize("a.yaml")
+    api._data_recorder.is_recording = True
+    assert api.initialize("b.yaml") is False
+    assert api._conversion_parser == "a.yaml"  # the recording and its conversion keep their config
+
+
+def test_initialize_switches_the_conversion_config_too():
+    api = _recording_api()
+    assert api.initialize("a.yaml") and api.initialize("b.yaml")
+    assert api._conversion_parser == "b.yaml"  # was the config given to AppAPI(...)
+
+
+def test_a_config_that_cannot_convert_keeps_the_previous_one():
+    api = _recording_api()
+    assert api.initialize("a.yaml")
+
+    def bad(config, options):
+        raise ValueError("bad options")
+
+    api._conversion_for = bad
+    assert api.initialize("b.yaml") is False
+    assert api._conversion_parser == "a.yaml"
+
+
+def test_delete_demo_with_a_relative_path_drops_it_from_the_session(tmp_path, monkeypatch):
+    api = _recording_api()
+    demo = tmp_path / "stack_1.h5"
+    demo.write_bytes(b"x")
+    api._session_h5_files = [str(demo)]
+    monkeypatch.chdir(tmp_path)
+    assert api.delete_demo("stack_1.h5")
+    assert api._session_h5_files == []  # was kept, and the conversion then failed on a missing file
+
+
+def test_a_rejected_config_raises_and_releases_ros(monkeypatch):
+    import relay_d.acquisition.api.api as mod
+
+    calls = []
+    monkeypatch.setattr(mod.rclpy, "init", lambda: calls.append("init"))
+    monkeypatch.setattr(mod.rclpy, "shutdown", lambda: calls.append("shutdown"))
+    monkeypatch.setattr(mod, "TopicSubscribers", lambda: SimpleNamespace(close=lambda: calls.append("close")))
+    monkeypatch.setattr(mod, "DataRecorder", lambda parser: SimpleNamespace())
+    monkeypatch.setattr(mod.AppAPI, "_load_conversion_config", lambda self, c, o: None)
+    monkeypatch.setattr(mod.AppAPI, "initialize", lambda self, c: False)
+    with pytest.raises(ValueError, match="Config rejected"):
+        mod.AppAPI("cfg.yaml")  # the GUI shows an error dialog; this returned a half-made object
+    assert calls == ["init", "close", "shutdown"]
