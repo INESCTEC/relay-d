@@ -6,6 +6,7 @@ import os
 import datetime
 import math
 
+from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils.numerics import stamp_to_sec
 from ..settings.config_manager import config
@@ -33,7 +34,7 @@ class ContainerVisualizer:
         self.temp_video_files = {}  # container_id -> temp file path
 
         # Visualization update rate (Hz)
-        self.update_rate = config.get("visualizer_update_rate", 20) or 20
+        self.update_rate = user_settings.get("visualizer_update_rate", 20) or 20
 
         self.framerate_window = {}  # container_id -> list of arrival times (for rolling FPS)
 

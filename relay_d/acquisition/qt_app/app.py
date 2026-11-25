@@ -19,15 +19,7 @@ from .settings_apply import live_changes, needs_config, ros_domain_to_set, start
 from .ui.settings.config_manager import config
 from .utils.custom_message_box import CustomMessageBox
 
-try:
-    from relay_d.utils.coloring_logger import logger, apply_user_level
-except ImportError:
-    # Fallback to standard logging if relay_d isn't installed/importable
-    import logging
-    logger = logging.getLogger(__name__)
-
-    def apply_user_level():
-        pass
+from relay_d.utils.coloring_logger import logger, apply_user_level
 
 try:
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -137,9 +129,7 @@ class UI(QMainWindow):
                     settings_page=settings,
                 )
             if TrainPage is not None:
-                self.page_train_ui = TrainPage(
-                    self, settings_page=getattr(self, "page_settings_ui", None)
-                )
+                self.page_train_ui = TrainPage(self)
             if RunPage is not None:
                 self.page_run_ui = RunPage(self)
             if hasattr(self, "page_record") and hasattr(self, "page_config"):
@@ -399,9 +389,6 @@ def main(args=None):
         rclpy.shutdown()
     except Exception:
         pass
-
-    window.raise_()
-    window.activateWindow()
 
     sys.exit(exit_code)
 

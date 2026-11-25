@@ -73,7 +73,7 @@ def test_joint_view_reads_joints_like_the_recorder():
     assert v.velocity == [0.0] * 3 and v.effort == [0.0] * 3  # a 1-value velocity for 3 joints is not read
 
     sb = StreamBuilder.__new__(StreamBuilder)
-    sb._joint_name_filters, sb._joint_filter_warned = {"js": frozenset(["j1", "j2", "j3"])}, {}
+    sb._joint_name_filters, sb._joint_filter_warned, sb._joint_last_full = {"js": frozenset(["j1", "j2", "j3"])}, {}, {}
     rec = sb.apply_joint_filter("js", msg)
     assert (rec.name, rec.position, rec.velocity, rec.effort) == (v.name, v.position, v.velocity, v.effort)
 
@@ -85,7 +85,7 @@ def test_message_missing_a_joint_keeps_the_last_good_value():
 
     b = ObsBuilder.__new__(ObsBuilder)  # skip ROS setup
     b._passthrough_sources, b._joint_filters = set(), {"js": ["j1", "j2"]}
-    b._joint_mismatch_warned, b._lock = set(), threading.Lock()
+    b._joint_mismatch_warned, b._lock, b._used_inputs = set(), threading.Lock(), None
     b._latest_inputs, b._input_timestamps, b._arrival = {}, {}, {}
     b.get_logger = lambda: SimpleNamespace(warn=lambda m: None)
     stamp = SimpleNamespace(sec=1, nanosec=0)
@@ -309,14 +309,26 @@ def test_inputs_the_policy_does_not_read_are_not_checked():
     from relay_d.dispatch.obs_builder import ObsBuilder
 
     ob = ObsBuilder.__new__(ObsBuilder)  # skip ROS setup
-    ob._obs_input_names = {"q": {"js"}, "teleop_action": {"teleop"}}
+    ob._obs_input_names = {"q": {"js"}, "teleop_action": {"teleop"}, "ee": {"tf"}}
     ob._passthrough_obs = {"agentview_image": "cam", "wrist_image": "wrist_cam"}
+    ob._passthrough_sources, ob._tf_inputs = {"cam", "wrist_cam"}, {"tf"}
+    ob._extractors = {"q": [], "teleop_action": [], "ee": []}
+    ob._pending_topics = [("teleop", "/teleop"), ("js", "/js")]
     ob._used_inputs, ob._lock = None, threading.Lock()
     now = time.monotonic()
     ob._arrival = {"js": now, "teleop": now - 60, "cam": now, "wrist_cam": now - 60}
     assert set(ob.get_input_ages()) == {"js", "teleop", "cam", "wrist_cam"}  # before use_only: all
+    names = ob.low_dim_obs_names  # read before use_only, as InferenceSession does
     ob.use_only(["q", "agentview_image"])
+    assert names == ["q", "teleop_action", "ee"]
     assert set(ob.get_input_ages()) == {"js", "cam"}  # a dead teleop topic or unused camera no longer stops the robot
+    # nor is it decoded, evaluated, looked up or subscribed to every tick
+    assert list(ob._extractors) == ["q"] and ob._passthrough_obs == {"agentview_image": "cam"}
+    assert ob._passthrough_sources == {"cam"} and ob._tf_inputs == set() and ob._pending_topics == [("js", "/js")]
+    decoded = []
+    ob._decode_passthrough = lambda name, msg: decoded.append(name)
+    ob._topic_callback(SimpleNamespace(), "wrist_cam")  # subscribed before use_only
+    assert decoded == [] and ob._arrival["wrist_cam"] == now - 60
 
 
 def test_sync_threshold_zero_means_off_as_when_recording(tmp_path):
@@ -349,7 +361,7 @@ def test_only_robot_clock_stamps_take_part_in_the_live_sync_check():
     from relay_d.dispatch.obs_builder import ObsBuilder
 
     ob = ObsBuilder.__new__(ObsBuilder)  # skip ROS setup
-    ob._lock, ob._passthrough_sources, ob._joint_filters = threading.Lock(), set(), {}
+    ob._lock, ob._passthrough_sources, ob._joint_filters, ob._used_inputs = threading.Lock(), set(), {}, None
     ob._latest_inputs, ob._input_timestamps, ob._arrival = {}, {}, {}
     ob.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(to_msg=lambda: SimpleNamespace(sec=10**9, nanosec=0)))
     js = JointState()
@@ -386,3 +398,19 @@ def test_a_zero_quaternion_holds_the_last_rpy_value_instead_of_nan():
     feed(0.0, 0.0, 0.0, 1.0)
     feed(0.0, 0.0, 0.0, 0.0)  # e.g. an uninitialised pose
     assert np.isfinite(ob._latest["ee_rpy"]).all() and ob._latest["ee_rpy"].tolist() == [0.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize("initialized", [True, False])
+def test_close_shuts_rclpy_down_only_if_the_session_started_it(monkeypatch, initialized):
+    import relay_d.dispatch.api as api
+
+    s = InferenceSession.__new__(InferenceSession)  # skip ROS setup
+    s.dispatcher = SimpleNamespace(send_stop=lambda: None)
+    s._executor = SimpleNamespace(shutdown=lambda: None)
+    s.obs_node = SimpleNamespace(destroy_node=lambda: None)
+    s._rclpy_initialized = initialized
+    shutdowns = []
+    monkeypatch.setattr(api.rclpy, "ok", lambda: True)
+    monkeypatch.setattr(api.rclpy, "shutdown", lambda: shutdowns.append(1))
+    s.close()
+    assert shutdowns == ([1] if initialized else [])  # an embedding app's rclpy context is left running

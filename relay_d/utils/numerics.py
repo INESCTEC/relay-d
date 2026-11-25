@@ -4,6 +4,8 @@ Both sides must apply the same rule, otherwise the policy sees different numbers
 than it was trained on. Keep them here, not in two copies.
 """
 
+import operator
+import re
 import types
 from typing import Optional
 
@@ -132,6 +134,101 @@ def read_scalar(getter, msg, math_op) -> float:
     """
     v = float(np.asarray(getter(msg)).reshape(-1)[0])
     return float(math_op(v)) if math_op is not None else v
+
+
+BIN_OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
+
+# "<spec> <op> <spec>": the spaces around the operator are required, which keeps it from matching dotted field paths
+BINOP_RE = re.compile(r"^(.+?)\s+([+\-*/])\s+(.+)$")
+
+
+def _parse_field(spec: str, math_op, tf_inputs, known_inputs):
+    """'<input>.<field_path>' or '<input>.<field_path>[:]' -> (input_name, attrgetter, is_slice, math_op)."""
+    if "." not in spec:
+        raise ValueError(f"'{spec}' is not a valid field spec: expected '<input_name>.<field_path>'")
+    input_name, raw_field = spec.split(".", 1)
+    if known_inputs is not None and input_name not in known_inputs:
+        raise ValueError(f"unknown input '{input_name}'")
+    is_slice = raw_field.endswith("[:]")
+    field_path = raw_field[:-3] if is_slice else raw_field
+    if any(c in field_path for c in "+-*/"):
+        raise ValueError(f"unexpected operator inside field path '{field_path}': arithmetic between two "
+                         f"specs needs spaces around the operator, e.g. 'a.x - b.x'")
+    if input_name in tf_inputs:
+        field_path = "transform." + field_path
+    return input_name, operator.attrgetter(field_path), is_slice, math_op
+
+
+def parse_spec(spec: str, tf_inputs, known_inputs=None):
+    """One stream / observation spec -> entry (input_name, payload, is_slice, math_op):
+
+      field     : (input_name,  attrgetter, is_slice, math_op | None)
+      zero:N    : ("__zero__",  N,          False,    None)
+      a <op> b  : ("__binop__", (l_input, l_getter, l_op, op_func, r_input, r_getter, r_op), False, outer_op | None)
+
+    The recorder and live inference both parse with this, so a stream has the width and values the obs will have.
+    Raises ValueError; `known_inputs` (optional) rejects an input name not in it.
+    """
+    math_op, spec = strip_trig(spec.strip())
+    if spec.startswith("zero:"):
+        try:
+            return ("__zero__", int(spec[5:]), False, None)
+        except ValueError:
+            raise ValueError("zero:N needs an integer N") from None
+    m = BINOP_RE.match(spec)
+    if m is None:
+        return _parse_field(spec, math_op, tf_inputs, known_inputs)
+    sides = []
+    for side in (m.group(1).strip(), m.group(3).strip()):
+        if BINOP_RE.match(side):
+            raise ValueError(f"only one arithmetic operation per spec is supported (chained: '{side}')")
+        side_op, side_spec = strip_trig(side)
+        inp, getter, is_slice, side_op = _parse_field(side_spec, side_op, tf_inputs, known_inputs)
+        if is_slice:
+            raise ValueError("slice specs ('[:]') cannot be arithmetic operands: arithmetic is scalar-only")
+        sides.append((inp, getter, side_op))
+    (l_inp, l_get, l_op), (r_inp, r_get, r_op) = sides
+    return ("__binop__", (l_inp, l_get, l_op, BIN_OPS[m.group(2)], r_inp, r_get, r_op), False, math_op)
+
+
+def entry_inputs(entries) -> set:
+    """The input names parsed entries read (both operands of an arithmetic one)."""
+    names = set()
+    for inp, payload, _, _ in entries:
+        if inp == "__binop__":
+            names.update((payload[0], payload[4]))
+        elif inp != "__zero__":
+            names.add(inp)
+    return names
+
+
+def evaluate_entries(entries, get) -> Optional[list]:
+    """The float row of parsed entries. ``get(input_name)`` is that input's latest message or None.
+
+    None if an input has no data; a field that cannot be read raises (the caller holds the last row).
+    """
+    row = []
+    for inp, payload, is_slice, math_op in entries:
+        if inp == "__zero__":
+            row.extend([0.0] * payload)
+        elif inp == "__binop__":
+            l_inp, l_get, l_op, op_func, r_inp, r_get, r_op = payload
+            l_msg, r_msg = get(l_inp), get(r_inp)
+            if l_msg is None or r_msg is None:
+                return None
+            v = float(op_func(read_scalar(l_get, l_msg, l_op), read_scalar(r_get, r_msg, r_op)))
+            row.append(float(math_op(v)) if math_op is not None else v)
+        else:
+            msg = get(inp)
+            if msg is None:
+                return None
+            if is_slice:
+                val = payload(msg)
+                vals = list(val) if hasattr(val, "__iter__") else [val]
+                row.extend(float(math_op(v)) if math_op is not None else float(v) for v in vals)
+            else:
+                row.append(read_scalar(payload, msg, math_op))
+    return row
 
 
 def median_rate(timestamps_ns) -> Optional[float]:

@@ -99,8 +99,9 @@ class AppAPI:
         except TfTopicSubscriptionError as e:
             logger.error(f"Recording NOT started: a configured TF topic could not be read: {e}")
             return False
-        if self._data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
-            self._session_h5_files.append(self._data_recorder.retried_file)
+        retried, self._data_recorder.retried_file = self._data_recorder.retried_file, None  # added once, not at every Start
+        if retried:  # an earlier demo saved only now: keep it in the session
+            self._session_h5_files.append(retried)
         return started
 
     def stop_recording(self) -> bool:

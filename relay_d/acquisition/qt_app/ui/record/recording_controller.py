@@ -109,8 +109,9 @@ class RecordingController:
                 self.yaml_parser.get_dataset_name(),
             )
             success = demo_name is not None
-            if self.data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
-                self.session_h5_files.append(self.data_recorder.retried_file)
+            retried, self.data_recorder.retried_file = self.data_recorder.retried_file, None  # added once, not at every Start
+            if retried:  # an earlier demo saved only now: keep it in the session
+                self.session_h5_files.append(retried)
 
             if success:
                 # The sampling thread already runs: set the state (and enable Stop) before any dialog.

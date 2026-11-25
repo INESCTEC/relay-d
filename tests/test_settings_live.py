@@ -15,7 +15,7 @@ from relay_d.utils import user_settings  # noqa: E402
 def test_one_store_and_other_pages_saves_show_in_settings(qapp, settings_file):
     page = SettingsPage(SimpleNamespace(page_settings=QWidget()))
     config.save_settings({"python_lerobot": "/venv/bin/python"})  # saved by the Train page, not by Settings
-    assert config.get("python_lerobot") == user_settings.get("python_lerobot") == "/venv/bin/python"
+    assert config.settings["python_lerobot"] == user_settings.get("python_lerobot") == "/venv/bin/python"
     if "python_lerobot" in page.widgets:
         assert page.widgets["python_lerobot"][1]() == "/venv/bin/python"
     page.widgets["rec_default_max_buffer_mb"][2](420)  # an unsaved edit elsewhere survives another page's save
@@ -30,7 +30,7 @@ def test_recorder_uses_the_current_buffer_setting_at_each_start(recorder_cls, se
                                        get_current_config_path=lambda: "c.yaml", get_input_data=lambda: [],
                                        get_streams=lambda: {}))
     user_settings.save({"rec_default_max_buffer_mb": 64})
-    assert rec.start_recording(SimpleNamespace()) is False  # 0 Hz is refused, after the settings were read
+    assert rec.start_recording(SimpleNamespace(), "d") is False  # 0 Hz is refused, after the settings were read
     assert rec.max_buffer_bytes == 64 * 1024**2
 
 

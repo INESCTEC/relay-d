@@ -6,15 +6,12 @@ DataRecorder (live recording, one tick at a time) and offline reprocessing
 qt_app/ui/review/demo_playback_reconstructor.py).
 """
 
-import array as _array
-import operator
-import re
 import types as _types
 
 import numpy as np
 
 from relay_d.utils.coloring_logger import logger
-from relay_d.utils.numerics import enriched_tf, read_scalar, select_joints, stream_entry, strip_trig
+from relay_d.utils.numerics import enriched_tf, entry_inputs, evaluate_entries, parse_spec, select_joints, stream_entry
 
 try:
     from sensor_msgs.msg import CompressedImage, Image, PointCloud2
@@ -22,12 +19,6 @@ try:
     _UNSUPPORTED_STREAM_MSG_TYPES = (Image, CompressedImage, PointCloud2)
 except ImportError:  # pragma: no cover - keeps this module importable without ROS installed
     _UNSUPPORTED_STREAM_MSG_TYPES = ()
-
-
-# Same spec grammar as relay_d/dispatch/obs_builder.py, so a recorded stream has the width and values
-# the live obs will have: "<operand> <op> <operand>" needs spaces around the operator.
-_BINOP_RE = re.compile(r"^(.+?)\s+([+\-*/])\s+(.+)$")
-_BIN_OPS = {"+": operator.add, "-": operator.sub, "*": operator.mul, "/": operator.truediv}
 
 
 class StreamBuilder:
@@ -47,6 +38,7 @@ class StreamBuilder:
         self._tf_input_names = set()
         self._joint_name_filters = {}
         self._joint_filter_warned = {}
+        self._joint_last_full = {}  # per joint-filtered input: its last message with every configured joint
         self._unsupported_type_warned = set()
         self.build_errors = []
         self._build_stream_extractors()
@@ -66,12 +58,7 @@ class StreamBuilder:
         binary arithmetic spec are included)."""
         names = set()
         for extractors in self._stream_extractors.values():
-            for extractor in extractors:
-                if extractor[0] == "simple":
-                    names.add(extractor[1])
-                elif extractor[0] == "binary":
-                    names.add(extractor[2][0])
-                    names.add(extractor[3][0])
+            names |= entry_inputs(extractors)
         return names
 
     def _build_stream_extractors(self):
@@ -100,69 +87,15 @@ class StreamBuilder:
             logger.error(msg)
             self.build_errors.append(msg)
 
-        def _parse_operand(operand, spec):
-            """Resolve one dotted operand to (input_name, getter, is_slice), or None (logged)."""
-            operand = operand.strip()
-            if "." not in operand:
-                _error(f"Stream spec '{spec}': operand '{operand}' has no dot separator — skipped")
-                return None
-            input_name, raw_field = operand.split(".", 1)
-            is_slice = raw_field.endswith("[:]")
-            field_path = raw_field[:-3] if is_slice else raw_field
-            if any(c in field_path for c in "+-*/"):
-                _error(
-                    f"Stream spec '{spec}': arithmetic operators must have spaces "
-                    f"around them (e.g. 'a.x - b.x') — skipped"
-                )
-                return None
-            if input_name in self._tf_input_names:
-                field_path = "transform." + field_path
-            return input_name, operator.attrgetter(field_path), is_slice
-
         streams = self.yaml_parser.get_streams()
         for stream_name, entry in streams.items():
             specs = stream_entry(entry)[0]  # rotation_format is applied at conversion
             extractor_list = []
             for spec in specs:
-                # sin(...)/cos(...) enclosing the whole spec, e.g. sin(joint_1.position[:]) or sin(a.x - b.x)
-                math_op, inner_spec = strip_trig(spec.strip())
-
-                if inner_spec.startswith("zero:"):
-                    try:
-                        extractor_list.append(("zero", int(inner_spec[5:])))
-                    except ValueError:
-                        _error(f"Stream spec '{spec}': zero:N needs an integer N — skipped")
-                    continue
-
-                # Binary arithmetic spec: <operand> +|-|*|/ <operand>, each side may have its own sin/cos
-                bin_match = _BINOP_RE.match(inner_spec)
-                if bin_match:
-                    sides = []
-                    for side in (bin_match.group(1).strip(), bin_match.group(3).strip()):
-                        if _BINOP_RE.match(side):
-                            _error(f"Stream spec '{spec}': only one arithmetic operation per spec — skipped")
-                            break
-                        side_op, side_spec = strip_trig(side)
-                        parsed = _parse_operand(side_spec, spec)
-                        if parsed is None:
-                            break
-                        if parsed[2]:
-                            _error(
-                                f"Stream spec '{spec}': arithmetic operands must be scalars "
-                                f"([:] not allowed) — skipped"
-                            )
-                            break
-                        sides.append((parsed[0], parsed[1], side_op))
-                    if len(sides) == 2:
-                        extractor_list.append(("binary", _BIN_OPS[bin_match.group(2)], sides[0], sides[1], math_op))
-                    continue
-
-                # Simple single-operand spec.
-                parsed = _parse_operand(inner_spec, spec)
-                if parsed is None:
-                    continue
-                input_name, getter, is_slice = parsed
-                extractor_list.append(("simple", input_name, getter, is_slice, math_op))
+                try:
+                    extractor_list.append(parse_spec(spec, self._tf_input_names))
+                except ValueError as e:
+                    _error(f"Stream spec '{spec}': {e} — skipped")
             if not extractor_list:
                 reason = (
                     "has no specs configured" if not specs
@@ -175,27 +108,36 @@ class StreamBuilder:
             self._stream_extractors[stream_name] = extractor_list
             logger.info(f"Built extractor for stream '{stream_name}' ({len(extractor_list)} specs)")
 
-    def apply_joint_filter(self, input_name: str, msg):
+    def _filter_joints(self, input_name: str, msg):
+        """``msg`` reduced to the configured joint_names. A message missing any of them (e.g. a gripper-only publisher
+        on the same topic) gives the last full one instead, None before any: as live inference, never a narrower row."""
         allowed = self._joint_name_filters.get(input_name)
-        if not allowed or not hasattr(msg, "name") or not msg.name:
+        if not allowed or not hasattr(msg, "name"):
             return msg
         names = list(msg.name)
-        indices = [i for i, n in enumerate(names) if n in allowed]
-        if not indices:
+        missing = allowed - set(names)
+        if missing:
             if not self._joint_filter_warned.get(input_name):
                 self._joint_filter_warned[input_name] = True
                 logger.warning(
-                    f"[joint_names filter] Input '{input_name}': none of the configured "
-                    f"names matched the robot's published names.\n"
+                    f"[joint_names filter] Input '{input_name}': configured joints not found in a message; "
+                    f"such messages are ignored (the last full one is kept).\n"
                     f"  Config names : {sorted(allowed)}\n"
                     f"  Robot names  : {sorted(names)}\n"
-                    f"  Filter is inactive. Update 'joint_names' in the config to match exactly.\n"
+                    f"  Missing      : {sorted(missing)}\n"
+                    f"  Update 'joint_names' in the config to match exactly.\n"
                     f"  Tip: ros2 topic echo /joint_states --once | grep -A20 name"
                 )
-            return msg
+            return self._joint_last_full.get(input_name)
         filtered = _types.SimpleNamespace(header=msg.header)
         filtered.name, filtered.position, filtered.velocity, filtered.effort = select_joints(msg, allowed)
+        self._joint_last_full[input_name] = filtered
         return filtered
+
+    def apply_joint_filter(self, input_name: str, msg):
+        """_filter_joints for the raw input recording, which cannot take None: the message as is until the first full one."""
+        filtered = self._filter_joints(input_name, msg)
+        return msg if filtered is None else filtered
 
     def _warn_unsupported_type(self, stream_name: str, input_name: str, msg) -> None:
         """Log once per stream why it's producing no data: the input resolved
@@ -227,50 +169,25 @@ class StreamBuilder:
             return None
         if input_name in self._tf_input_names:
             return enriched_tf(msg)  # euler.* / rot6d.* / rot_matrix.*, as obs_builder sees TF
-        return self.apply_joint_filter(input_name, msg)
+        return self._filter_joints(input_name, msg)
 
     def evaluate(self, all_data: dict):
+        # Every row first, appended after: an error half way must not leave earlier streams one row ahead for good
+        rows = {}
         for stream_name, extractors in self._stream_extractors.items():
-            row = []
-            ok = True
-            for extractor in extractors:
-                try:
-                    if extractor[0] == "zero":
-                        row.extend([0.0] * extractor[1])
-                    elif extractor[0] == "simple":
-                        _kind, input_name, getter, is_slice, math_op = extractor
-                        msg = self._input(stream_name, input_name, all_data)
-                        if msg is None:
-                            ok = False
-                            break
-                        if is_slice:
-                            val = getter(msg)
-                            vals = list(val) if isinstance(val, _array.array) else list(val[:])
-                            row.extend(float(math_op(v)) if math_op is not None else float(v) for v in vals)
-                        else:
-                            row.append(read_scalar(getter, msg, math_op))
-                    else:  # "binary": outer_op(side_op(a) <op> side_op(b)), both scalars
-                        _kind, op_func, (in_a, get_a, op_a), (in_b, get_b, op_b), math_op = extractor
-                        msg_a = self._input(stream_name, in_a, all_data)
-                        msg_b = self._input(stream_name, in_b, all_data)
-                        if msg_a is None or msg_b is None:
-                            ok = False
-                            break
-                        v = float(op_func(read_scalar(get_a, msg_a, op_a), read_scalar(get_b, msg_b, op_b)))
-                        row.append(float(math_op(v)) if math_op is not None else v)
-                except (AttributeError, TypeError, IndexError, ValueError, ZeroDivisionError):  # e.g. a short joint array: hold the last row
-                    ok = False
-                    break
+            try:
+                rows[stream_name] = evaluate_entries(extractors, lambda n, s=stream_name: self._input(s, n, all_data))
+            except (AttributeError, TypeError, IndexError, ValueError, ZeroDivisionError):  # e.g. a short joint array: hold the last row
+                rows[stream_name] = None
+        for stream_name, row in rows.items():
             buf = self._stream_buffers.setdefault(stream_name, [])
-            if ok:
+            if row is not None:
                 self._stream_last_valid[stream_name] = row
                 buf.append(row)
-            elif stream_name in self._stream_last_valid:
-                # Sample-and-hold: reuse last valid row when input is temporarily missing.
-                # Ensures all streams have identical row counts for Robomimic alignment.
-                buf.append(self._stream_last_valid[stream_name])
             else:
-                buf.append(None)   # no valid row yet — filtered at save time
+                # Sample-and-hold: reuse the last valid row (None before the first: filtered at save time),
+                # so all streams have identical row counts for Robomimic alignment.
+                buf.append(self._stream_last_valid.get(stream_name))
 
     def finalize(self) -> dict:
         """Return {stream_name: (N, M) float32 array} for every stream with data."""

@@ -35,7 +35,6 @@ def page(qapp, tmp_path, monkeypatch):
     monkeypatch.delenv("DISPLAY", raising=False)  # headless runs, no terminal window
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.setattr(tp.config, "save_settings", lambda *_: None)  # do not touch ~/.relayd_settings.json
-    monkeypatch.setattr(tp.config, "get", lambda key, default=None: default)
     boxes = []
     for name in ("info", "error", "warning"):
         monkeypatch.setattr(tp.CustomMessageBox, name, staticmethod(lambda *a, _n=name, **k: boxes.append((_n, a))))

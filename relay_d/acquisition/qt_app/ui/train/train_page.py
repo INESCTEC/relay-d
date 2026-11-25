@@ -40,9 +40,8 @@ _REFRESH_MS = 2000  # run table refresh
 
 
 class TrainPage:
-    def __init__(self, ui_instance, settings_page=None):
+    def __init__(self, ui_instance):
         self.ui = ui_instance
-        self.settings_page = settings_page
         self.datasets = []
         self.folder = ""
         self._param_widgets = {}
@@ -152,7 +151,7 @@ class TrainPage:
     # ------------------------------------------------------------------ dataset
 
     def choose_folder(self):
-        start = self.folder or config.get("hdf5_save_folder") or os.path.expanduser("~")
+        start = self.folder or user_settings.get("hdf5_save_folder") or os.path.expanduser("~")
         folder = QFileDialog.getExistingDirectory(self.ui, "Choose the dataset folder", start)
         if folder:
             self.load_folder(folder)

@@ -38,7 +38,7 @@ def test_save_writes_the_file_emits_and_notes_restart_only_changes(page):
     page.widgets["ros_domain_id"][2](7)
     assert page.save_settings_from_ui() is True
     assert json.loads(page.path.read_text())["rec_default_max_buffer_mb"] == 450
-    assert us.get("theme") == "dark" and config.get("theme") == "dark"
+    assert us.get("theme") == "dark" and config.settings["theme"] == "dark"
     assert seen and seen[-1]["theme"] == "dark"
     assert "Restart" in page.label_status.text() and "ROS domain" in page.label_status.text()
     config.settings_changed.disconnect(seen.append)

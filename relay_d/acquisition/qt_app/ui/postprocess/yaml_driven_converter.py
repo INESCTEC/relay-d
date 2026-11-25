@@ -197,7 +197,7 @@ def _is_converted_robomimic(path: str) -> bool:
 
 def _recordings(input_files: List[str]) -> List[str]:
     """The input files in conversion order, without converted robomimic datasets."""
-    return [f for f in sorted(input_files, key=natural_key) if not _is_converted_robomimic(f)]
+    return [f for f in sorted(dict.fromkeys(input_files), key=natural_key) if not _is_converted_robomimic(f)]
 
 
 class DataTransformEngine:
@@ -447,62 +447,40 @@ class YAMLDrivenConverter:
                 skipped = self.skipped_files
                 counter = 0
 
-                for file_path in sorted_files:
-                    if not file_path.endswith(".h5"):
-                        logger.warning(f"Skipping non-HDF5 file: {file_path}")
-                        skipped.append(os.path.basename(file_path))
-                        continue
-
+                for file_path, raw_demo_name, demo_data in self._iter_convertible_demos(sorted_files, engine, freq, "open"):
                     try:
-                        with h5py.File(file_path, "r") as in_f:
-                            for raw_demo_name in sorted(self._find_demo_groups(in_f)):
-                                in_data_grp = in_f.get("data")
-                                if not isinstance(in_data_grp, h5py.Group):
-                                    continue
-                                demo_data = in_data_grp.get(raw_demo_name)
-                                if not isinstance(demo_data, h5py.Group):
-                                    continue
+                        out_name = f"demo_{counter}"
+                        converted = self._convert_single_demo(
+                            demo_data, engine, out_name
+                        )
 
-                                if reason := self._demo_problem(demo_data, engine, freq):
-                                    logger.error(f"Skipped {file_path}::{raw_demo_name}: {reason}")
-                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
-                                    continue
-
-                                out_name = f"demo_{counter}"
-                                converted = self._convert_single_demo(
-                                    demo_data, engine, out_name
+                        if converted:
+                            try:
+                                self._write_demo_to_output(
+                                    data_grp, out_name, converted
                                 )
-
-                                if converted:
-                                    try:
-                                        self._write_demo_to_output(
-                                            data_grp, out_name, converted
-                                        )
-                                    except Exception as e:
-                                        # drop the half-written group so the next demo can reuse the name
-                                        if out_name in data_grp:
-                                            del data_grp[out_name]
-                                        logger.error(f"Skipped {file_path}::{raw_demo_name}: {e}")
-                                        self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
-                                        continue
-                                    processed.append(out_name)
-                                    total_demos += converted["num_samples"]
-                                    counter += 1
-                                    logger.info(
-                                        f"Converted {file_path}::{raw_demo_name} -> "
-                                        f"{out_name} ({converted['num_samples']} samples)"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"Skipped {file_path}::{raw_demo_name} (conversion failed)"
-                                    )
-                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
+                            except Exception as e:
+                                # drop the half-written group so the next demo can reuse the name
+                                if out_name in data_grp:
+                                    del data_grp[out_name]
+                                logger.error(f"Skipped {file_path}::{raw_demo_name}: {e}")
+                                self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
+                                continue
+                            processed.append(out_name)
+                            total_demos += converted["num_samples"]
+                            counter += 1
+                            logger.info(
+                                f"Converted {file_path}::{raw_demo_name} -> "
+                                f"{out_name} ({converted['num_samples']} samples)"
+                            )
+                        else:
+                            logger.warning(
+                                f"Skipped {file_path}::{raw_demo_name} (conversion failed)"
+                            )
+                            self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
 
                     except Exception as e:
-                        fname = os.path.basename(file_path)
-                        logger.error(f"Skipping {fname} — could not open: {e}")
-                        skipped.append(fname)
-                        continue
+                        self._skip_file(file_path, f"could not open: {e}")
 
                 if counter == 0:
                     self.last_error = "No demos could be converted."
@@ -537,6 +515,35 @@ class YAMLDrivenConverter:
             traceback.print_exc()
             self._discard_output(output_path)
             return False
+
+    def _iter_convertible_demos(self, files: List[str], engine: DataTransformEngine, freq: float, verb: str):
+        """(file, demo name, demo group) of every demo `_demo_problem` passes, in order, while its file is open.
+        Non-.h5 and unreadable files and problem demos are logged and recorded as skipped. A file the consumer
+        skips with `_skip_file` while handling one of its demos yields no more demos."""
+        for file_path in files:
+            if not file_path.endswith(".h5"):
+                logger.warning(f"Skipping non-HDF5 file: {file_path}")
+                self.skipped_files.append(os.path.basename(file_path))
+                continue
+            try:
+                with h5py.File(file_path, "r") as in_f:
+                    for raw_demo_name in sorted(self._find_demo_groups(in_f)):  # only groups under a data group
+                        demo_data = in_f["data"][raw_demo_name]
+                        if reason := self._demo_problem(demo_data, engine, freq):
+                            logger.error(f"Skipped {file_path}::{raw_demo_name}: {reason}")
+                            self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
+                            continue
+                        n_skipped = len(self.skipped_files)
+                        yield file_path, raw_demo_name, demo_data
+                        if len(self.skipped_files) > n_skipped:
+                            break
+            except Exception as e:
+                self._skip_file(file_path, f"could not {verb}: {e}")
+
+    def _skip_file(self, file_path: str, reason: str) -> None:
+        fname = os.path.basename(file_path)
+        logger.error(f"Skipping {fname} — {reason}")
+        self.skipped_files.append(fname)
 
     @staticmethod
     def _discard_output(path: str) -> None:
@@ -640,66 +647,48 @@ class YAMLDrivenConverter:
                 video_preset=user_settings.get("lerobot_video_preset"),
                 video_gop=user_settings.get("lerobot_gop"),
             ) as writer:
-                for file_path in sorted_files:
-                    if not file_path.endswith(".h5"):
-                        logger.warning(f"Skipping non-HDF5 file: {file_path}")
-                        skipped.append(os.path.basename(file_path))
-                        continue
+                for file_path, raw_demo_name, demo_data in self._iter_convertible_demos(sorted_files, engine, fps, "read"):
                     try:
-                        with h5py.File(file_path, "r") as in_f:
-                            in_data_grp = in_f.get("data")
-                            if not isinstance(in_data_grp, h5py.Group):
-                                continue
-                            for raw_demo_name in sorted(self._find_demo_groups(in_f)):
-                                demo_data = in_data_grp.get(raw_demo_name)
-                                if not isinstance(demo_data, h5py.Group):
-                                    continue
-                                if reason := self._demo_problem(demo_data, engine, fps):
-                                    logger.error(f"Skipped {file_path}::{raw_demo_name}: {reason}")
-                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
-                                    continue
-                                demo = self._convert_single_demo(
-                                    demo_data, engine, f"lerobot_ep_{written}"
-                                )
-                                if not demo:
-                                    logger.warning(
-                                        f"Skipped {file_path}::{raw_demo_name} (conversion failed)"
-                                    )
-                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
-                                    continue
-                                try:
-                                    state, state_names, images = self._lerobot_split_obs(
-                                        demo, lerobot_cfg.get("state_streams")
-                                    )
-                                    writer.add_episode(
-                                        state,
-                                        demo["actions"],
-                                        images,
-                                        task=task_text,
-                                        state_names=state_names,
-                                        action_names=self._lerobot_action_names(
-                                            demo["actions"].shape[1]
-                                        ),
-                                    )
-                                except LeRobotFatalError:
-                                    raise  # missing library or aborted dataset: every later episode would be wrong too
-                                except LeRobotWriterError as e:
-                                    logger.error(
-                                        f"Skipped {file_path}::{raw_demo_name}: {e}"
-                                    )
-                                    self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
-                                    continue
-                                written += 1
-                                logger.info(
-                                    f"Converted {file_path}::{raw_demo_name} -> "
-                                    f"episode {written - 1} ({demo['num_samples']} frames)"
-                                )
+                        demo = self._convert_single_demo(
+                            demo_data, engine, f"lerobot_ep_{written}"
+                        )
+                        if not demo:
+                            logger.warning(
+                                f"Skipped {file_path}::{raw_demo_name} (conversion failed)"
+                            )
+                            self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
+                            continue
+                        try:
+                            state, state_names, images = self._lerobot_split_obs(
+                                demo, lerobot_cfg.get("state_streams")
+                            )
+                            writer.add_episode(
+                                state,
+                                demo["actions"],
+                                images,
+                                task=task_text,
+                                state_names=state_names,
+                                action_names=self._lerobot_action_names(
+                                    demo["actions"].shape[1]
+                                ),
+                            )
+                        except LeRobotFatalError:
+                            raise  # missing library or aborted dataset: every later episode would be wrong too
+                        except LeRobotWriterError as e:
+                            logger.error(
+                                f"Skipped {file_path}::{raw_demo_name}: {e}"
+                            )
+                            self.skipped_demos.append(f"{file_path}::{raw_demo_name}")
+                            continue
+                        written += 1
+                        logger.info(
+                            f"Converted {file_path}::{raw_demo_name} -> "
+                            f"episode {written - 1} ({demo['num_samples']} frames)"
+                        )
                     except LeRobotFatalError:
                         raise
                     except Exception as e:  # skip a broken file: reaching the writer would delete the whole output
-                        fname = os.path.basename(file_path)
-                        logger.error(f"Skipping {fname} — could not read: {e}")
-                        skipped.append(fname)
+                        self._skip_file(file_path, f"could not read: {e}")
 
                 if written == 0:
                     logger.error("No episodes were converted; nothing to write.")

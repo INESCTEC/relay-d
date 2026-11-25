@@ -137,7 +137,8 @@ class InferenceSession:
             backend = detect_backend(checkpoint)
         if backend not in BACKENDS:
             raise ValueError(f"unknown backend '{backend}' (choose from {BACKENDS} or 'auto')")
-        if not rclpy.ok():
+        self._rclpy_initialized = not rclpy.ok()  # shut down in close() only if this session started it
+        if self._rclpy_initialized:
             rclpy.init()
 
         self.obs_node = ObsBuilder(obs_config)
@@ -198,7 +199,7 @@ class InferenceSession:
         self.dispatcher.send_stop()  # once: nothing is sent if run() already stopped and nothing was dispatched since
         self._executor.shutdown()
         self.obs_node.destroy_node()
-        if rclpy.ok():
+        if self._rclpy_initialized and rclpy.ok():
             rclpy.shutdown()
 
     def __enter__(self) -> "InferenceSession":

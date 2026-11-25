@@ -270,3 +270,12 @@ def test_an_unreadable_file_is_named_in_the_summary(tmp_path, fmt):
     assert conv.convert_multiple_files(fmt, [str(good), str(broken)], str(out))
     assert conv.conversion_summary() == (f"Converted {len(LENGTHS)} of {len(LENGTHS)} demos; "
                                          "1 file(s) could not be read: b_broken.h5")
+
+
+def test_a_file_listed_twice_is_converted_once(tmp_path):
+    """A demo saved by a retry was added to the session at every later Start."""
+    rec, out = tmp_path / "rec.h5", tmp_path / "out.h5"
+    write_recording(rec, LENGTHS)
+    conv = _converter()
+    assert conv.convert_multiple_files("robomimic", [str(rec), str(rec)], str(out))
+    assert conv.converted_demos == len(LENGTHS)  # was 2x: every demo duplicated in the dataset

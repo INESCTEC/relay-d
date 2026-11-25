@@ -36,9 +36,6 @@ class ConfigManager(QObject):
         self.settings = user_settings.save(new_settings)
         self.settings_changed.emit(self.settings)
 
-    def get(self, key, default=None):
-        return user_settings.get(key, default)  # one store: same value the command-line tools read
-
     def config_dialog_dir(self):
         """Start folder for config dialogs: config_folder, else hdf5_load_folder, else ''."""
         for key in ("config_folder", "hdf5_load_folder"):

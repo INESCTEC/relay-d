@@ -45,7 +45,6 @@ class DataRecorder(Node):
 
         self.recorded_data = defaultdict(list)
         self.recording_metadata = {}
-        self.current_demo_number = 0
         self.retried_file = None  # path of the demo saved by the last retry_save()
 
         self.recording_frequency = None  # read from the config at each start_recording
@@ -72,6 +71,7 @@ class DataRecorder(Node):
         self._fill_gaps_containers = set()
         self._fill_count_summary = {}
         self._held_counts = defaultdict(int)  # per input: ticks recorded without a fresh sample
+        self._last_msgs = {}  # per input: (message of the last tick, ticks it has been repeated)
         self._strict_drops = 0  # ticks skipped by sync_mode: strict
         self._partial_files = []  # half-written demos set aside by a failed save
         self._modalities = {}
@@ -89,7 +89,7 @@ class DataRecorder(Node):
 
         logger.info("DataRecorder initialized")
 
-    def start_recording(self, topic_subscribers, demo_name=None):
+    def start_recording(self, topic_subscribers, demo_name):
         try:
             with self.recording_lock:
                 if self.is_recording:
@@ -108,9 +108,6 @@ class DataRecorder(Node):
 
                 self.topic_subscribers = topic_subscribers
                 self.recording_frequency = None  # only the loaded config sets it: no config, no recording
-
-                if demo_name is None:
-                    demo_name = f"demo_{self.current_demo_number}"
 
                 self.recording_metadata = {
                     "demo_name": demo_name,
@@ -156,6 +153,7 @@ class DataRecorder(Node):
 
                 self.recorded_data.clear()
                 self._held_counts.clear()
+                self._last_msgs = {}
                 self._strict_drops = 0
                 self._buffered_bytes = 0
                 self.buffer_full = False
@@ -223,6 +221,9 @@ class DataRecorder(Node):
             self.recording_sample_count = 0
 
             interval = 1.0 / self.recording_frequency
+            # An input repeating the same message for longer than the inference stale limit has stopped publishing;
+            # shorter repeats are an input slower than recording_frequency.
+            max_repeats = float(user_settings.get("infer_max_obs_age_s")) * self.recording_frequency
             # Monotonic next-tick anchor — corrects for loop body processing time
             # so the actual sample rate stays close to recording_frequency.
             next_tick = time.monotonic()
@@ -324,11 +325,10 @@ class DataRecorder(Node):
                         msg_data = all_data.get(container_id)
                         processed_data = None
                         if msg_data is not None:
-                            msg_data = self._stream_builder.apply_joint_filter(container_id, msg_data)
                             processed_data = self._process_message_for_recording(
-                                msg_data, container_id
+                                self._stream_builder.apply_joint_filter(container_id, msg_data), container_id
                             )
-                        tick[container_id] = processed_data
+                        tick[container_id] = (msg_data, processed_data)
 
                     # Streams share the same snapshot as all containers.
                     if self._stream_builder.has_streams():
@@ -337,13 +337,17 @@ class DataRecorder(Node):
                     self.timestamp_spreads.append(spread)
                     self.timestamps.append(timestamp_nsec)
                     data_processed = 0
-                    for container_id, processed_data in tick.items():
+                    for container_id, (msg_data, processed_data) in tick.items():
+                        last_msg, repeats = self._last_msgs.get(container_id, (None, 0))
+                        # identity, not equality: the subscriber stores a new object per message received
+                        repeats = repeats + 1 if msg_data is not None and msg_data is last_msg else 0
+                        self._last_msgs[container_id] = (msg_data, repeats)
                         if processed_data:
                             self._last_valid_raw[container_id] = processed_data
                             self._buffered_bytes += _sample_nbytes(processed_data)
                             data_processed += 1
-                        else:
-                            self._held_counts[container_id] += 1  # held (or None until the first sample)
+                        if not processed_data or repeats > max_repeats:
+                            self._held_counts[container_id] += 1  # held, frozen (or None until the first sample)
                         self.recorded_data[container_id].append(
                             processed_data or self._last_valid_raw.get(container_id)
                         )
@@ -457,6 +461,9 @@ class DataRecorder(Node):
                 if self.h5_file:
                     try:
                         self.h5_file.close()
+                    except Exception as e:
+                        logger.error(f"Could not close {self.h5_file_path}: {e}")
+                        saved = False  # the file may be incomplete: set it aside below
                     finally:
                         self.h5_file = None
 
@@ -473,7 +480,6 @@ class DataRecorder(Node):
                     f"Recording duration: {self.recording_metadata['duration']:.2f} seconds"
                 )
 
-                self.current_demo_number += 1
                 return True
 
         except Exception as e:
@@ -500,7 +506,6 @@ class DataRecorder(Node):
             return False
         self._unsaved = False
         self.retried_file = self.h5_file_path  # the caller adds it to its session list
-        self.current_demo_number += 1
         for path in self._partial_files:  # the full demo is saved now
             try:
                 os.remove(path)
@@ -546,7 +551,7 @@ class DataRecorder(Node):
 
             self.recorded_data_dir = output_dir
             self.h5_file_path = os.path.join(str(output_dir), f"{demo_name}.h5")
-            # "w-": never overwrite a demo already there (the demo counter restarts in every process)
+            # "w-": never overwrite a demo already there
             self.h5_file = h5py.File(self.h5_file_path, mode, libver="latest")
             logger.info(f"Created H5 file: {self.h5_file_path}")
         except Exception as e:
@@ -620,7 +625,7 @@ class DataRecorder(Node):
                 # The loop already held the last sample over gaps; held ticks are not real samples.
                 fill_count = self._held_counts.get(container_id, 0)
                 non_null_raw = len(data_list) - fill_count
-                if fill_count > 0 and container_id in self._fill_gaps_containers:
+                if fill_count > 0:  # every input: the validator flags one that stopped publishing
                     self._fill_count_summary[container_id] = fill_count
 
                 # Samples taken before the first message arrived are None. Dropping them would

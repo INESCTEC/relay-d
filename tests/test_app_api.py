@@ -34,6 +34,8 @@ def test_demo_saved_by_a_retry_at_start_joins_the_session():
     api._data_recorder.retried_file = "/data/demo_0.h5"
     assert api.start_recording("demo_1")
     assert api._session_h5_files == ["/data/demo_0.h5"]  # was never converted
+    api.start_recording("demo_2")
+    assert api._session_h5_files == ["/data/demo_0.h5"]  # was added again at every later Start
 
 
 def test_shutdown_keeps_running_when_the_recording_could_not_be_saved():

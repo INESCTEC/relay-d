@@ -19,6 +19,11 @@ import importlib
 import time
 
 
+def _has_nan(transform):
+    t, r = transform.transform.translation, transform.transform.rotation
+    return any(v != v for v in (t.x, t.y, t.z, r.x, r.y, r.z, r.w))
+
+
 class TopicSubscribers(Node):
     # Timeouts come from the user settings, read when used so a change applies to the next subscription.
     @property
@@ -578,13 +583,7 @@ class TopicSubscribers(Node):
                     timeout=rclpy_duration(seconds=0.0),
                 )
 
-                # Check for NaN or invalid transform
-                t = transform.transform.translation
-                r = transform.transform.rotation
-
-                if not (t.x == t.x and t.y == t.y and t.z == t.z) or not (
-                    r.x == r.x and r.y == r.y and r.z == r.z and r.w == r.w
-                ):
+                if _has_nan(transform):
                     msg_count = self.subscriber_status.get(container_id, {}).get(
                         "message_count", 0
                     )
@@ -641,12 +640,7 @@ class TopicSubscribers(Node):
                 ros_time,
                 timeout=rclpy_duration(seconds=timeout_sec),
             )
-            t = transform.transform.translation
-            r = transform.transform.rotation
-            if not (t.x == t.x and t.y == t.y and t.z == t.z and
-                    r.x == r.x and r.y == r.y and r.z == r.z and r.w == r.w):
-                return None
-            return transform
+            return None if _has_nan(transform) else transform
         except Exception:
             return None
 

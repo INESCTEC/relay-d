@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List
 
-from relay_d.training.launcher import RUNS_DIRNAME
+from relay_d.training.launcher import RUNS_DIRNAME, script_alive
 
 STARTING, RUNNING, FINISHED, FAILED, STOPPED = "starting", "running", "finished", "failed", "stopped"
 _STOP_CODES = {130, 143}  # Ctrl+C / SIGTERM
@@ -39,12 +39,8 @@ def _read_int(path: Path):
         return None
 
 
-def _alive(pid: int) -> bool:
-    """True if ``pid`` is still the run script (guards against a reused pid after a reboot)."""
-    try:
-        return b"run.sh" in Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
+def _alive(run_dir: Path, pid: int) -> bool:
+    return script_alive(pid, Path(run_dir) / "run.sh")
 
 
 def _status(run_dir: Path, meta: dict) -> str:
@@ -54,7 +50,7 @@ def _status(run_dir: Path, meta: dict) -> str:
     pid = _read_int(run_dir / "pid")
     if pid is None:
         return STARTING if time.time() - meta.get("started", 0) < _START_GRACE_S else STOPPED
-    return RUNNING if _alive(pid) else STOPPED  # no exit_code and the script is gone: it was killed
+    return RUNNING if _alive(run_dir, pid) else STOPPED  # no exit_code and the script is gone: it was killed
 
 
 def read_run(run_dir) -> Run:
@@ -83,10 +79,15 @@ def list_runs(path) -> List[Run]:
 
 
 def stop(run_dir, grace: float = 10.0) -> bool:
-    """Stop a running run (terminate, then kill after ``grace`` seconds). True if it is no longer running."""
+    """Stop a running run (terminate, then kill after ``grace`` seconds). True if it is no longer running.
+    A run still starting gets ``grace`` seconds to write its ``pid``; False if it does not (it may start later)."""
     run_dir = Path(run_dir)
-    pid = _read_int(run_dir / "pid")
-    if pid is None or not _alive(pid):
+    deadline = time.monotonic() + grace
+    while (pid := _read_int(run_dir / "pid")) is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if pid is None:
+        return False
+    if not _alive(run_dir, pid):
         return True
     try:
         pgid = os.getpgid(pid)
@@ -94,13 +95,13 @@ def stop(run_dir, grace: float = 10.0) -> bool:
         send = (lambda sig: os.killpg(pgid, sig)) if pgid != os.getpgrp() else (lambda sig: os.kill(pid, sig))
         send(signal.SIGTERM)
         deadline = time.monotonic() + grace
-        while _alive(pid) and time.monotonic() < deadline:
+        while _alive(run_dir, pid) and time.monotonic() < deadline:
             time.sleep(0.1)
-        if _alive(pid):
+        if _alive(run_dir, pid):
             send(signal.SIGKILL)
             time.sleep(0.2)
     except ProcessLookupError:
         pass
     if not (run_dir / "exit_code").exists():
         (run_dir / "exit_code").write_text("143\n")  # so the run reads as "stopped", not "running"
-    return not _alive(pid)
+    return not _alive(run_dir, pid)

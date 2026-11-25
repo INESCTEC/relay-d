@@ -364,7 +364,7 @@ class PostProcessPage(QWidget):
     def _recordings_dir(self):
         """Where recordings are saved (Settings page), for the file dialogs; else home."""
         save_folder = self.settings_page.get_hdf5_save_folder() if self.settings_page else ""
-        return os.path.join(save_folder, "recorded_data") if save_folder else os.path.expanduser("~")
+        return save_folder or os.path.expanduser("~")
 
     def _select_files_to_convert(self):
         fn, _ = QFileDialog.getOpenFileNames(
