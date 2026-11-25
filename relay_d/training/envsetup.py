@@ -29,9 +29,12 @@ LEROBOT_VERSION = "0.6.1"
 # Installed with --no-deps: its pins (egl_probe, which only robosuite environments import) are replaced by the list below,
 # plus what it imports without declaring it (six: config/base_config.py; packaging: algo/diffusion_policy.py).
 ROBOMIMIC_COMMIT = "e10526b9a40c78b41f1e37e60041dc0ec0a5f60f"
-_ROBOMIMIC_DEPS = ("numpy", "six", "packaging", "h5py", "psutil", "tqdm", "termcolor", "tensorboard", "tensorboardX", "imageio", "imageio-ffmpeg",
-                   "matplotlib", "huggingface_hub==0.23.4", "transformers==4.41.2", "diffusers==0.11.1",
-                   "opencv-python-headless>=4.8.0,<4.13")  # cv2: lfd-inference-node decodes camera frames in this environment
+# All pinned to a set that trained and ran (2026-11): unpinned, a new torch / numpy next to the old diffusers / transformers breaks.
+_ROBOMIMIC_TORCH = ("torch==2.14.1", "torchvision==0.29.1")
+_ROBOMIMIC_DEPS = ("numpy==2.5.4", "six==1.17.0", "packaging==26.3", "h5py==3.16.0", "psutil==7.2.2", "tqdm==4.70.1", "termcolor==3.3.0",
+                   "tensorboard==2.21.0", "tensorboardX==2.6.5", "imageio==2.38.1", "imageio-ffmpeg==0.6.0", "matplotlib==3.11.2",
+                   "huggingface_hub==0.23.4", "transformers==4.41.2", "diffusers==0.11.1",
+                   "opencv-python-headless==4.11.0.86")  # cv2: lfd-inference-node decodes camera frames in this environment
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,7 @@ ENVS = {
     ),
     "robomimic": EnvSpec(
         "robomimic",
-        (("torch", "torchvision"),
+        (_ROBOMIMIC_TORCH,
          ("--no-deps", f"robomimic @ git+https://github.com/ARISE-Initiative/robomimic.git@{ROBOMIMIC_COMMIT}"),
          _ROBOMIMIC_DEPS),
         "import robomimic.scripts.train, torch, cv2; print('robomimic ok, torch', torch.__version__, 'cuda', torch.cuda.is_available())",
@@ -91,17 +94,8 @@ def _pid_file(env_dir: Path) -> Path:
     return Path(env_dir).with_name(Path(env_dir).name + ".setup.pid")
 
 
-def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    try:  # a killed script nobody waited for stays a zombie: it does not run any more
-        return Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0] != "Z"
-    except (OSError, IndexError):
-        return True
+def _script(env_dir: Path) -> Path:
+    return Path(env_dir).with_name(Path(env_dir).name + ".setup.sh")
 
 
 def build_script(fmt: str, env_dir: Path, uv: Optional[str], base_python: str) -> str:
@@ -132,7 +126,7 @@ def status(env_dir: Path) -> str:
         # pip prints no progress into a pipe, so a long download leaves the log silent: ask the script's process.
         # Without a pid file (the script has not started yet), a log silent for a quarter of an hour belongs to a killed one.
         try:
-            return "running" if _alive(int(_pid_file(env_dir).read_text())) else "failed"
+            return "running" if launcher.script_alive(int(_pid_file(env_dir).read_text()), _script(env_dir)) else "failed"
         except (OSError, ValueError):
             return "running" if time.time() - log.stat().st_mtime < _STALE_SECONDS else "failed"
     code = exit_file.read_text().strip()
@@ -171,7 +165,7 @@ def start(fmt: str, env_dir: Optional[Path] = None, terminal: bool = True) -> Pa
     for f in (log, exit_file, _pid_file(env_dir)):
         f.unlink(missing_ok=True)
     log.touch()  # "running" from now on
-    script = env_dir.with_name(env_dir.name + ".setup.sh")
+    script = _script(env_dir)
     script.write_text(build_script(fmt, env_dir, shutil.which("uv"), sys.executable))
     launcher.run_script(script, f"Relay-D: {fmt} setup", terminal)
     return env_dir

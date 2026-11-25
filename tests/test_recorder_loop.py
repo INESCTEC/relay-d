@@ -82,7 +82,7 @@ def test_missing_or_zero_recording_frequency_is_refused_at_start(recorder_cls, m
         config["config"]["recording_frequency"] = recording_frequency
     rec = _loop_ready(recorder_cls, monkeypatch, _config_parser(config))
     rec.output_directory = str(tmp_path)
-    assert rec.start_recording(_FakeSubscribers(rec, [{}], {})) is False  # missing: was the 30 Hz setting
+    assert rec.start_recording(_FakeSubscribers(rec, [{}], {}), "d") is False  # missing: was the 30 Hz setting
     assert rec.is_recording is False
 
 
@@ -116,6 +116,7 @@ def test_start_always_flushes_stale_data(recorder_cls, monkeypatch, tmp_path):
 
 def test_a_failed_close_keeps_the_demo_for_a_retry(recorder_cls, tmp_path):
     rec = make_recorder(recorder_cls, tmp_path, [1, 2], {"arm": [joint_sample()] * 2})
+    rec.h5_file_path = str(tmp_path / "demo.h5")
     real = rec.h5_file
 
     class _CloseFails:
@@ -130,6 +131,7 @@ def test_a_failed_close_keeps_the_demo_for_a_retry(recorder_cls, tmp_path):
     rec.recording_metadata["start_time"] = 0.0
     assert rec.stop_recording() is False
     assert rec._unsaved is True  # was False: the next Start would have cleared the buffer
+    assert not (tmp_path / "demo.h5").exists() and (tmp_path / "demo.h5.partial").exists()  # was left as a demo
     real.close()
     rec.output_directory = str(tmp_path / "retry")
     assert rec.retry_save() is True and rec._unsaved is False
@@ -234,6 +236,31 @@ def test_tf_is_looked_up_at_the_topic_stamp_not_its_own(recorder_cls, monkeypatc
     rec.topic_subscribers = subs
     rec._standard_recording_loop(subs)
     assert looked_up == [(10, 0)]  # was 12 s: TF aligned to itself, not to the camera frame
+
+
+def test_an_input_that_stops_publishing_is_counted_as_held(recorder_cls, monkeypatch):
+    msgs = _real_message_classes(recorder_cls)
+    rec = _loop_ready(recorder_cls, monkeypatch)
+    get = sys.modules[recorder_cls.__module__].user_settings.get
+    monkeypatch.setattr(sys.modules[recorder_cls.__module__].user_settings, "get",
+                        lambda k: 0.002 if k == "infer_max_obs_age_s" else get(k))  # 2 repeats at 1000 Hz
+
+    def js():
+        m = msgs.JointState()
+        m.name, m.position = ["j"], [1.0]
+        return m
+
+    slow = [js() for _ in range(3)]
+    frozen = js()
+    # 'fast' is new every tick; 'slow' repeats each message twice (slower than the recording rate), then freezes
+    frames = [{"fast": js(), "slow": m} for m in (slow[0], slow[0], slow[1], slow[1], slow[2], slow[2])]
+    frames += [{"fast": js(), "slow": frozen} for _ in range(6)]
+    subs = _FakeSubscribers(rec, frames, {"fast": msgs.JointState, "slow": msgs.JointState})
+    rec.topic_subscribers = subs
+    rec._standard_recording_loop(subs)
+    assert len(rec.timestamps) == 12
+    assert rec._held_counts.get("fast", 0) == 0
+    assert rec._held_counts["slow"] == 3  # was 0: a frozen input looked live; repeats up to the stale limit are not held
 
 
 def test_strict_sync_counts_and_reports_dropped_ticks(recorder_cls, monkeypatch, tmp_path):

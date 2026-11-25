@@ -474,3 +474,22 @@ def test_a_late_rejection_does_not_make_a_newer_goal_resend(d):
     d._goal_response_callback(rejected, "grip", keys[1])  # B itself rejected: retried
     d.dispatch(np.array([2.0]))
     assert sent == [1.0, 2.0, 2.0]
+
+
+@pytest.mark.parametrize("lim", [{"lower_lim": 2.0, "upper_lim": 0.0}, {"lower_lim": 0.0}, {"upper_lim": 1.0, "lower_lim": None}])
+def test_swapped_or_missing_limit_is_rejected_at_startup(tmp_path, lim):
+    with pytest.raises(ValueError, match="'grip'.*lower_lim <= upper_lim"):  # swapped: every value clamped to upper_lim
+        _load(tmp_path, {"grip": {**_GRIP, "limits": [lim]}})
+
+
+def test_euler_to_quat_round_trips_and_lands_at_euler_start(d):
+    from relay_d.dispatch.action_dispatcher import _euler_to_quat
+    from relay_d.utils.numerics import quat_to_euler
+
+    for rpy in [(0.0, 0.0, 0.0), (0.3, -0.2, 1.1), (-2.5, 1.2, -3.0), (np.pi / 2, 0.0, 0.0), (0.0, 0.0, np.pi / 2)]:
+        q = _euler_to_quat(*rpy)
+        assert np.isclose(np.linalg.norm(q), 1.0, atol=1e-6)
+        np.testing.assert_allclose(quat_to_euler(q), rpy, atol=1e-5)  # the inverse the recorder/converter uses
+    out = d._apply_transform(np.array([9.0, 0.3, -0.2, 1.1, 7.0], dtype=np.float32), {"type": "euler_to_quat", "euler_start": 1})
+    assert out[0] == 9.0 and out[-1] == 7.0 and len(out) == 6
+    np.testing.assert_allclose(out[1:5], _euler_to_quat(0.3, -0.2, 1.1), rtol=1e-6)

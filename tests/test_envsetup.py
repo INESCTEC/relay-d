@@ -6,6 +6,7 @@ import time
 
 import pytest
 
+from helpers import wait_until
 from relay_d.training import envsetup, launcher
 
 
@@ -28,9 +29,9 @@ def test_package_lists_differ_per_format(tmp_path):
     v = envsetup.LEROBOT_VERSION  # pinned: launcher.py hard-codes this release's module and flags
     assert f"'lerobot[training]=={v}' 'lerobot[diffusion]=={v}' 'lerobot[smolvla]=={v}'" in lerobot and "robomimic" not in lerobot.replace("Relay-D", "")
     assert f"git+https://github.com/ARISE-Initiative/robomimic.git@{envsetup.ROBOMIMIC_COMMIT}" in robomimic
-    assert "--no-deps" in robomimic and "diffusers==0.11.1" in robomimic and "torch torchvision" in robomimic
+    assert "--no-deps" in robomimic and "diffusers==0.11.1" in robomimic and "torch==2.14.1 torchvision==0.29.1" in robomimic
     assert "import robomimic.scripts.train" in robomimic
-    assert " six " in robomimic and " packaging " in robomimic  # imported by robomimic but not in its requirements
+    assert " six==" in robomimic and " packaging==" in robomimic  # imported by robomimic but not in its requirements
     assert "opencv-python-headless" in robomimic and "cv2" in robomimic  # inference decodes camera frames there
 
 
@@ -78,16 +79,19 @@ def test_a_silent_log_of_a_live_build_is_still_running_and_is_not_started_twice(
     log.write_text("downloading torch\n")
     old = time.time() - 2 * envsetup._STALE_SECONDS  # pip prints nothing into a pipe: the log stays silent
     os.utime(log, (old, old))
-    envsetup._pid_file(env).write_text(str(os.getpid()))  # a live process
+    envsetup._pid_file(env).write_text(str(os.getpid()))  # a live process that is not the script: a pid reused after a reboot
+    assert envsetup.status(env) == "failed"
+    envsetup._script(env).write_text("sleep 30\n")
+    live = subprocess.Popen(["bash", str(envsetup._script(env))])
+    envsetup._pid_file(env).write_text(str(live.pid))
     assert envsetup.status(env) == "running"
     started = []
     monkeypatch.setattr(envsetup.launcher, "run_script", lambda *a: started.append(a))
     envsetup.start("lerobot", env)
     assert started == [] and log.read_text() == "downloading torch\n"  # left alone: a second build would corrupt the venv
-    dead = subprocess.Popen(["true"])
-    dead.wait()
-    envsetup._pid_file(env).write_text(str(dead.pid))
-    assert envsetup.status(env) == "failed"  # the script's process is gone
+    live.kill()  # not waited for: a zombie, which no longer runs
+    assert wait_until(lambda: envsetup.status(env) == "failed")  # the script's process is gone
+    live.wait()
     envsetup.start("lerobot", env)
     assert len(started) == 1 and not envsetup._pid_file(env).exists()
 

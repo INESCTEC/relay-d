@@ -39,9 +39,11 @@ class AppAPI:
         postprocess_config_path: Optional[str] = None,
     ):
         # Conversion config + format options, checked like relay-d-convert: raises before any ROS setup
+        self._options_path = postprocess_config_path
         self._load_conversion_config(config_path, postprocess_config_path)
         self._rclpy_initialized = False
         try:
+            user_settings.apply_ros_domain()  # same domain as the GUI
             rclpy.init()
             self._rclpy_initialized = True
         except Exception:
@@ -59,11 +61,22 @@ class AppAPI:
         self._containers: list = []
         self._config_path = config_path
 
-        if config_path is not None:
-            self.initialize(config_path)
+        if config_path is not None and not self.initialize(config_path):
+            self._topic_subscribers.close()
+            if self._rclpy_initialized:
+                rclpy.shutdown()
+            raise ValueError(f"Config rejected: {config_path} (see the log)")  # the GUI shows an error dialog
 
     def initialize(self, config_path: str) -> bool:
         if config_path is None:
+            return False
+        if self._data_recorder.is_recording:  # the GUI ignores a config load during a recording too
+            logger.warning("Config not loaded: a recording is in progress (stop it first).")
+            return False
+        try:  # conversion follows the config that records, as the Post-process page does; checked first, swapped last
+            conversion = self._conversion_for(config_path, self._options_path)
+        except ValueError as e:
+            logger.error(f"Config rejected for conversion: {e}")
             return False
         if not self._yaml_parser.load_yaml_file(config_path):
             return False
@@ -81,6 +94,8 @@ class AppAPI:
         if problems:
             logger.warning("Config check:\n" + "\n".join(f"  {p.message}" for p in problems))
 
+        self._yaml_converter, self._conversion_parser = conversion
+        self._config_path = config_path
         # Subscribed at every start_recording, as in the GUI
         self._containers = [ContainerAdapter(d) for d in self._yaml_parser.get_input_data()]
         self.start_spinning()
@@ -91,6 +106,9 @@ class AppAPI:
 
     def start_recording(self, demo_name: Optional[str] = None) -> bool:
         """Start a demo, named like the GUI's (``{dataset_name}_{ms}``) unless ``demo_name`` is given."""
+        if self._data_recorder.is_recording:  # refused before start_demo, which would subscribe every input again
+            logger.warning("Recording already in progress")
+            return False
         try:
             started = start_demo(  # same steps as the GUI's Start
                 self._data_recorder, self._topic_subscribers, self._containers,
@@ -99,8 +117,9 @@ class AppAPI:
         except TfTopicSubscriptionError as e:
             logger.error(f"Recording NOT started: a configured TF topic could not be read: {e}")
             return False
-        if self._data_recorder.retried_file:  # an earlier demo saved only now: keep it in the session
-            self._session_h5_files.append(self._data_recorder.retried_file)
+        retried, self._data_recorder.retried_file = self._data_recorder.retried_file, None  # added once, not at every Start
+        if retried:  # an earlier demo saved only now: keep it in the session
+            self._session_h5_files.append(retried)
         return started
 
     def stop_recording(self) -> bool:
@@ -125,17 +144,22 @@ class AppAPI:
         """Delete a recorded demo and drop it from this session, like the GUI's Review > Delete / Reject Demo."""
         if not delete_demo_file(file_path, self._data_recorder):
             return False
-        self._session_h5_files = [p for p in self._session_h5_files if p != file_path]
+        path = os.path.abspath(file_path)  # a relative path names the same demo
+        self._session_h5_files = [p for p in self._session_h5_files if os.path.abspath(p) != path]
         return True
 
-    def _load_conversion_config(self, config_path: Optional[str], options_path: Optional[str]) -> None:
-        """The converter, with the config and format options of relay-d-convert (options: ``options_path``, else a
-        postprocess_config.yaml next to the config, else the defaults). Raises ValueError if a file is unusable."""
-        self._yaml_converter = YAMLDrivenConverter()
-        self._conversion_parser = None
+    @staticmethod
+    def _conversion_for(config_path: Optional[str], options_path: Optional[str]):
+        """(converter, parser) with the config and format options of relay-d-convert (options: ``options_path``, else
+        a postprocess_config.yaml next to the config, else the defaults). Raises ValueError if a file is unusable."""
+        converter, parser = YAMLDrivenConverter(), None
         if config_path:
-            self._conversion_parser, self._yaml_converter.options = load_conversion_config(config_path, options_path)
-            self._yaml_converter.data_config = self._conversion_parser.yaml_data["config"]
+            parser, converter.options = load_conversion_config(config_path, options_path)
+            converter.data_config = parser.yaml_data["config"]
+        return converter, parser
+
+    def _load_conversion_config(self, config_path: Optional[str], options_path: Optional[str]) -> None:
+        self._yaml_converter, self._conversion_parser = self._conversion_for(config_path, options_path)
 
     def convert_recording_to_dataset(self, output_format: str = "robomimic") -> bool:
         """Convert this session's recordings like the Post-process page: a new ``<date>_<Format>`` folder in the

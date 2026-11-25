@@ -35,7 +35,6 @@ def page(qapp, tmp_path, monkeypatch):
     monkeypatch.delenv("DISPLAY", raising=False)  # headless runs, no terminal window
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
     monkeypatch.setattr(tp.config, "save_settings", lambda *_: None)  # do not touch ~/.relayd_settings.json
-    monkeypatch.setattr(tp.config, "get", lambda key, default=None: default)
     boxes = []
     for name in ("info", "error", "warning"):
         monkeypatch.setattr(tp.CustomMessageBox, name, staticmethod(lambda *a, _n=name, **k: boxes.append((_n, a))))
@@ -194,3 +193,17 @@ def test_the_default_python_is_not_saved_as_a_setting(page, tmp_path, monkeypatc
     page.edit_python.setText("/my/venv/bin/python")
     page._save_python()
     assert saved == [{"python_lerobot": ""}, {"python_lerobot": "/my/venv/bin/python"}]
+
+
+def test_a_saved_robomimic_config_is_the_default_policy_like_the_cli(page):
+    import shutil
+
+    from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
+
+    template = PostprocessConfigLoader().get_output_train_config(launcher.ROBOMIMIC, "diffusion_policy")
+    shutil.copy(template, page.folder_path / "robomimic_config.json")  # what an older Post-process saved
+    page.load_folder(str(page.folder_path))
+    assert page.combo_policy.itemText(0) == tp.SAVED_POLICY
+    assert page._policy() is None  # relay-d-train without --policy: the saved config, not bc_rnn_gmm
+    page.combo_policy.setCurrentText("bc_rnn_gmm")
+    assert page._policy() == "bc_rnn_gmm"

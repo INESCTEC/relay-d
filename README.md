@@ -98,19 +98,36 @@ Keep dependencies up to date to avoid security vulnerabilities and compatibility
 
 ## 4. Installation
 
+**Quick install** (Ubuntu 24.04 with [ROS 2 Jazzy](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html) already installed):
+
+```bash
+git clone git@github.com:pascd/Relay-D.git && cd Relay-D
+./scripts/install.sh            # --no-lerobot / --no-robomimic to skip a training environment
+```
+
+It installs `relay_d` into the system Python (the ROS one), so any script can `import relay_d` without a venv: dependencies
+from apt where apt has them (built against ROS's NumPy 1.26), the rest with `pip install --user --break-system-packages`,
+and `relay_d` itself with `--no-deps -e` so pip never pulls NumPy 2 over ROS. torch / LeRobot / robomimic go into their own
+environments in `~/.relayd/envs` (the same ones the Train tab's **Set up ... environment** button builds), used automatically
+for training and `lfd-inference-node`. Safe to run again. The manual steps:
+
 ```bash
 # 1. Source ROS 2
 source /opt/ros/jazzy/setup.bash
-sudo apt install ros-jazzy-tf2-ros ros-jazzy-geometry-msgs ros-jazzy-std-msgs \
-    ros-jazzy-sensor-msgs ros-jazzy-image-transport
+sudo apt install python3-pip python3-numpy python3-yaml python3-opencv python3-pyqt5 python3-pyqt5.qtmultimedia \
+    ros-jazzy-tf2-ros ros-jazzy-geometry-msgs ros-jazzy-std-msgs \
+    ros-jazzy-sensor-msgs ros-jazzy-image-transport ros-jazzy-xacro \
+    ros-jazzy-rviz2 ros-jazzy-robot-state-publisher ros-jazzy-sensor-msgs-py
 
 # 2. Clone
 cd ~/ros2_ws/src
 git clone git@github.com:pascd/Relay-D.git
 cd Relay-D
 
-# 3. Install
-pip install -e .
+# 3. Install (system Python: what apt lacks, then relay_d without letting pip replace the apt packages)
+pip install --user --break-system-packages h5py "pyarrow<21" av "pyqtgraph>=0.13.7"
+pip install --user --break-system-packages --no-deps -e .
+# Or, in a venv only you use: pip install -e ".[lerobot]"
 
 # Optional: robomimic, to run robomimic policies (`lfd-inference-node --backend robomimic`).
 # IMPORTANT: PyPI's `robomimic` package only goes up to 0.3.0 and is NOT

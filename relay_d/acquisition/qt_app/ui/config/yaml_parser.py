@@ -1,3 +1,4 @@
+import os
 import yaml
 import re
 import html
@@ -24,38 +25,48 @@ class YamlParser:
         logger.info("Create YamlParser object.")
 
         self.yaml_data = None
+        self.yaml_text = None  # the text yaml_data was loaded from, shown as is (comments, key order)
         self.current_config = {}
         self.clear()
 
     def load_yaml_file(self, file_path):
         try:
             with open(file_path, "r") as stream:
-                self.yaml_data = yaml.safe_load(stream)
-                self._retrieve_all_parameters()
-                self.current_config = file_path
-                self._print_parsed_data()
-                return True
+                self._load(stream.read())
+            self.current_config = file_path
+            self._print_parsed_data()
+            return True
         except Exception as exc:
             logger.error(f"Error loading YAML file: {exc}")
             return False
 
-    def _retrieve_all_parameters(self):
+    def _load(self, text):
+        """Parse ``text`` and only then replace the loaded data: a bad file leaves the previous config intact."""
+        data = yaml.safe_load(text)
+        parsed = self._retrieve_all_parameters(data)
+        self.yaml_data, self.yaml_text = data, text
+        self.clear()
+        for name, value in parsed.items():
+            setattr(self, name, value)
+
+    def _retrieve_all_parameters(self, data):
         logger.info("Retrieving YAML parameters")
 
-        self.clear()
-
-        if not self.yaml_data or "config" not in self.yaml_data:
+        parsed = {}
+        if not data or "config" not in data:
             logger.error("Invalid YAML: missing 'config'")
-            return
+            return parsed
 
-        config = self.yaml_data["config"]
-        self.dataset_name = config.get("dataset_name", "demo")
+        config = data["config"]
+        parsed["dataset_name"] = config.get("dataset_name", "demo")
 
         if "input" in config:
             # Also add a raw for future procesing
-            self.yaml_input_data_raw = config["input"]
+            input_section = config.get("input") or {}
+            parsed["yaml_input_data_raw"] = input_section
+            parsed["yaml_input_data"] = inputs = []
 
-            for name, input_config in config["input"].items():
+            for name, input_config in input_section.items():
                 if not isinstance(input_config, dict):
                     continue
 
@@ -85,16 +96,15 @@ class YamlParser:
                 else:
                     continue
 
-                self.yaml_input_data.append(input_data)
+                inputs.append(input_data)
 
         if "metadata" in config:
-            self.metadata = config["metadata"]
+            parsed["metadata"] = config["metadata"]
 
-        output_section = config.get("output", {})
+        output_section = config.get("output") or {}
         if isinstance(output_section.get("streams"), dict):
-            self.yaml_streams_data = output_section["streams"]
-        else:
-            self.yaml_streams_data = {}
+            parsed["yaml_streams_data"] = output_section["streams"]
+        return parsed
 
     def _print_parsed_data(self):
         """Print all parsed data for debugging. Lines with nothing meaningful
@@ -206,9 +216,12 @@ class YamlParser:
         if not self.yaml_data:
             return "<pre></pre>"
 
-        raw = yaml.dump(self.yaml_data, default_flow_style=False, allow_unicode=True)
-        if raw.startswith("---\n"):
-            raw = raw[4:]
+        if self.yaml_text is not None and yaml.safe_load(self.yaml_text) == self.yaml_data:
+            raw = self.yaml_text  # unchanged since it was loaded: keep its comments and key order
+        else:
+            raw = yaml.dump(self.yaml_data, default_flow_style=False, allow_unicode=True)
+            if raw.startswith("---\n"):
+                raw = raw[4:]
 
         highlighted_lines = [
             self.highlight_yaml_syntax_line(line) for line in raw.splitlines()
@@ -226,28 +239,36 @@ class YamlParser:
     # File I/O helpers (unchanged)
     # ------------------------------------------------------------------
 
-    def save_yaml_file(self, file_path=None, data:str = None):
-        """Save the current YAML data to a file"""
+    def save_yaml_file(self, file_path=None, data=None):
+        """Save the current YAML data (or ``data``: a dict is dumped, a string is written as is) to a file, atomically."""
         if file_path is None:
             file_path = self.current_config
         if not file_path:
             logger.warning("No file path specified for saving")
             return False
 
+        if data is None:
+            data = self.yaml_data
+        tmp = f"{file_path}.tmp"
         try:
-            with open(file_path, "w") as f:
-                yaml.dump(data if data is not None else self.yaml_data, f, default_flow_style=False)
+            with open(tmp, "w") as f:
+                if isinstance(data, str):
+                    f.write(data)
+                else:
+                    yaml.dump(data, f, default_flow_style=False)
+            os.replace(tmp, file_path)
             logger.info(f"YAML file saved successfully: {file_path}")
             return True
         except Exception as e:
             logger.error(f"Error saving YAML file: {e}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
             return False
 
     def load_from_yaml_string(self, yaml_string):
         """Load YAML data from a string (used for editing)"""
         try:
-            self.yaml_data = yaml.safe_load(yaml_string)
-            self._retrieve_all_parameters()
+            self._load(yaml_string)
             return True
         except Exception as e:
             logger.error(f"Error parsing YAML string: {e}")
@@ -295,7 +316,7 @@ class YamlParser:
         """
         if not self.yaml_data:
             return {}
-        output_section = self.yaml_data.get("config", {}).get("output", {})
+        output_section = (self.yaml_data.get("config") or {}).get("output") or {}
         return {
             key: value
             for key, value in output_section.items()

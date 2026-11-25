@@ -44,3 +44,15 @@ def test_check_warnings_do_not_block_loading(page, tmp_path):
     page.signal_manager.config_loaded.connect(loaded.append)
     page.load_config_path(str(path))
     assert loaded and any(kind == "warning" and "not defined" in args[0] for kind, args in page.boxes)
+
+
+def test_save_writes_the_text_as_typed(page, tmp_path):
+    path = tmp_path / "c.yaml"
+    text = "# my config\nconfig:\n  recording_frequency: 10  # Hz\n  dataset_name: d\n  input: {}\n  output: {}\n"
+    path.write_text(text)
+    page.load_config_path(str(path))
+    edited = text.replace("dataset_name: d", "dataset_name: e")
+    page.ui.txt_config_display.setPlainText(edited)
+    page.save_config_file()
+    assert path.read_text() == edited  # comments and key order (recording_frequency before dataset_name) kept
+    assert "# my config" in page.ui.txt_config_display.toPlainText()

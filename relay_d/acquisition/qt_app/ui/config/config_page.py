@@ -253,7 +253,7 @@ class ConfigPage:
                     logger.error(message)
                     CustomMessageBox.error(message)
                     return
-                if self.yaml_parser.save_yaml_file():
+                if self.yaml_parser.save_yaml_file(data=yaml_text):  # as typed: keeps comments and key order
                     logger.info(
                         f"Config file saved successfully to {self.yaml_parser.current_config}"
                     )

@@ -89,3 +89,17 @@ def test_node_runs_in_its_own_process_group_and_stop_still_reaches_it(page, monk
     page.stop()
     assert _wait(lambda: not page.is_running())
     assert page.proc.exitCode() == 0 and "safe stop sent" in page.log.toPlainText()
+
+
+def test_rate_accepts_only_a_dot_decimal_whatever_the_system_locale(qapp):
+    from PyQt5.QtCore import QLocale
+
+    QLocale.setDefault(QLocale(QLocale.Portuguese, QLocale.Portugal))  # "12,5" there
+    try:
+        p = rp.RunPage(SimpleNamespace(page_run=QWidget()))
+        for text, ok in (("12.5", True), ("12,5", False), ("1,000", False)):
+            p.edit_hz.setText(text)
+            assert p.edit_hz.hasAcceptableInput() is ok, text
+        p.shutdown()
+    finally:
+        QLocale.setDefault(QLocale.c())

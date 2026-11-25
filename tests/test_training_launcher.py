@@ -167,6 +167,28 @@ def test_running_run_can_be_stopped(folder, tmp_path):
     assert not os.path.exists(f"/proc/{pid}") or b"run.sh" not in open(f"/proc/{pid}/cmdline", "rb").read()
 
 
+def test_stopping_a_starting_run_waits_for_its_pid(folder, tmp_path):
+    """Stop on a run whose terminal has not written ``pid`` yet must not report it stopped while it starts later."""
+    import subprocess
+    import threading
+
+    run_dir = folder / "training_runs" / "r"
+    run_dir.mkdir(parents=True)
+    script = run_dir / "run.sh"
+    script.write_text("echo $$ > pid\nsleep 60\n")
+    assert runs.stop(run_dir, grace=0.3) is False  # no pid within grace: it may still start
+    assert not (run_dir / "exit_code").exists()
+    late = threading.Timer(0.5, lambda: subprocess.Popen(["bash", str(script)], cwd=run_dir, start_new_session=True))
+    late.start()
+    assert runs.stop(run_dir, grace=5) is True  # the pid appeared within grace: stopped as usual
+    assert (run_dir / "exit_code").read_text().strip() == "143"
+
+
+def test_a_reused_pid_is_not_the_run(tmp_path):
+    (tmp_path / "pid").write_text(str(os.getpid()))  # after a reboot the pid belongs to some other process
+    assert runs._status(tmp_path, {}) == runs.STOPPED
+
+
 def test_start_validates_before_creating_anything(folder):
     with pytest.raises(TrainingError):
         launcher.start(TrainJob(_robomimic(folder), "py", "bc_rnn_gmm", {"epochs": -1}), terminal=False)
@@ -268,7 +290,7 @@ def test_ctrl_c_in_the_training_window_ends_the_run_and_closes_the_window(folder
     assert wait_until(lambda: runs.read_run(run_dir).status == runs.RUNNING)
     pid = int((run_dir / "pid").read_text())
     os.killpg(os.getpgid(pid), signal.SIGINT)  # what the terminal does for Ctrl+C
-    assert wait_until(lambda: not runs._alive(pid), seconds=5)  # the script exited by itself: no "Press Enter" wait
+    assert wait_until(lambda: not runs._alive(run_dir, pid), seconds=5)  # the script exited by itself: no "Press Enter" wait
     assert (run_dir / "exit_code").read_text().strip() == "130"
     assert runs.read_run(run_dir).status == runs.STOPPED
 
@@ -335,5 +357,5 @@ def test_ctrl_c_keeps_the_trainings_last_output_in_the_log(folder, tmp_path):
     assert wait_until(lambda: runs.read_run(run_dir).status == runs.RUNNING)
     pid = int((run_dir / "pid").read_text())
     os.killpg(os.getpgid(pid), signal.SIGINT)
-    assert wait_until(lambda: not runs._alive(pid), seconds=5)
+    assert wait_until(lambda: not runs._alive(run_dir, pid), seconds=5)
     assert "saved-final-checkpoint" in (run_dir / "train.log").read_text()

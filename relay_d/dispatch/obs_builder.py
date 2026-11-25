@@ -11,8 +11,6 @@ A custom `tf_topic` that cannot be subscribed to, or never produces its
 transform, raises TfTopicSubscriptionError; it never falls back to /tf silently.
 """
 
-import operator
-import re
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -27,34 +25,18 @@ from rosidl_runtime_py.utilities import get_message
 from relay_d.utils.config_loader import load_yaml_config
 from relay_d.utils.numerics import (
     enriched_tf,
+    entry_inputs,
+    evaluate_entries,
     inputs_in_sync,
+    parse_spec,
     quat_to_euler,
-    read_scalar,
     select_joints,
     stamp_to_sec,
     stream_entry,
-    strip_trig,
 )
 from relay_d.utils.qos import subscription_qos
 from relay_d.utils.ros_media_codec import decode_image, decode_organized_pointcloud
-from relay_d.utils.tf_topic import _TfTopicListener, get_or_create_tf_buffer
-
-
-# ---------------------------------------------------------------------------
-# Spec parsing helpers
-# ---------------------------------------------------------------------------
-
-_BIN_OPS = {
-    "+": operator.add,
-    "-": operator.sub,
-    "*": operator.mul,
-    "/": operator.truediv,
-}
-
-# "<spec> <op> <spec>" — whitespace around the operator is REQUIRED, which is
-# what keeps this from matching ordinary dotted field paths (they never
-# contain whitespace).
-_BINOP_RE = re.compile(r"^(.+?)\s+([+\-*/])\s+(.+)$")
+from relay_d.utils.tf_topic import get_or_create_tf_buffer
 
 
 # ---------------------------------------------------------------------------
@@ -69,16 +51,7 @@ class _JointStateView:
         self.name, self.position, self.velocity, self.effort = select_joints(msg, set(joint_names))
 
 
-# ---------------------------------------------------------------------------
-# Extractor tuple: (input_name, payload, is_slice, math_op)
-#
-#   normal   : (input_name,  attrgetter,    is_slice, math_op | None)
-#   zero-fill: ("__zero__",  zero_count,    False,    None)
-#   binary op: ("__binop__", binop_payload, False,    outer_math_op | None)
-#
-# binop_payload = (raw_spec, l_input, l_getter, l_math_op,
-#                  op_func, r_input, r_getter, r_math_op)
-# ---------------------------------------------------------------------------
+# Extractor tuple (input_name, payload, is_slice, math_op): see numerics.parse_spec
 _Entry = Tuple[str, Any, bool, Any]
 
 
@@ -152,10 +125,9 @@ class ObsBuilder(Node):
         # TF — one Buffer per distinct (tf_topic, tf_static_topic) pair
         # referenced by config.input, keyed the same way as the acquisition
         # side (relay_d.utils.tf_topic). Inputs that don't set tf_topic /
-        # tf_static_topic default to the standard /tf, /tf_static pair,
-        # which uses the same listener class (with the stale-stamp filter) below. A TF input
-        # that DOES configure a custom pair goes through
-        # get_or_create_tf_buffer, which raises TfTopicSubscriptionError
+        # tf_static_topic default to the standard /tf, /tf_static pair. Every
+        # pair is created by get_or_create_tf_buffer (one listener class, with
+        # the stale-stamp filter), which for a custom pair raises TfTopicSubscriptionError
         # (uncaught here — crashes node startup) if that custom topic can't
         # be subscribed to. This is deliberate: a broken custom tf_topic
         # must never silently fall back to reading the default /tf tree.
@@ -164,24 +136,18 @@ class ObsBuilder(Node):
         self._DEFAULT_TF_KEY = ("/tf", "/tf_static")
         self._tf_input_buffer: Dict[str, Buffer] = {}
 
-        if self._tf_inputs:
-            self._tf_buffer = Buffer()
-            self._tf_listener = _TfTopicListener(self._tf_buffer, self, *self._DEFAULT_TF_KEY)
-            self._tf_buffers[self._DEFAULT_TF_KEY] = self._tf_buffer
-            self._tf_listeners[self._DEFAULT_TF_KEY] = self._tf_listener
-
-            for name in self._tf_inputs:
-                spec = self._input_cfg[name]
-                tf_topic = spec.get("tf_topic", "/tf")
-                tf_static_topic = spec.get("tf_static_topic", "/tf_static")
-                self._tf_input_buffer[name] = get_or_create_tf_buffer(
-                    self._tf_buffers,
-                    self._tf_listeners,
-                    self,
-                    tf_topic,
-                    tf_static_topic,
-                    self._DEFAULT_TF_KEY,
-                )
+        for name in self._tf_inputs:
+            spec = self._input_cfg[name]
+            tf_topic = spec.get("tf_topic", "/tf")
+            tf_static_topic = spec.get("tf_static_topic", "/tf_static")
+            self._tf_input_buffer[name] = get_or_create_tf_buffer(
+                self._tf_buffers,
+                self._tf_listeners,
+                self,
+                tf_topic,
+                tf_static_topic,
+                self._DEFAULT_TF_KEY,
+            )
 
         # Topic subscriptions (msg type auto-discovered from topic graph)
         self._pending_topics: List[Tuple[str, str]] = []
@@ -242,104 +208,17 @@ class ObsBuilder(Node):
             specs = stream_entry(stream_def)[0]
             entries: List[_Entry] = []
             for raw_spec in specs:
-                spec = raw_spec.strip()
-
-                # sin() / cos() wrapper — only when it encloses the whole spec,
-                # so "sin(a.x) - cos(b.x)" falls through to arithmetic parsing.
-                math_op, spec = strip_trig(spec)
-
-                # zero:N sentinel
-                if spec.startswith("zero:"):
-                    entries.append(("__zero__", int(spec[5:]), False, None))
-                    continue
-
-                # "<spec> <op> <spec>" arithmetic between two scalar specs
-                m = _BINOP_RE.match(spec)
-                if m is not None:
-                    entries.append(self._parse_binop(obs_name, raw_spec, m, math_op))
-                    continue
-
-                entries.append(self._parse_atomic(obs_name, raw_spec, spec, math_op))
+                try:
+                    entries.append(parse_spec(raw_spec, self._tf_inputs, self._input_cfg))
+                except ValueError as e:
+                    raise ValueError(f"obs '{obs_name}' spec '{raw_spec}': {e}. Check obs_config.yaml.") from None
 
             if rot_fmt == "rpy":
                 self._validate_rpy(obs_name, specs, entries)
 
             self._extractors[obs_name] = entries
 
-            # Real underlying inputs this obs depends on (used for the sync
-            # check). __binop__ entries expand to BOTH of their operand inputs.
-            real_inputs: set = set()
-            for inp_name, payload, _, _ in entries:
-                if inp_name == "__zero__":
-                    continue
-                if inp_name == "__binop__":
-                    real_inputs.update((payload[1], payload[5]))
-                else:
-                    real_inputs.add(inp_name)
-            self._obs_input_names[obs_name] = real_inputs
-
-    def _parse_atomic(self, obs_name: str, raw_spec: str, spec: str, math_op) -> _Entry:
-        """Parse one atomic '<input>.<field_path>' or '<input>.<field_path>[:]'.
-
-        `spec` must already have any sin()/cos() wrapper stripped (the caller
-        passes the resulting op in as `math_op`); `raw_spec` is kept only for
-        error messages.
-        """
-        if "." not in spec:
-            raise ValueError(
-                f"obs '{obs_name}' spec '{raw_spec}': '{spec}' is not a valid "
-                f"field spec — expected '<input_name>.<field_path>'."
-            )
-        dot = spec.index(".")
-        input_name = spec[:dot]
-        if input_name not in self._input_cfg:
-            raise ValueError(
-                f"obs '{obs_name}' spec '{raw_spec}' references unknown "
-                f"input '{input_name}'. Check config.input in obs_config.yaml."
-            )
-        raw_field  = spec[dot + 1:]
-        is_slice   = raw_field.endswith("[:]")
-        field_path = raw_field[:-3] if is_slice else raw_field
-
-        if any(c in field_path for c in "+-*/"):
-            raise ValueError(
-                f"obs '{obs_name}' spec '{raw_spec}': unexpected operator inside "
-                f"field path '{field_path}'. Arithmetic between two specs needs "
-                f"spaces around the operator, e.g. 'a.x - b.x'."
-            )
-
-        if input_name in self._tf_inputs:
-            field_path = "transform." + field_path
-
-        return (input_name, operator.attrgetter(field_path), is_slice, math_op)
-
-    def _parse_binop(self, obs_name: str, raw_spec: str, m, outer_op) -> _Entry:
-        """Parse '<spec> <op> <spec>' into a single-value __binop__ entry."""
-        op_func = _BIN_OPS[m.group(2)]
-
-        sides = []
-        for side_txt, label in ((m.group(1).strip(), "left"),
-                                 (m.group(3).strip(), "right")):
-            if _BINOP_RE.match(side_txt):
-                raise ValueError(
-                    f"obs '{obs_name}' spec '{raw_spec}': only one arithmetic "
-                    f"operation per spec is supported (chained expression on the "
-                    f"{label} side: '{side_txt}')."
-                )
-            side_op, side_spec = strip_trig(side_txt)
-            inp, getter, is_slice, side_op = self._parse_atomic(
-                obs_name, raw_spec, side_spec, side_op
-            )
-            if is_slice:
-                raise ValueError(
-                    f"obs '{obs_name}' spec '{raw_spec}': slice specs ('[:]') "
-                    f"cannot be arithmetic operands — arithmetic is scalar-only."
-                )
-            sides.append((inp, getter, side_op))
-
-        (l_inp, l_get, l_op), (r_inp, r_get, r_op) = sides
-        payload = (raw_spec.strip(), l_inp, l_get, l_op, op_func, r_inp, r_get, r_op)
-        return ("__binop__", payload, False, outer_op)
+            self._obs_input_names[obs_name] = entry_inputs(entries)  # for the sync check
 
     def _validate_rpy(self, obs_name: str, specs: List[str],
                        entries: List[_Entry]) -> None:
@@ -449,6 +328,8 @@ class ObsBuilder(Node):
         return decoded
 
     def _topic_callback(self, msg: Any, input_name: str) -> None:
+        if not self._is_used(input_name):
+            return  # subscribed before use_only(): the policy does not read it
         # Capture timestamp before any wrapping (e.g. _JointStateView) hides the original message's header.
         # Only a header stamp takes part in the sync check, as when recording: the node's clock next to
         # robot-clock stamps (sim time, bag replay) would hold every observation that mixes the two.
@@ -541,56 +422,12 @@ class ObsBuilder(Node):
                 self._warn_desync(obs_name, input_names, ts_snapshot)
                 continue   # sample-and-hold: leave self._latest[obs_name] untouched
 
-            row: List[float] = []
-            ok = True
-
-            for inp_name, payload, is_slice, math_op in entries:
-                if inp_name == "__zero__":
-                    row.extend([0.0] * payload)
-                    continue
-
-                if inp_name == "__binop__":
-                    (spec_txt, l_inp, l_get, l_op,
-                     op_func, r_inp, r_get, r_op) = payload
-                    l_raw = snapshot.get(l_inp)
-                    r_raw = snapshot.get(r_inp)
-                    if l_raw is None or r_raw is None:
-                        ok = False
-                        break
-                    try:
-                        v = float(op_func(read_scalar(l_get, l_raw, l_op),
-                                           read_scalar(r_get, r_raw, r_op)))
-                        row.append(float(math_op(v)) if math_op is not None else v)
-                    except Exception as exc:
-                        self.get_logger().warn(
-                            f"Extraction failed for obs '{obs_name}' spec "
-                            f"'{spec_txt}': {exc}"
-                        )
-                        ok = False
-                        break
-                    continue
-
-                raw = snapshot.get(inp_name)
-                if raw is None:
-                    ok = False
-                    break
-
-                try:
-                    val = payload(raw)   # payload is operator.attrgetter result
-                    if is_slice:
-                        vals = list(val) if hasattr(val, "__iter__") else [val]
-                        if math_op is not None:
-                            row.extend(float(math_op(v)) for v in vals)
-                        else:
-                            row.extend(float(v) for v in vals)
-                    else:
-                        row.append(read_scalar(payload, raw, math_op))
-                except Exception as exc:
-                    self.get_logger().warn(
-                        f"Extraction failed for obs '{obs_name}' input '{inp_name}': {exc}"
-                    )
-                    ok = False
-                    break
+            try:
+                row = evaluate_entries(entries, snapshot.get)
+            except Exception as exc:
+                self.get_logger().warn(f"Extraction failed for obs '{obs_name}': {exc}", throttle_duration_sec=5.0)
+                row = None
+            ok = row is not None
 
             if ok and self._rotation_format.get(obs_name) == "rpy":
                 # 4 raw quaternion floats -> (roll, pitch, yaw); a zero / NaN quaternion gives NaN, which the
@@ -649,14 +486,21 @@ class ObsBuilder(Node):
             return {k: v.copy() for k, v in self._latest.items()}
 
     def use_only(self, obs_keys) -> None:
-        """Limit validate_inputs() and get_input_ages() to the inputs behind these observations (the policy's):
-        obs_config lists every recorded stream, and an unused one that is not published must not stop the robot."""
+        """Limit the node to the inputs behind these observations (the policy's): obs_config lists every recorded
+        stream, and an unused one must not stop the robot when not published, nor be decoded / looked up every tick.
+        Call after reading low_dim_obs_names, which then lists only the used observations."""
+        keys = set(obs_keys)
         used = set()
-        for k in obs_keys:
+        for k in keys:
             used |= self._obs_input_names.get(k, set())
             if k in self._passthrough_obs:
                 used.add(self._passthrough_obs[k])
         self._used_inputs = used
+        self._extractors = {k: v for k, v in self._extractors.items() if k in keys}
+        self._passthrough_obs = {k: v for k, v in self._passthrough_obs.items() if k in keys}
+        self._passthrough_sources &= used
+        self._tf_inputs &= used
+        self._pending_topics = [p for p in self._pending_topics if p[0] in used]
 
     def _is_used(self, input_name: str) -> bool:
         return self._used_inputs is None or input_name in self._used_inputs

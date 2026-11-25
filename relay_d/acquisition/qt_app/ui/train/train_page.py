@@ -37,12 +37,12 @@ from ..page_style import add_page_header, page_layout
 from ..settings.config_manager import config
 
 _REFRESH_MS = 2000  # run table refresh
+SAVED_POLICY = "saved robomimic_config.json"
 
 
 class TrainPage:
-    def __init__(self, ui_instance, settings_page=None):
+    def __init__(self, ui_instance):
         self.ui = ui_instance
-        self.settings_page = settings_page
         self.datasets = []
         self.folder = ""
         self._param_widgets = {}
@@ -152,7 +152,7 @@ class TrainPage:
     # ------------------------------------------------------------------ dataset
 
     def choose_folder(self):
-        start = self.folder or config.get("hdf5_save_folder") or os.path.expanduser("~")
+        start = self.folder or user_settings.get("hdf5_save_folder") or os.path.expanduser("~")
         folder = QFileDialog.getExistingDirectory(self.ui, "Choose the dataset folder", start)
         if folder:
             self.load_folder(folder)
@@ -184,6 +184,8 @@ class TrainPage:
         self.combo_policy.clear()
         if ds is not None:
             if ds.format == launcher.ROBOMIMIC:
+                if (ds.base / "robomimic_config.json").exists():  # the default of relay-d-train without --policy, too
+                    self.combo_policy.addItem(SAVED_POLICY)
                 self.combo_policy.addItems(launcher.ROBOMIMIC_POLICIES)
             else:
                 self.combo_policy.addItems(launcher.LEROBOT_POLICIES)
@@ -210,7 +212,7 @@ class TrainPage:
 
     def _policy(self):
         text = self.combo_policy.currentText()
-        return text or None
+        return None if text == SAVED_POLICY else text or None  # None: the folder's saved robomimic_config.json
 
     def _on_policy_changed(self):
         for widget, label in self._param_widgets.values():

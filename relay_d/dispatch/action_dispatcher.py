@@ -216,6 +216,7 @@ class ActionDispatcher:
         self._stopped = True  # nothing commanded yet, so there is nothing to stop (see send_stop)
         self._goals = []  # (name, accepted goal handle; None in a dry run) since the last stop: send_stop cancels them
         self._goals_lock = threading.Lock()  # goals are accepted on the executor thread
+        self._not_ready_warned = set()  # action entries whose server was not ready (warned once)
 
         # feedback: -- opt-in ack-wait for topic entries (see _wait_for_ack)
         self._ack_latest: Dict[str, Any] = {}
@@ -235,6 +236,12 @@ class ActionDispatcher:
             if "limits" in cfg and len(cfg["limits"]) not in (1, len(cfg["indices"])):
                 raise ValueError(f"[ActionDispatcher] '{name}': 'limits' needs 1 entry or one per index "
                                  f"({len(cfg['indices'])}), got {len(cfg['limits'])}.")
+            for lim in cfg.get("limits") or []:  # a swapped pair would clamp every value to upper_lim
+                if lim is not None and (not isinstance(lim, dict) or lim.get("lower_lim") is None
+                                        or lim.get("upper_lim") is None
+                                        or float(lim["lower_lim"]) > float(lim["upper_lim"])):
+                    raise ValueError(f"[ActionDispatcher] '{name}': each 'limits' entry needs "
+                                     f"lower_lim <= upper_lim, got {lim!r}.")
             if cfg.get("action", False):
                 if "action_type" not in cfg:
                     raise ValueError(
@@ -535,10 +542,11 @@ class ActionDispatcher:
         if not self._dry_run:
             client = self._action_clients[name]
             if not client.server_is_ready():
-                logger.warning(
-                    f"[ActionDispatcher] Action server '{cfg['topic']}' not ready, skipping."
-                )
+                if name not in self._not_ready_warned:  # retried every tick: warn once until it is ready
+                    self._not_ready_warned.add(name)
+                    logger.warning(f"[ActionDispatcher] Action server '{cfg['topic']}' not ready, skipping.")
                 return False
+            self._not_ready_warned.discard(name)
 
         goal = self._goal_classes[name]()
 

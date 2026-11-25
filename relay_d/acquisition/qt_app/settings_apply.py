@@ -1,14 +1,8 @@
 """How the app start-up and live changes use the user settings. Pure functions (no Qt, no ROS), so they are tested."""
 
-from typing import Mapping, Optional
+from typing import Mapping
 
 _PAGES = ("start", "data", "review", "train", "import", "settings")
-
-
-def ros_domain_to_set(settings: Mapping, environ: Mapping) -> Optional[str]:
-    """Value for ROS_DOMAIN_ID, or None to leave it alone (-1 in the settings, or already set in the environment)."""
-    domain = int(settings.get("ros_domain_id", -1))
-    return str(domain) if domain >= 0 and "ROS_DOMAIN_ID" not in environ else None
 
 
 def startup_page(settings: Mapping) -> str:

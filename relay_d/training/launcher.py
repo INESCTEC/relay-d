@@ -60,6 +60,9 @@ _LEROBOT_SAVE_EVERY = 20_000
 _LEROBOT_LR = {"act": 1e-5, "diffusion": 1e-4, "smolvla": 1e-4}
 # Fine-tuned from a pretrained model on the Hugging Face Hub (downloaded on the first run) instead of trained from scratch,
 # with the camera names that model was trained with: the dataset's cameras are renamed to them, in order.
+# shortcut: not pinned to a Hub revision (trained with lerobot/smolvla_base@5e8d12a6e2975b0e5e5fce7c8caf47c371d257b6);
+# lerobot 0.6.1 reads --policy.path's config.json from main and applies --policy.pretrained_revision only to the weights,
+# so a pin would mix revisions. Pin both when lerobot passes the revision to the config too.
 _LEROBOT_PRETRAINED = {"smolvla": ("lerobot/smolvla_base", ["observation.images.camera1", "observation.images.camera2",
                                                             "observation.images.camera3"])}
 _LEROBOT_MODULE = "lerobot.scripts.lerobot_train"
@@ -387,9 +390,18 @@ def _open_terminal(candidates: List[List[str]]) -> Optional[str]:
     return None
 
 
+def script_alive(pid: int, script: Path) -> bool:
+    """True if ``pid`` is still ``bash <script>`` (a pid reused after a reboot is not; a zombie's cmdline is empty)."""
+    try:
+        return str(Path(script).resolve()).encode() in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except OSError:
+        return False
+
+
 def run_script(script: Path, title: str, terminal: bool = True) -> Optional[str]:
     """Run ``bash script`` in its own terminal window, else detached in the background (no display, no working terminal,
     or ``terminal`` False). Returns the terminal's name, or None for the background. Raises OSError if bash cannot start."""
+    script = Path(script).resolve()  # absolute, so ``script_alive`` can find it in the process's command line
     opened = _open_terminal(_terminal_candidates(title, ["bash", str(script)])) if terminal else None
     if opened is None:
         subprocess.Popen(["bash", str(script)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,

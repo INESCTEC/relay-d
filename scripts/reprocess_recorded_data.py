@@ -8,6 +8,7 @@ from builtin_interfaces.msg import Time
 from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser
 from relay_d.acquisition.qt_app.ui.review.demo_playback_reconstructor import DemoPlaybackReader
 from relay_d.acquisition.qt_app.utils.stream_builder import StreamBuilder
+from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 
 # Header stamps aren't read by any stream spec — a zeroed dummy is enough.
@@ -109,7 +110,7 @@ class ReprocessRecordedData:
                 streams_grp = dst_demo_group.create_group("streams")
                 for stream_name, arr in new_streams.items():
                     streams_grp.create_dataset(
-                        stream_name, data=arr, compression="gzip", compression_opts=4
+                        stream_name, data=arr, **user_settings.h5_compression()
                     )
                     logger.info(f"Rebuilt stream '{stream_name}' in {h5_path}: shape {arr.shape}")
         except Exception:

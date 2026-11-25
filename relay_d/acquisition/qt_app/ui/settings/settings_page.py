@@ -178,4 +178,4 @@ class SettingsPage:
 
     # Used by other pages
     def get_hdf5_save_folder(self):
-        return config.get("hdf5_save_folder", "")
+        return user_settings.get("hdf5_save_folder", "")

@@ -1,13 +1,21 @@
 """Start-up and live-change decisions of the app (the window itself needs ROS, these functions do not)."""
 
-from relay_d.acquisition.qt_app.settings_apply import live_changes, ros_domain_to_set, startup_page
+import pytest
+
+from relay_d.acquisition.qt_app.settings_apply import live_changes, startup_page
+from relay_d.utils import user_settings
 
 
-def test_ros_domain_id_only_when_set_and_not_in_the_environment():
-    assert ros_domain_to_set({"ros_domain_id": 7}, {}) == "7"
-    assert ros_domain_to_set({"ros_domain_id": 0}, {}) == "0"  # 0 is a real domain
-    assert ros_domain_to_set({"ros_domain_id": -1}, {}) is None  # -1: leave the environment alone
-    assert ros_domain_to_set({"ros_domain_id": 7}, {"ROS_DOMAIN_ID": "3"}) is None  # the environment wins
+@pytest.mark.parametrize("setting, environ, expected", [
+    (7, {}, "7"),
+    (0, {}, "0"),  # 0 is a real domain
+    (-1, {}, None),  # -1: leave the environment alone
+    (7, {"ROS_DOMAIN_ID": "3"}, "3"),  # the environment wins
+])
+def test_ros_domain_id_only_when_set_and_not_in_the_environment(monkeypatch, setting, environ, expected):
+    monkeypatch.setattr(user_settings, "get", lambda key, default=None: setting if key == "ros_domain_id" else default)
+    user_settings.apply_ros_domain(environ)
+    assert environ.get("ROS_DOMAIN_ID") == expected
 
 
 def test_startup_page_falls_back_to_help():

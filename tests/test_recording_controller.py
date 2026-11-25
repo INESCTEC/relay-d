@@ -211,6 +211,9 @@ def test_demo_saved_by_a_retry_at_start_joins_the_session(env):
     env.ui.btn_start_record.click()
     env.ui.btn_stop_record.click()
     assert env.ctrl.session_h5_files == ["/data/my_demo_0.h5", "/data/my_demo_1.h5"]
+    env.recorder.start_recording.return_value = False
+    env.ctrl.start_recording()
+    assert env.ctrl.session_h5_files == ["/data/my_demo_0.h5", "/data/my_demo_1.h5"]  # a failed Start re-added it
 
 
 def test_a_failed_recording_loop_is_reported_like_a_full_buffer(env):

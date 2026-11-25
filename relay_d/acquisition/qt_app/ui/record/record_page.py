@@ -206,10 +206,6 @@ class RecordPage:
             return 0
         return self.container_manager.restart_failed_subscribers()
 
-    def force_ui_refresh(self):
-        """Force UI refresh"""
-        self.container_manager.force_ui_refresh()
-
     def on_window_resize(self):
         """Handle window resize events"""
         self.container_manager.on_window_resize()

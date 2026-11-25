@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Start refuses to record** while an input cannot be subscribed (it was left out of the demo silently).
 
 ### Added
+- **`scripts/install.sh`: one-command install on a new PC** (Ubuntu 24.04 with ROS 2 Jazzy). Installs `relay_d` into the system Python (so any script can import it without a venv; dependencies from apt, the rest with `pip --user`, NumPy stays at ROS's 1.26) and builds the lerobot and robomimic environments in `~/.relayd/envs` (`--no-lerobot` / `--no-robomimic` to skip one).
 - **Review shows everything that was recorded.**
   - **Images:** every camera of the demo is shown side by side (raw or compressed), each in its own card titled with its name and resolution. The frame fills the card, keeps its aspect ratio and rescales with the window. One slider drives them all, with the frame number and the time since the start. Before, only the first camera was shown.
   - **Every other recorded dataset gets its own channel too:**
@@ -75,6 +76,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The app logo is a small PNG (11 KB instead of 3.9 MB), so `resources_rc.py` shrinks by about 250k lines; duplicate icon entries are removed from `resources.qrc`.
 
 ### Fixed
+- **Recording:** an input that stops publishing mid-demo (a dead camera) now counts as gap-filled once it repeats past the stale input limit (`infer_max_obs_age_s`), for every input, so the after-recording check warns / fails; before, the demo passed with frozen frames. A failed close of the demo file sets it aside as `.partial` instead of leaving a possibly corrupt `.h5` in place. A JointState missing a configured joint holds the last full row (as live inference does) instead of recording a narrower one; stream rows stay aligned if evaluation fails half way.
+- **AppAPI / Record:** a demo saved by a retry at Start is added to the session once (a later failed Start added it again, so it was converted twice); the converter also drops duplicate input files.
+- **Training:** Stop on a run that is still starting waits for it to start and then stops it (before, it reported success and training ran to the end). A process id reused after a reboot no longer reads as a running environment setup or training run.
+- **Config page:** a config that fails to load leaves the previous one untouched (empty `input:` / `output:` sections now load); Save keeps comments and key order and writes atomically.
+- **Run tab:** the rate field accepts only `12.5` (not `12,5` or `1,000`) whatever the system's number format, so `--hz` no longer fails.
+- **Inference:** `limits` with `lower_lim > upper_lim` or a missing bound are refused at startup (they pinned the joint to one value). Inputs the policy does not read are no longer decoded each tick; no default `/tf` listener when every TF input uses its own topic. `InferenceSession.close()` shuts rclpy down only if the session started it. Per-tick extraction and "action server not ready" warnings are throttled.
+- **Environments:** the robomimic environment pins torch 2.14.1 / torchvision 0.29.1 and its other dependencies to the versions it is tested with. `scripts/install.sh` also installs `python3-pyqt5.qtmultimedia` (without it no GUI page loads), rviz2, robot_state_publisher and sensor_msgs_py, and refuses to start while the GUI is building the same environment.
+- **AppAPI and the CLIs behave like the GUI:**
+  - `AppAPI.start_recording()` during a recording is refused before touching the subscriptions (it re-subscribed every input of the running demo); `initialize()` during a recording is refused, as the Config page does.
+  - `AppAPI.initialize(path)` also switches the conversion config (it kept converting with the first one); a config that cannot convert leaves the previous one in place.
+  - `AppAPI(config)` raises `ValueError` when the config is rejected (it returned an object that could not record); `delete_demo()` accepts a relative path.
+  - The `ros_domain_id` setting applies to AppAPI, `lfd-inference-node` and `InferenceSession` too (it only applied to the GUI); an environment `ROS_DOMAIN_ID` still wins.
+  - `relay-d-train` checks the Python environment before starting, as the Train tab does (it said "Started" and the run then failed).
+  - Train tab: a folder with a saved `robomimic_config.json` offers it as the first policy, the default of `relay-d-train` without `--policy` (the tab always used `bc_rnn_gmm`).
 - **Inference sync under sim time / bag replay:** a message without a header (and a chain of only static transforms) took the node's clock as its time, next to the robot-clock stamps of the other inputs, so every observation mixing them was held and pre-flight failed. Only header stamps take part in the sync check now, as when recording.
 - **Inference:** a goal rejected after it timed out no longer makes a newer goal resend (and pre-empt itself); a zero or NaN quaternion on an `rpy` observation holds the last value (and goes stale) instead of feeding NaN to the policy.
 - **Conversion:** a file that cannot be read is named in the summary ("Converted 3 of 3 demos" hid a whole missing file); a non-integer `recording_frequency` is refused for LeRobot instead of rounded (7.5 Hz played 6.7% fast).

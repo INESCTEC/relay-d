@@ -9,7 +9,7 @@ import shutil
 import signal
 import sys
 
-from PyQt5.QtCore import QProcess, QProcessEnvironment, QTimer
+from PyQt5.QtCore import QLocale, QProcess, QProcessEnvironment, QTimer
 from PyQt5.QtGui import QDoubleValidator
 from PyQt5.QtWidgets import (
     QCheckBox,
@@ -106,7 +106,10 @@ class RunPage:
         self.combo_device.setCurrentText(user_settings.get("infer_device"))
         form.addRow("Device", self.combo_device)
         self.edit_hz = QLineEdit()
-        self.edit_hz.setValidator(QDoubleValidator(0.0, 1000.0, 3))
+        hz_validator, c_locale = QDoubleValidator(0.0, 1000.0, 3), QLocale.c()
+        c_locale.setNumberOptions(QLocale.RejectGroupSeparator)  # the node's argparse reads "12.5", never "12,5" or "1,000"
+        hz_validator.setLocale(c_locale)
+        self.edit_hz.setValidator(hz_validator)
         self.edit_hz.setPlaceholderText("blank: the rate the policy was trained at")
         form.addRow("Rate (Hz)", self.edit_hz)
         self.check_dry_run = QCheckBox("Dry run (log commands, move nothing)")
