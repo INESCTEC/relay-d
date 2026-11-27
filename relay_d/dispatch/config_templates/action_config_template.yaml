@@ -46,10 +46,35 @@
 #                                                values fed straight to mapping (no limits, no transform). An action
 #                                                entry cannot have one: at the same moments its still-active goal is cancelled.
 #
+#   joint_names       list[str]      the joint each index drives (as in the robot's JointState), in index order; needed by
+#                                                max_step and trajectory. null for an index that is no joint (e.g. a gripper command).
+#   max_step          float | list   optional, with joint_names.  each command stays within +- max_step of the robot's
+#                                                MEASURED position (rad or m per tick, 1 value or one per index), like LeRobot's
+#                                                max_relative_target: no jump bigger than that, whatever limits allows. Without a
+#                                                fresh measured position (infer_max_obs_age_s) nothing is sent. For absolute targets;
+#                                                for deltas use limits.
+#   state_topic       str            optional.  JointState topic of the measured position (default /joint_states)
+#
 #   -- then pick exactly ONE dispatch method --
 #   topic + msg_type                        METHOD 1.  ROS2 publisher, published every tick; needs `mapping`
 #   action: true + action_type + topic      METHOD 2.  ROS2 ActionClient; needs `mapping`
 #                                                       (action_type is "pkg/action/Name", topic is the action's name)
+#                                                       Without feedback it sends a new goal every tick that
+#                                                       preempts the last: fine for discrete moves, not for
+#                                                       streaming a policy (use METHOD 3). Nested arrays such as
+#                                                       control_msgs/FollowJointTrajectory's trajectory.points can be
+#                                                       pre-allocated in goal_init ("trajectory.points: 1").
+#   trajectory: true + topic + joint_names  METHOD 3.  trajectory_msgs/JointTrajectory to a ros2_control
+#                                                       joint_trajectory_controller (e.g. ur_robot_driver over RTDE, or
+#                                                       lbr_fri_ros2_stack over FRI), which interpolates at its own rate.
+#                                                       A LeRobot ACT policy sends its whole chunk once every
+#                                                       n_action_steps ticks; other policies one point per tick. No
+#                                                       mapping / stop: its stop holds the measured position. See
+#                                                       ARM_TRAJECTORY below.
+#                                                       max_step bounds each point's distance from the previous
+#                                                       (position per tick); the controller's interpolation can run
+#                                                       ~10 % faster within a tick: hard velocity caps belong to the
+#                                                       driver / robot controller.
 #
 #   mapping           dict           both.  field_path (dot/bracket) -> slice index, or list of indices
 #   goal_init         dict           both.  pre-populate literal/static fields + pre-allocate arrays first
@@ -89,6 +114,15 @@
 #                                                  only ever signals completion through feedback ticks).
 # =============================================================================
 
+# ARM_TRAJECTORY (METHOD 3), e.g. for a ros2_control arm:
+#   arm_trajectory:
+#     indices: [0, 1, 2, 3, 4, 5]
+#     trajectory: true
+#     topic: /scaled_joint_trajectory_controller/joint_trajectory
+#     joint_names: [shoulder_pan_joint, shoulder_lift_joint, elbow_joint, wrist_1_joint, wrist_2_joint, wrist_3_joint]
+#     max_step: 0.05                      # rad per tick: at 20 Hz at most 1 rad/s
+#     limits: [{lower_lim: -6.28, upper_lim: 6.28}]
+
 actions:
 
   # Example: the same arm commanded with an end-effector pose instead of joints.
@@ -119,7 +153,10 @@ actions:
 
   move_arm_joint:
     indices: [0, 1, 2, 3, 4, 5, 6]        # 7 iiwa joint positions (or deltas)
-    # limits: (optional) clamp each joint value or delta, real units, e.g. [{lower_lim: -0.05, upper_lim: 0.05}]
+    stop: [0, 0, 0, 0, 0, 0, 0]           # sent once when inference stops: zero deltas hold the arm where it is.
+                                          # With use_delta: false these would be joint POSITIONS: change or remove it.
+    # limits: clamp each joint value or delta, real units. Set them for your robot, e.g. for deltas
+    #   [{lower_lim: -0.05, upper_lim: 0.05}] (never that for absolute positions: it would pull every joint to ~0).
     msg_type: kuka_iiwa_arm_sim_interface/msg/ArmCommand
     topic: /kuka_iiwa_arm_interface/streaming_command
     goal_init:

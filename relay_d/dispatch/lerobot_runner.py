@@ -125,6 +125,16 @@ def build_batch(obs: Dict[str, np.ndarray], state_keys: List[str], images: Dict[
     return batch
 
 
+def chunk_steps(cfg) -> int:
+    """Actions executed from one predicted chunk (n_action_steps) when that chunk is exactly what select_action would
+    run, so it can be sent whole as a trajectory; 0 otherwise (one action per tick)."""
+    # shortcut: ACT only (its select_action is predict_action_chunk()[:n_action_steps]); Diffusion / SmolVLA keep an
+    # observation history inside select_action, add them once their chunk can be read with that history.
+    if getattr(cfg, "type", None) != "act" or getattr(cfg, "temporal_ensemble_coeff", None) is not None:
+        return 0
+    return int(getattr(cfg, "n_action_steps", 0) or 0)
+
+
 class LeRobotPolicyRunner:
     """Runs a LeRobot policy checkpoint on ObsBuilder's observations."""
 
@@ -160,6 +170,7 @@ class LeRobotPolicyRunner:
         cfg.device = device
         self._policy = get_policy_class(cfg.type).from_pretrained(str(folder), config=cfg)
         self._policy.eval()
+        self.chunk_steps = chunk_steps(cfg)
         self._pre, self._post = make_pre_post_processors(
             policy_cfg=cfg, pretrained_path=str(folder), preprocessor_overrides={"device_processor": {"device": device}}
         )
@@ -226,6 +237,21 @@ class LeRobotPolicyRunner:
         self._post.reset()
 
     def get_action(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
+        tensors = self._tensors(obs_dict)
+        with self._torch.no_grad():
+            action = self._post(self._policy.select_action(self._pre(tensors)))
+        return action.detach().cpu().numpy().astype(np.float32).reshape(-1)
+
+    def get_action_chunk(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
+        """The policy's whole predicted chunk (steps x action size), un-normalized one step at a time: sent as one
+        trajectory, the robot's controller interpolates it. Only when ``chunk_steps`` > 0."""
+        tensors = self._tensors(obs_dict)
+        with self._torch.no_grad():
+            chunk = self._policy.predict_action_chunk(self._pre(tensors))  # (1, steps, action)
+            steps = [self._post(chunk[:, i]) for i in range(chunk.shape[1])]
+        return np.stack([a.detach().cpu().numpy().reshape(-1) for a in steps]).astype(np.float32)
+
+    def _tensors(self, obs_dict: Dict[str, np.ndarray]) -> dict:
         batch = build_batch(obs_dict, self.state_keys, self._images, self.task)
         if self._state_dim and batch[STATE].shape[0] != self._state_dim:
             widths = {k: int(np.asarray(obs_dict[k]).size) for k in self.state_keys}
@@ -233,7 +259,4 @@ class LeRobotPolicyRunner:
                 f"[LeRobotPolicyRunner] {STATE} has {batch[STATE].shape[0]} values {widths}, the policy expects {self._state_dim}. "
                 "Check the observations (or --state-keys) against the dataset the policy was trained on."
             )
-        tensors = {k: v if isinstance(v, str) else self._torch.from_numpy(v) for k, v in batch.items()}
-        with self._torch.no_grad():
-            action = self._post(self._policy.select_action(self._pre(tensors)))
-        return action.detach().cpu().numpy().astype(np.float32).reshape(-1)
+        return {k: v if isinstance(v, str) else self._torch.from_numpy(v) for k, v in batch.items()}

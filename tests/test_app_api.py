@@ -245,3 +245,22 @@ def test_a_rejected_config_raises_and_releases_ros(monkeypatch):
     with pytest.raises(ValueError, match="Config rejected"):
         mod.AppAPI("cfg.yaml")  # the GUI shows an error dialog; this returned a half-made object
     assert calls == ["init", "close", "shutdown"]
+
+
+@pytest.mark.parametrize("flag", ["buffer_full", "loop_failed"])
+def test_stop_reports_a_demo_whose_sampling_stopped_early(tmp_path, flag):
+    """The GUI shows a dialog when sampling stops early; a script only had a log line and a True."""
+    api = _recording_api()
+    api.initialize("cfg.yaml")
+    api._validator = SimpleNamespace(validate=lambda path: SimpleNamespace(checks=[]))
+    saved = tmp_path / "stack_1.h5"
+    saved.write_bytes(b"x")
+    api._data_recorder.h5_file_path = str(saved)
+    api._data_recorder.buffer_full = api._data_recorder.loop_failed = False
+    setattr(api._data_recorder, flag, True)
+    api.start_recording()
+    assert api.stop_recording() is False  # was True: the demo is shorter than the operator recorded
+    assert api._session_h5_files == [str(saved)]  # what was recorded is saved and still converted
+    setattr(api._data_recorder, flag, False)
+    api.start_recording()
+    assert api.stop_recording() is True

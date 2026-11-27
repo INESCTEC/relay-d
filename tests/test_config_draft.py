@@ -112,3 +112,19 @@ def test_shipped_acquisition_template_passes_the_check():
     # "Generate Defaults" hands this file to users: it must load without errors and turn into an obs_config inference accepts.
     path = Path(__file__).parents[1] / "relay_d/acquisition/qt_app/ui/config/templates/config_template.yaml"
     assert [str(p) for p in check_config(yaml.safe_load(path.read_text())) if p.level == ERROR] == []
+
+
+def test_a_delta_action_on_quaternion_components_is_warned_about():
+    """q[t+1] - q[t] per component is no rotation (and q, -q are the same one): only rpy deltas are angles."""
+    import copy
+
+    cfg = {"config": copy.deepcopy(DATA_CONFIG)}
+    c = cfg["config"]
+    c["input"]["tf_eef"] = {"parent_frame": "base", "child_frame": "tool"}
+    c["output"]["streams"]["eef_rot"] = [f"tf_eef.rotation.{a}" for a in "xyzw"]
+    c["actions_to_extract"] = ["robot_joint_pos", "eef_rot"]
+    c["delta_actions"] = ["eef_rot"]
+    warnings = _messages(cfg, "warning")
+    assert any("eef_rot" in m and "quaternion" in m for m in warnings)  # was silent
+    c["output"]["streams"]["eef_rot"] = {"specs": c["output"]["streams"]["eef_rot"], "rotation_format": "rpy"}
+    assert not any("quaternion" in m for m in _messages(cfg))

@@ -41,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Start refuses to record** while an input cannot be subscribed (it was left out of the demo silently).
 
 ### Added
+- **`max_step` in `action_config.yaml`:** each command stays within ±`max_step` of the robot's measured position
+  (`JointState` on `state_topic`, joints by `joint_names`), like LeRobot's `max_relative_target`; without a fresh measured
+  position nothing is sent. `limits` only clamped absolute values, so a 1 rad jump inside them went out.
+- **Trajectory outputs (`trajectory: true`):** `trajectory_msgs/JointTrajectory` for a `ros2_control`
+  `joint_trajectory_controller`, which interpolates at its own rate (RTDE, FRI). A LeRobot ACT policy sends its whole
+  chunk once every `n_action_steps` ticks (`LeRobotPolicyRunner.get_action_chunk`, the same actions `select_action`
+  runs); other policies one point per tick. Their stop holds the measured position.
 - **`scripts/install.sh`: one-command install on a new PC** (Ubuntu 24.04 with ROS 2 Jazzy). Installs `relay_d` into the system Python (so any script can import it without a venv; dependencies from apt, the rest with `pip --user`, NumPy stays at ROS's 1.26) and builds the lerobot and robomimic environments in `~/.relayd/envs` (`--no-lerobot` / `--no-robomimic` to skip one).
 - **Review shows everything that was recorded.**
   - **Images:** every camera of the demo is shown side by side (raw or compressed), each in its own card titled with its name and resolution. The frame fills the card, keeps its aspect ratio and rescales with the window. One slider drives them all, with the frame number and the time since the start. Before, only the first camera was shown.
@@ -63,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   command (ACT and SmolVLA), and `LeRobotPolicyRunner` runs the checkpoint, with state and action normalized by the dataset's own stats.
 
 ### Changed
+- **Demos missing an observation, or with another width, are skipped** (robomimic and LeRobot, pre-check included):
+  a missing numeric observation was filled with zeros, and a stream with another joint count was written as is (robomimic),
+  so training saw false observations or failed when batching. The pre-check names the demo and the reason
+  (`no <key> (observation stream)`, `'<key>' has shape (6,) per sample, other demos (4,)`). This can convert fewer demos
+  than before.
 - **Training actions are next-step targets:** an absolute action (a stream not in `delta_actions`) is the stream's value at t+1, as a delta already looked one step ahead; it was the value at t, so a state stream used as an action
   taught the policy to stand still. A stream that is both `normalize: true` and in `delta_actions` is refused (conversion and the config check): the dispatcher cannot turn a normalized delta back into real units.
 - **LeRobot policies run at their training rate:** `--hz` defaults to the dataset's fps (read through the checkpoint), and `InferenceSession.run()` warns when the rate differs (a 30 fps policy at 10 Hz played its actions 3x slower).
@@ -76,6 +88,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The app logo is a small PNG (11 KB instead of 3.9 MB), so `resources_rc.py` shrinks by about 250k lines; duplicate icon entries are removed from `resources.qrc`.
 
 ### Fixed
+- **The Run tab's STOP and Ctrl+C now send the safe stop:** STOP sent SIGINT, and rclpy's SIGINT handler shut ROS down
+  before the node could publish its stop / hold (`publisher's context is invalid`), so the robot kept its last command.
+  STOP now sends SIGTERM; the node handles SIGTERM and SIGINT alike (`signals_run_the_safe_stop`), and an
+  `InferenceSession` that starts rclpy no longer installs rclpy's signal handlers, so Ctrl+C in a script stops safely too.
+- **Action entries without `feedback` are warned about at start:** they send a new goal every tick that preempts the
+  last; a `joint_trajectory_controller` crashed under that at 20 Hz. Use a `trajectory: true` entry for continuous control.
+- **`goal_init` can pre-allocate a nested array** (`trajectory.points: 1`), so an action entry can send
+  `control_msgs/FollowJointTrajectory`, the standard arm action (`joint_trajectory_controller`, `ur_robot_driver`). Only
+  top-level arrays worked: the `1` overwrote the list and startup failed.
+- **The inference node no longer drives the robot after the GUI died:** started from the Run tab (new
+  `--exit-with-parent`), it sends the safe stop and exits when the GUI process is gone. Before, a crashed GUI left the
+  policy running with nobody able to stop it.
+- **The generated `action_config.yaml` has a `stop:`** for the arm (zero deltas: it holds where it is), and the node warns
+  at start for every output without `stop:` (its last command stays active when inference stops) or without `limits`
+  (the model's outputs go out unclamped).
+- **A crash mid-demo no longer leaves an empty `<demo>.h5`** that Review and the converters took for a demo: a demo is
+  written as `<demo>.h5.partial` and renamed once saved.
+- **An empty demo is no longer "saved":** with no sample recorded (e.g. `sync_mode: strict` dropping every tick) nothing
+  is written, Stop reports it with the reason, and the GUI says so instead of asking to check the disk. A topic with an
+  unset header stamp (0) no longer counts in the sync check, which made strict mode drop every tick.
+- **`AppAPI.stop_recording()` returns False for a demo cut short** (buffer full, recording loop failing); the demo is
+  still saved and converted. It returned True with only a log line.
+- **Delta actions of `*.euler.roll/pitch/yaw` specs wrap at ±π** like `rotation_format: rpy` streams (a yaw crossing ±π
+  read as a -6.26 rad turn). The config check warns about `delta_actions` on quaternion components.
+- **A second conversion into the same folder keeps an edited `action_dispatcher/action_config.yaml`** (it was reset to the
+  template), and converting into the config's own folder no longer skips the dispatcher files (`SameFileError`).
+- **Train tab Stop:** a run that survived SIGKILL was marked "stopped"; it now stays "running" and Stop reports failure.
+- **A TF input whose source stopped was saved as live data:** a TF lookup returns a new object every tick, so the
+  stopped-publishing check (by identity) never fired. An input whose non-zero header stamp does not advance now counts as
+  held, and the Review flags it; an all-static TF chain (stamp 0) is still never flagged.
+- **Record page cards:** a card whose input name does not start with `image_` (e.g. `camera_rgb`) showed "Topic Name"
+  instead of its name; TF/pose cards never showed theirs either. The joint card kept its input name (`joint_1 · 7 joints`).
+  The "Ready (press Start Recording…)" status no longer lands in the small metric badges, where it was cut off; the badges
+  have short texts (`Pos`, `Vel`, `Eff`, `FPS`, time) with the meaning and units in their tooltips, and no fake placeholder values.
+- **Drop-down and spin-box arrows** were drawn as small squares or lines, and a checked checkbox had no tick: the themes now
+  use SVG icons (`ui/styles/icons/`).
+- **Dark theme sidebar:** the menu and Start/Stop Record icons (black PNGs) were almost invisible; they are now drawn in
+  each button's text colour and follow its state (grey while disabled, green/red once usable).
+- **Camera card:** the image overflowed the card's right margin (the video area asked for 400 px in a narrower card).
 - **Recording:** an input that stops publishing mid-demo (a dead camera) now counts as gap-filled once it repeats past the stale input limit (`infer_max_obs_age_s`), for every input, so the after-recording check warns / fails; before, the demo passed with frozen frames. A failed close of the demo file sets it aside as `.partial` instead of leaving a possibly corrupt `.h5` in place. A JointState missing a configured joint holds the last full row (as live inference does) instead of recording a narrower one; stream rows stay aligned if evaluation fails half way.
 - **AppAPI / Record:** a demo saved by a retry at Start is added to the session once (a later failed Start added it again, so it was converted twice); the converter also drops duplicate input files.
 - **Training:** Stop on a run that is still starting waits for it to start and then stops it (before, it reported success and training ran to the end). A process id reused after a reboot no longer reads as a running environment setup or training run.
@@ -126,6 +177,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Environment setup:** the folder name in the setup script is shell-quoted correctly.
 
 ### Removed
+- **`PyQt5.QtMultimedia` is no longer needed** (`python3-pyqt5.qtmultimedia` is gone from the install steps): the camera
+  card showed its frames in a QLabel laid over an unused `QVideoWidget`/`QMediaPlayer`; it is now a plain QLabel.
+- **`resources_rc.py` (14 862 generated lines) and `resources.qrc`:** icons and images are loaded from
+  `qt_app/resources/` by relative path, so there is no `pyrcc5` step.
+- The unused compiled card widgets `ui/containers/{image,joint,pose,actuactor}Widget_ui.py` (the app loads the `.ui` files;
+  only `mainWindow_ui.py` is kept, for the tests).
 - `YAMLDrivenConverter(config_loader, ...)`: the unused first argument is gone (`YAMLDrivenConverter(data_config=...)`), with
   `load_data_config`. The training launcher no longer looks for `<dataset>_acquisition_config.yaml` (nothing wrote it).
 - `relay_d.dispatch.DispatcherHelpers` (replaced by `save_dispatch_templates`).

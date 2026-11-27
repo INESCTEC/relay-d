@@ -225,7 +225,9 @@ class RecordingController:
                         "Stopped (Data Available)", "Stopped (No Data)"
                     )
                     self.update_buttons()
+                    problem = getattr(self.data_recorder, "stop_problem", "")
                     CustomMessageBox.error(
+                        f"{problem}\n\nNothing was saved for this demo." if problem else
                         "The recording could not be saved (check the disk). The data is still in "
                         "memory: fix the problem and press Start to retry the save.",
                         title="Recording Not Saved",

@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Form implementation generated from reading ui file '/home/pascd/Documents/git-repos/relay-d/relay_d/acquisition/qt_app/ui/containers/mainWindow.ui'
+# Form implementation generated from reading ui file 'relay_d/acquisition/qt_app/ui/containers/mainWindow.ui'
 #
 # Created by: PyQt5 UI code generator 5.15.11
 #
@@ -59,7 +59,7 @@ class Ui_MainWindow(object):
         self.logoLabel.setMinimumSize(QtCore.QSize(40, 40))
         self.logoLabel.setMaximumSize(QtCore.QSize(40, 40))
         self.logoLabel.setText("")
-        self.logoLabel.setPixmap(QtGui.QPixmap(":/img/resources/img/relayd_logo_simple.png"))
+        self.logoLabel.setPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/img/relayd_logo_simple.png"))
         self.logoLabel.setScaledContents(True)
         self.logoLabel.setAlignment(QtCore.Qt.AlignCenter)
         self.logoLabel.setObjectName("logoLabel")
@@ -91,7 +91,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_start.setFont(font)
         icon = QtGui.QIcon()
-        icon.addPixmap(QtGui.QPixmap(":/icons/resources/icons/camera.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/camera.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_start.setIcon(icon)
         self.btn_start.setIconSize(QtCore.QSize(24, 24))
         self.btn_start.setAutoDefault(False)
@@ -108,7 +108,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_data_post_process.setFont(font)
         icon1 = QtGui.QIcon()
-        icon1.addPixmap(QtGui.QPixmap(":/icons/resources/icons/data.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon1.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/data.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_data_post_process.setIcon(icon1)
         self.btn_data_post_process.setIconSize(QtCore.QSize(24, 24))
         self.btn_data_post_process.setObjectName("btn_data_post_process")
@@ -122,7 +122,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_review.setFont(font)
         icon2 = QtGui.QIcon()
-        icon2.addPixmap(QtGui.QPixmap(":/icons/resources/icons/video.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon2.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/video.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_review.setIcon(icon2)
         self.btn_review.setIconSize(QtCore.QSize(24, 24))
         self.btn_review.setObjectName("btn_review")
@@ -136,7 +136,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_train.setFont(font)
         icon3 = QtGui.QIcon()
-        icon3.addPixmap(QtGui.QPixmap(":/icons/resources/icons/play.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon3.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/play.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_train.setIcon(icon3)
         self.btn_train.setIconSize(QtCore.QSize(24, 24))
         self.btn_train.setObjectName("btn_train")
@@ -162,7 +162,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_import.setFont(font)
         icon4 = QtGui.QIcon()
-        icon4.addPixmap(QtGui.QPixmap(":/icons/resources/icons/import.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon4.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/import.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_import.setIcon(icon4)
         self.btn_import.setIconSize(QtCore.QSize(24, 24))
         self.btn_import.setObjectName("btn_import")
@@ -193,7 +193,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_stop_record.setFont(font)
         icon5 = QtGui.QIcon()
-        icon5.addPixmap(QtGui.QPixmap(":/icons/resources/icons/stop-button.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon5.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/stop-button.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_stop_record.setIcon(icon5)
         self.btn_stop_record.setIconSize(QtCore.QSize(24, 24))
         self.btn_stop_record.setObjectName("btn_stop_record")
@@ -218,7 +218,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_settings.setFont(font)
         icon6 = QtGui.QIcon()
-        icon6.addPixmap(QtGui.QPixmap(":/icons/resources/icons/setting.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon6.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/setting.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_settings.setIcon(icon6)
         self.btn_settings.setIconSize(QtCore.QSize(24, 24))
         self.btn_settings.setObjectName("btn_settings")
@@ -232,7 +232,7 @@ class Ui_MainWindow(object):
         font.setWeight(75)
         self.btn_help.setFont(font)
         icon7 = QtGui.QIcon()
-        icon7.addPixmap(QtGui.QPixmap(":/icons/resources/icons/question.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon7.addPixmap(QtGui.QPixmap("relay_d/acquisition/qt_app/ui/containers/../../resources/icons/question.png"), QtGui.QIcon.Normal, QtGui.QIcon.Off)
         self.btn_help.setIcon(icon7)
         self.btn_help.setIconSize(QtCore.QSize(24, 24))
         self.btn_help.setObjectName("btn_help")
@@ -559,7 +559,7 @@ class Ui_MainWindow(object):
 "<table border=\"0\" style=\" margin-top:0px; margin-bottom:0px; margin-left:0px; margin-right:0px;\" width=\"100%\" cellspacing=\"0\" cellpadding=\"30\">\n"
 "<tr>\n"
 "<td>\n"
-"<p align=\"center\" style=\" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\"><img src=\":/img/resources/img/inesctec_logo.png\" alt=\"INESC TEC Logo\" /><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px;\"> </span></p>\n"
+"<p align=\"center\" style=\" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\"><img src=\"img/inesctec_logo.png\" alt=\"INESC TEC Logo\" /><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px;\"> </span></p>\n"
 "<h1 align=\"center\" style=\" margin-top:16px; margin-bottom:24px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\"><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:xx-large; font-weight:600;\">Relay-D — Help &amp; Documentation </span></h1>\n"
 "<h2 style=\" margin-top:20px; margin-bottom:8px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px;\"><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:x-large; font-weight:600;\">About Relay-D</span></h2>\n"
 "<p style=\" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:160%;\"><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px;\">Relay-D is a Qt-based desktop application designed for data collection and dataset building to support Learning from Demonstration (LfD) models. It enables researchers and developers to efficiently capture, organize, and prepare demonstration data for machine learning. </span></p>\n"
@@ -585,4 +585,3 @@ class Ui_MainWindow(object):
 "<p style=\" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:160%;\"><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px; font-weight:600;\">Relay-D</span><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px;\"> is developed by INESC TEC.</span></p>\n"
 "<p style=\" margin-top:12px; margin-bottom:12px; margin-left:0px; margin-right:0px; -qt-block-indent:0; text-indent:0px; line-height:160%;\"><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px; font-weight:600;\">Authors:</span><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px;\"> Pedro Dias, Artur Cordeiro<br /></span><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px; font-weight:600;\">Organization:</span><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px;\"> INESC TEC<br /></span><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px; font-weight:600;\">License:</span><span style=\" font-family:\'Segoe UI\',\'sans-serif\'; font-size:14px;\"> GNU GPLv3 </span></p></td></tr></table></body></html>"))
         self.actionMain.setText(_translate("MainWindow", "Main"))
-import resources_rc

@@ -6,6 +6,7 @@ import types
 
 import h5py
 import numpy as np
+import pytest
 from helpers import image_sample, joint_sample, make_recorder
 
 
@@ -151,3 +152,21 @@ def test_a_failed_save_is_set_aside_and_removed_once_a_retry_saves_it(recorder_c
     rec.output_directory = str(tmp_path)
     assert rec.retry_save() is True
     assert not (tmp_path / "demo.h5.partial").exists() and os.path.exists(rec.retried_file)
+
+
+def test_a_demo_is_a_h5_file_only_once_it_is_saved(recorder_cls, tmp_path):
+    """A crash mid-demo must not leave a <demo>.h5 that Review and the converters take for a recorded demo."""
+    module = sys.modules[recorder_cls.__module__]
+    rec = recorder_cls(types.SimpleNamespace(is_loaded=lambda: False, yaml_data=None))
+    module.user_settings.save({"hdf5_save_folder": str(tmp_path)})
+    rec._create_h5_file("demo_0")
+    folder = os.path.dirname(rec.h5_file_path)
+    assert os.listdir(folder) == ["demo_0.h5.partial"]  # was demo_0.h5 from the first sample on (a crash left it)
+    rec.recorded_data = {"arm": [joint_sample()] * 2}
+    rec.timestamps = [1, 2]
+    rec.recording_metadata = {"demo_name": "demo_0", "start_time": 0.0}
+    rec.is_recording = True
+    assert rec.stop_recording() is True
+    assert os.listdir(folder) == ["demo_0.h5"] and rec.h5_file_path == os.path.join(folder, "demo_0.h5")
+    with pytest.raises(Exception):
+        rec._create_h5_file("demo_0")  # a saved demo is never overwritten

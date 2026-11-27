@@ -3,12 +3,8 @@
 import pytest
 
 pytest.importorskip("PyQt5")
-import sys  # noqa: E402
-from pathlib import Path  # noqa: E402
 
 from PyQt5.QtWidgets import QMainWindow  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).parents[1] / "relay_d/acquisition/qt_app"))  # mainWindow_ui.py does `import resources_rc`
 
 from relay_d.acquisition.qt_app.ui.config import config_page as cp  # noqa: E402
 from relay_d.acquisition.qt_app.ui.containers.mainWindow_ui import Ui_MainWindow  # noqa: E402

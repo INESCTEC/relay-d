@@ -2,7 +2,6 @@ from relay_d.utils.ros_media_codec import imgmsg_to_cv2
 import cv2
 import numpy as np
 import time
-import os
 import datetime
 import math
 
@@ -18,8 +17,6 @@ from tf2_msgs.msg import TFMessage
 from sensor_msgs_py import point_cloud2
 from PyQt5.QtCore import QTimer, QMutex, Qt
 from PyQt5.QtGui import QPixmap, QImage
-from PyQt5.QtMultimedia import QMediaPlayer
-from PyQt5.QtMultimediaWidgets import QVideoWidget
 
 
 class ContainerVisualizer:
@@ -30,8 +27,6 @@ class ContainerVisualizer:
     def __init__(self):
         self.visualization_timers = {}  # container_id -> QTimer
         self.update_mutex = QMutex()
-        self.media_players = {}  # container_id -> QMediaPlayer
-        self.temp_video_files = {}  # container_id -> temp file path
 
         # Visualization update rate (Hz)
         self.update_rate = user_settings.get("visualizer_update_rate", 20) or 20
@@ -151,7 +146,7 @@ class ContainerVisualizer:
                             "%H:%M:%S.%f"
                         )[:-3]
                         if hasattr(container, "label_timestamp"):
-                            container.label_timestamp.setText(f"Time: {dt_str}")
+                            container.label_timestamp.setText(dt_str)
 
                 # === Framerate ===
                 now = time.time()
@@ -163,7 +158,7 @@ class ContainerVisualizer:
 
                 fps = len(window) / 2.0  # messages per second (avg over 2s)
                 if hasattr(container, "label_frame_rate"):
-                    container.label_frame_rate.setText(f"FPS: {fps:.1f}")
+                    container.label_frame_rate.setText(f"{fps:.1f} FPS")
 
             elif isinstance(latest_msg, PointCloud2):
                 self._update_pointcloud_display(container, latest_msg)
@@ -193,10 +188,8 @@ class ContainerVisualizer:
             self.update_mutex.unlock()
 
     def _update_image_display(self, container, image_msg):
-        """Update container with image data - specifically for QVideoWidget"""
+        """Update container with image data"""
         try:
-            container_id = getattr(container, "container_id", "unknown")
-
             # Convert ROS image message to OpenCV format
             if isinstance(image_msg, CompressedImage):
                 # Decompress compressed image
@@ -209,14 +202,7 @@ class ContainerVisualizer:
             if cv_image is None:
                 return
 
-            # Check for QVideoWidget named 'widget_video'
-            if hasattr(container, "widget_video") and isinstance(
-                container.widget_video, QVideoWidget
-            ):
-                self._display_image_in_video_widget(container, cv_image, container_id)
-            else:
-                # Fallback to QLabel display
-                self._display_image_in_label(container, cv_image, image_msg)
+            self._display_image(container, cv_image)
 
             # Update image info if text area exists
             height, width = cv_image.shape[:2]
@@ -228,131 +214,15 @@ class ContainerVisualizer:
             # Fallback to text update
             self._update_text_status(container, f"Image Error: {str(e)[:50]}")
 
-    def _display_image_in_video_widget(self, container, cv_image, container_id):
-        """Display image in QVideoWidget using QMediaPlayer"""
-        try:
-            # Create or get existing media player
-            if container_id not in self.media_players:
-                media_player = QMediaPlayer()
-                media_player.setVideoOutput(container.widget_video)
-                self.media_players[container_id] = media_player
-                logger.info(f"Created media player for container {container_id}")
-            else:
-                media_player = self.media_players[container_id]
-
-            # Convert OpenCV image to a format suitable for QMediaPlayer
-            # For real-time display, we'll convert the image to a QLabel approach
-            # since QMediaPlayer is more suited for video files
-
-            # Alternative approach: Convert to QPixmap and display on an overlay
-            self._display_image_as_pixmap_overlay(container, cv_image)
-
-        except Exception as e:
-            logger.error(f"Error displaying image in video widget: {e}")
-            # Fallback to label display
-            self._display_image_in_label(container, cv_image, None)
-
-    def _display_image_as_pixmap_overlay(self, container, cv_image):
-        """Display image as pixmap overlay on video widget"""
-        try:
-            # Convert OpenCV image to Qt format
-            height, width, channels = cv_image.shape
-            bytes_per_line = channels * width
-
-            # Convert BGR to RGB
-            rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-
-            # Create QImage
-            qt_image = QImage(
-                rgb_image.data, width, height, bytes_per_line, QImage.Format_RGB888
-            )
-
-            # Scale image to fit video widget
-            video_widget = container.widget_video
-            video_size = video_widget.size()
-
-            if video_size.width() > 0 and video_size.height() > 0:
-                # Scale maintaining aspect ratio
-                scaled_pixmap = QPixmap.fromImage(qt_image).scaled(
-                    video_size.width(),
-                    video_size.height(),
-                    Qt.AspectRatioMode.KeepAspectRatio,  # Keep aspect ratio
-                )
-
-                # Check if we need to create an overlay label
-                if not hasattr(container, "_video_overlay_label"):
-                    from PyQt5.QtWidgets import QLabel
-
-                    overlay_label = QLabel(video_widget)
-                    # Style defined in .ui file
-                    overlay_label.resize(video_widget.size())
-                    overlay_label.show()
-                    container._video_overlay_label = overlay_label
-                    logger.info(
-                        f"Created video overlay label for {getattr(container, 'container_id', 'unknown')}"
-                    )
-
-                # Update overlay with new image
-                container._video_overlay_label.setPixmap(scaled_pixmap)
-                container._video_overlay_label.resize(video_widget.size())
-
-            logger.debug(f"Updated video widget overlay with image {width}x{height}")
-
-        except Exception as e:
-            logger.error(f"Error displaying image as pixmap overlay: {e}")
-
-    def _display_image_in_label(self, container, cv_image, image_msg):
-        """Fallback method to display image in QLabel"""
-        try:
-            # Check if container has valid size
-            if not hasattr(container, "size") or container.size().width() <= 0:
-                logger.warning("Container has invalid size, skipping image update")
-                return
-
-            # Resize image to fit container
-            height, width = cv_image.shape[:2]
-            container_size = container.size()
-            container_width = max(container_size.width() - 20, 50)  # Minimum 50px
-            container_height = max(container_size.height() - 60, 50)  # Minimum 50px
-
-            # Calculate scaling factor to maintain aspect ratio
-            scale_x = container_width / width
-            scale_y = container_height / height
-            scale = min(scale_x, scale_y, 1.0)  # Don't upscale
-
-            new_width = max(int(width * scale), 1)
-            new_height = max(int(height * scale), 1)
-
-            cv_image = cv2.resize(cv_image, (new_width, new_height))
-
-            # Convert to Qt format
-            rgb_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            bytes_per_line = ch * w
-            qt_image = QImage(
-                rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888
-            )
-            pixmap = QPixmap.fromImage(qt_image)
-
-            # Try to find image display widget with multiple possible names
-            image_widget = None
-            possible_names = ["label_image", "image_display", "imageLabel", "imgLabel"]
-
-            for name in possible_names:
-                if hasattr(container, name):
-                    widget = getattr(container, name)
-                    if hasattr(widget, "setPixmap"):
-                        image_widget = widget
-                        break
-
-            if image_widget:
-                image_widget.setPixmap(pixmap)
-            else:
-                # Create a basic status update if no image widget found
-                self._update_text_status(container, f"Image: {width}x{height}")
-
-        except Exception as e:
-            logger.error(f"Error displaying image in label: {e}")
+    def _display_image(self, container, cv_image):
+        """Show the frame in the card's ``label_image``, scaled to the label (aspect ratio kept)."""
+        label = getattr(container, "label_image", None)
+        if label is None or label.width() <= 0 or label.height() <= 0:
+            return
+        rgb = np.ascontiguousarray(cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB))
+        h, w = rgb.shape[:2]
+        qt_image = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
+        label.setPixmap(QPixmap.fromImage(qt_image).scaled(label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _update_pointcloud_display(self, container, pc_msg):
         """Update container with point cloud data"""
@@ -437,22 +307,22 @@ class ContainerVisualizer:
             # Update individual metric labels if they exist
             if hasattr(container, "positionLabel") and joint_msg.position:
                 avg_pos = sum(joint_msg.position) / len(joint_msg.position)
-                container.positionLabel.setText(f"Avg Pos: {avg_pos:.3f}")
+                container.positionLabel.setText(f"Pos {avg_pos:.3f}")
 
             if hasattr(container, "velocityLabel") and joint_msg.velocity:
                 avg_vel = sum(abs(v) for v in joint_msg.velocity) / len(
                     joint_msg.velocity
                 )
-                container.velocityLabel.setText(f"Avg Vel: {avg_vel:.3f} rad/s")
+                container.velocityLabel.setText(f"Vel {avg_vel:.3f}")
 
             if hasattr(container, "torqueLabel") and joint_msg.effort:
                 avg_eff = sum(abs(e) for e in joint_msg.effort) / len(joint_msg.effort)
-                container.torqueLabel.setText(f"Avg Eff: {avg_eff:.3f} Nm")
+                container.torqueLabel.setText(f"Eff {avg_eff:.3f}")
 
             # Update topic name label at bottom
             if hasattr(container, "text_data_display"):
                 container.text_data_display.setText(
-                    f"{len(joint_msg.name)} Joint States"
+                    f"{getattr(container, 'container_id', 'joints')} · {len(joint_msg.name)} joints"
                 )
 
         except Exception as e:
@@ -874,19 +744,6 @@ class ContainerVisualizer:
             for container_id, timer in list(self.visualization_timers.items()):
                 timer.stop()
             self.visualization_timers.clear()
-
-            # Stop all media players
-            for container_id, media_player in list(self.media_players.items()):
-                media_player.stop()
-            self.media_players.clear()
-
-            # Clean up temp files
-            for container_id, temp_file in list(self.temp_video_files.items()):
-                try:
-                    os.remove(temp_file)
-                except Exception:
-                    pass
-            self.temp_video_files.clear()
 
             logger.info("Stopped all container visualizations")
 

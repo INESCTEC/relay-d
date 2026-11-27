@@ -243,11 +243,6 @@ def test_start_shows_no_blocking_dialog_and_stop_is_available_at_once(env):
 
 def test_restart_subscribers_is_refused_while_recording(monkeypatch):
     pytest.importorskip("rclpy")  # record_page imports its ROS subscribers
-    for name in ("PyQt5.QtMultimedia", "PyQt5.QtMultimediaWidgets"):  # not in every PyQt5 install (or its libs); unused here
-        try:
-            __import__(name)
-        except ImportError:
-            monkeypatch.setitem(sys.modules, name, MagicMock())
     from relay_d.acquisition.qt_app.ui.record.record_page import RecordPage
 
     page = RecordPage.__new__(RecordPage)  # skip the UI setup: only the guard is used

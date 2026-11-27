@@ -22,6 +22,7 @@ Usage (after `pip install -e .`):
 """
 
 import argparse
+import os
 import signal
 import sys
 
@@ -31,10 +32,12 @@ from .api import InferenceSession, detect_backend
 from .reexec import reexec_if_needed
 
 
-def sigterm_runs_the_safe_stop():
-    """SIGTERM (kill, systemd, a supervisor) raises KeyboardInterrupt like Ctrl+C, so the safe stop is sent: rclpy's
-    own handler ends the process without running ``finally``. Call it after rclpy.init(), which installs that handler."""
+def signals_run_the_safe_stop():
+    """SIGTERM (the Run tab's STOP, kill, systemd) and SIGINT (Ctrl+C) raise KeyboardInterrupt, so run() sends the safe
+    stop while ROS still works: rclpy's own handlers shut the context down first (the stop could not be published) or
+    end the process without running ``finally``. Call it after rclpy.init()."""
     signal.signal(signal.SIGTERM, signal.default_int_handler)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
 
 
 def main():
@@ -63,6 +66,8 @@ def main():
                              "Default: the task of the dataset the policy was trained on")
     parser.add_argument("--dry-run",       action="store_true",
                         help="Run the full loop but publish nothing and send no goals: every command is logged instead")
+    parser.add_argument("--exit-with-parent", action="store_true",
+                        help="Send the safe stop and exit if the process that started this one dies (the Run tab uses it)")
     args = parser.parse_args()
 
     try:  # the package of the backend may live in another environment (the one built by the Train tab)
@@ -72,6 +77,7 @@ def main():
         pass  # an unknown checkpoint: InferenceSession reports it
 
     state_keys = [k.strip() for k in args.state_keys.split(",")] if args.state_keys else None
+    parent_pid = os.getppid() if args.exit_with_parent else None  # read early: after the re-exec above, same parent
 
     session = InferenceSession(
         checkpoint=args.checkpoint,
@@ -84,8 +90,9 @@ def main():
         dry_run=args.dry_run,
     )
     try:
-        sigterm_runs_the_safe_stop()
-        ok = session.run(hz=args.hz, validate_timeout=args.obs_wait, max_obs_age=args.max_obs_age)
+        signals_run_the_safe_stop()
+        ok = session.run(hz=args.hz, validate_timeout=args.obs_wait, max_obs_age=args.max_obs_age,
+                         parent_pid=parent_pid)
     finally:
         session.close()
     if not ok:  # a model error: the Run tab shows Failed, not Stopped

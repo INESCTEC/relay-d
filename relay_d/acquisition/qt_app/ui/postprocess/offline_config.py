@@ -93,8 +93,9 @@ def write_dataset_files(output_dir: str, parser: YamlParser, options_source: Opt
             shutil.copyfile(source, target)
     elif not parser.save_yaml_file(file_path=target):
         raise RuntimeError("could not write acquisition_config.yaml")
-    if options_source:
-        shutil.copy2(options_source, os.path.join(output_dir, OPTIONS_FILENAME))
+    options_target = os.path.join(output_dir, OPTIONS_FILENAME)
+    if options_source and os.path.abspath(options_source) != os.path.abspath(options_target):  # output in the config's folder
+        shutil.copy2(options_source, options_target)
     dispatcher = os.path.join(output_dir, "action_dispatcher")
     os.makedirs(dispatcher, exist_ok=True)
     if not parser.save_yaml_file(file_path=os.path.join(dispatcher, "obs_config.yaml"), data=parser.get_obs_config()):

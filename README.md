@@ -9,10 +9,6 @@
 - **Who it is for** — robotics researchers and engineers building imitation-learning pipelines on ROS 2 (Jazzy) robots.
 - **The problem it solves** — LfD projects usually stitch together bespoke, one-off scripts for recording, format conversion, and inference. Relay-D replaces that with a single, consistent tool covering the whole loop, so datasets recorded for training are guaranteed to be compatible with the config format consumed at inference time.
 
-**Screenshot:**
-
-<!-- TODO: add a screenshot of the RelayDApp GUI (e.g. the Record page with live sensor feeds) here. -->
-
 ---
 
 ## 1. Project status
@@ -29,11 +25,12 @@ This project is currently **in progress**: it is actively being developed and co
 
 Relay-D is a plain pip package (not a colcon/ament package) intended to run standalone inside a Python environment where ROS 2 Jazzy has already been sourced — it is not a ROS 2 node package in its own right, but it depends on a sourced ROS 2 environment at runtime.
 
-It is composed of two subsystems that interoperate directly:
+It is composed of three subsystems that interoperate directly:
 
-- **`relay_d.acquisition`** — the `RelayDApp` GUI: records robot sensor data (topics + TF) to HDF5 per a YAML config, and converts recordings to Robomimic format. Also exposes a headless `AppAPI` for programmatic recording that runs the same code as the GUI (same config checks, same start/stop, same conversion and files).
+- **`relay_d.acquisition`** — the `RelayDApp` GUI: records robot sensor data (topics + TF) to HDF5 per a YAML config, and converts recordings to Robomimic or LeRobot format. Also exposes a headless `AppAPI` for programmatic recording that runs the same code as the GUI (same config checks, same start/stop, same conversion and files).
 - **`relay_d.dispatch`** — the `lfd-inference-node` CLI: runs a trained LfD policy live on the robot. Also exposes a programmatic `InferenceSession` API.
-- **`relay_d.utils`** — small utilities shared by both subsystems (currently the colored console logger).
+- **`relay_d.training`** — the `relay-d-train` CLI and the Train tab: starts and follows robomimic and LeRobot training runs.
+- **`relay_d.utils`** — utilities shared by all of them: user settings, colored logger, config loader, QoS, TF-topic and ROS media helpers.
 
 See [Architecture diagrams](#6-architecture-diagrams) for how these pieces fit together.
 
@@ -114,7 +111,7 @@ for training and `lfd-inference-node`. Safe to run again. The manual steps:
 ```bash
 # 1. Source ROS 2
 source /opt/ros/jazzy/setup.bash
-sudo apt install python3-pip python3-numpy python3-yaml python3-opencv python3-pyqt5 python3-pyqt5.qtmultimedia \
+sudo apt install python3-pip python3-numpy python3-yaml python3-opencv python3-pyqt5 \
     ros-jazzy-tf2-ros ros-jazzy-geometry-msgs ros-jazzy-std-msgs \
     ros-jazzy-sensor-msgs ros-jazzy-image-transport ros-jazzy-xacro \
     ros-jazzy-rviz2 ros-jazzy-robot-state-publisher ros-jazzy-sensor-msgs-py
@@ -157,7 +154,23 @@ This is a plain pip package (not a colcon/ament package) — no `colcon build` s
 RelayDApp
 ```
 
-Three pages: **Config** (load/validate your YAML), **Record** (start/stop, live sensor feeds), **Post-process** (convert raw recordings to Robomimic or LeRobot format; a config can be loaded here without the robot running).
+Pages:
+
+- **Import** (Configuration): load, validate and edit your YAML, or build one from the running robot ("Build from ROS").
+- **Start Recording** (Record): start/stop demos, with live sensor feeds.
+- **Review**: per-demo quality checks (sample rate, gaps, counts), plots of every recorded stream and camera playback.
+- **Data Post Process**: convert recordings to Robomimic or LeRobot format; a config can be loaded here without the robot running.
+- **Train**: start and follow robomimic / LeRobot training runs.
+- **Run**: run a trained policy on the robot (with a dry-run mode that moves nothing).
+- **Settings**: every default, saved to `~/.relayd_settings.json` (see [Settings](#settings)).
+
+| | |
+|---|---|
+| ![Configuration page](./img/screenshots/config.png) Configuration | ![Review page](./img/screenshots/review.png) Review |
+| ![Data Post Process page](./img/screenshots/postprocess.png) Data Post Process | ![Train page](./img/screenshots/train.png) Train |
+| ![Run page](./img/screenshots/run.png) Run | ![Settings page](./img/screenshots/settings.png) Settings |
+
+*Screenshots taken from a real `RelayDApp` session recording synthetic `/joint_states` and camera topics.*
 
 Everything lands in the recordings folder (Settings), named by what it holds:
 
@@ -234,11 +247,17 @@ At startup the node checks `action_config.yaml` against the model: an index past
 sends are listed in a warning. `--dry-run` runs the whole loop on the live robot's sensors but logs every command and stop instead of
 sending it (config errors still stop startup): use it for the first run of a new checkpoint or action config.
 
+`action_config.yaml` entries can also limit each command to `max_step` from the robot's measured position (its `JointState`),
+like LeRobot's `max_relative_target`, and send a `trajectory_msgs/JointTrajectory` to a `ros2_control`
+`joint_trajectory_controller` (`trajectory: true`): the driver (e.g. RTDE for UR, FRI for KUKA) interpolates it in real
+time. A LeRobot ACT policy sends its whole action chunk as one trajectory every `n_action_steps` ticks; other policies send
+one point per tick. See the template's quick reference.
+
 The **Run** tab does the same from the GUI: choose the checkpoint and the dataset's `action_dispatcher/` folder (or the Post-process output
-folder holding it), keep **Dry run** checked for a first look, and press **Start**; the log shows the node's output. **STOP** sends Ctrl+C,
-so the node sends each entry's `stop:`, cancels any action goal still running, and closes; closing Relay-D stops a running policy the same way.
+folder holding it), keep **Dry run** checked for a first look, and press **Start**; the log shows the node's output. **STOP** sends SIGTERM,
+which the node handles like Ctrl+C: it sends each entry's `stop:`, cancels any action goal still running, and closes; closing Relay-D stops a running policy the same way.
 The node runs in its own process group, so Ctrl+C in the terminal that started Relay-D stops it once, through Relay-D. A model error ends
-the run with exit code 1 (shown as Failed). The node also sends the stop on SIGTERM. `InferenceSession` used from Python has the same
+the run with exit code 1 (shown as Failed). The node sends the stop on SIGTERM and SIGINT (Ctrl+C) alike. `InferenceSession` used from Python has the same
 defaults as the node (`device`: the `infer_device` setting; `run(hz=None)`: the policy's rate, else `infer_hz`).
 
 See `relay_d/dispatch/inference_node.py` and `relay_d/dispatch/config_templates/*.yaml` for the full set of options and config syntax.
@@ -354,7 +373,7 @@ To report a security vulnerability, see [SECURITY.md](SECURITY.md) instead of op
 
 ## 11. Credits and acknowledgements
 
-- Pedro Dias – Developer, INESC TEC
+- Pedro A. Dias – Developer, INESC TEC
 - Artur Cordeiro – Developer, INESC TEC
 
 ---
@@ -363,5 +382,5 @@ To report a security vulnerability, see [SECURITY.md](SECURITY.md) instead of op
 
 For support or inquiries, contact:
 
-- Pedro Dias – pedro.dias@inesctec.pt <!-- TODO: confirm actual address -->
-- Artur Cordeiro – artur.cordeiro@inesctec.pt <!-- TODO: confirm actual address -->
+- Pedro Dias – pedro.a.dias@inesctec.pt <!-- TODO: confirm actual address -->
+- Artur Cordeiro – artur.j.cordeiro@inesctec.pt <!-- TODO: confirm actual address -->

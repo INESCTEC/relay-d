@@ -11,11 +11,6 @@ from relay_d.acquisition.qt_app.ui.postprocess import postprocess_page as pp  # 
 
 @pytest.fixture
 def page(monkeypatch, qapp):
-    # resources_rc (icons) is imported by the generated UI module via a top-level name
-    import os
-    import relay_d.acquisition.qt_app as qt_app
-
-    monkeypatch.syspath_prepend(os.path.dirname(qt_app.__file__))
     from relay_d.acquisition.qt_app.ui.containers.mainWindow_ui import Ui_MainWindow
 
     window = QMainWindow()

@@ -41,19 +41,31 @@ def _stream_output_width(data_config: Dict, stream_name: str) -> Optional[int]:
     return width
 
 
+_EULER_SPEC = re.compile(r"\.euler\.(roll|pitch|yaw)$")  # an angle spec; sin(...)/cos(...) end with ")"
+
+
 def _action_part(part: np.ndarray, key: str, stream_configs: dict, delta_actions: list) -> np.ndarray:
     """One `actions_to_extract` entry as (N, width) columns: its stream's rotation format,
     then the target of step t: the delta to t+1 if listed in `delta_actions`, else the value at t+1
     (the value at t is the current state, which would teach the policy to stand still).
     Shared by both output formats."""
     part = part if part.ndim > 1 else part[:, np.newaxis]
-    _, rot_fmt = stream_entry(stream_configs.get(key, []))
+    specs, rot_fmt = stream_entry(stream_configs.get(key, []))
     part = _apply_rotation_format(part, rot_fmt, key)
     if key not in delta_actions:
         return _next_step(part)
     delta = _compute_delta(part)
     # An angle going from +3.13 to -3.13 rad moved +0.02, not -6.26.
-    return (delta + np.pi) % (2 * np.pi) - np.pi if rot_fmt == "rpy" else delta
+    wrap = lambda d: (d + np.pi) % (2 * np.pi) - np.pi  # noqa: E731
+    if rot_fmt == "rpy":
+        return wrap(delta)
+    angles = [bool(_EULER_SPEC.search(str(spec).strip())) for spec in specs]
+    if any(angles):
+        if len(angles) == delta.shape[1]:  # one column per spec (no [:] slice)
+            delta[:, angles] = wrap(delta[:, angles])
+        else:  # shortcut: no column map with a [:] slice in the stream; split the angles into their own stream if needed
+            logger.warning(f"delta action '{key}': its euler angles are not wrapped at +-pi (the stream also has a [:] slice)")
+    return delta
 
 
 def _compute_delta(data: np.ndarray) -> np.ndarray:
@@ -857,23 +869,36 @@ class YAMLDrivenConverter:
         for key in actions:
             if key not in streams_grp:  # zero actions would train on zeros: the demo is skipped
                 return f"no {key} (action stream)"
+        # A missing input is never filled in: zeros (or black frames) would teach the policy a false observation.
+        for key in streams_cfg:
+            if key not in streams_grp:
+                return f"no {key} (observation stream)"
         try:  # the recorder writes one row per timestamp: another length means lost or extra frames
             for key in dict.fromkeys(present + list(actions)):
                 _check_length(streams_grp[key], n, key)
+                self._check_shape(streams_grp[key], key)
             for key in sorted(engine.bridge_map):
                 if key in self._excluded_keys or key in streams_cfg:
                     continue
                 ds = engine._get_nested_data(demo_data, engine.resolve_path(key) or "")
-                if ds is not None:
-                    _check_length(ds, n, key)
-                    continue
-                shape, dtype = self._shape_cache[key]
-                if np.dtype(dtype) == np.uint8 or len(shape) >= 2 or key in self._modality_map:
-                    # black frames would teach the policy to act blind (a missing numeric obs is zero-filled)
-                    return f"no {'point cloud' if self._modality_map.get(key) == 'scan' else 'camera'} {key}"
+                if ds is None:
+                    shape, dtype = self._shape_cache[key]
+                    if self._modality_map.get(key) == "scan":
+                        return f"no point cloud {key}"
+                    is_camera = np.dtype(dtype) == np.uint8 or len(shape) >= 2 or key in self._modality_map
+                    return f"no {'camera' if is_camera else 'input'} {key}"
+                _check_length(ds, n, key)
+                self._check_shape(ds, key)
         except ValueError as e:
             return str(e)
         return ""
+
+    def _check_shape(self, ds, key: str) -> None:
+        """Every demo must give a key the same per-sample shape (joints, camera resolution) as the first demo of the
+        batch that has it: robomimic would write mixed shapes and training would fail when it batches them."""
+        expected = self._shape_cache.get(key)
+        if expected is not None and tuple(ds.shape[1:]) != tuple(expected[0]):
+            raise ValueError(f"'{key}' has shape {tuple(ds.shape[1:])} per sample, other demos {tuple(expected[0])}")
 
     def _lerobot_task(self, task: Optional[str] = None) -> str:
         return task or self.options.lerobot().get("task") or self.data_config.get("dataset_name") or "unspecified task"
@@ -1003,29 +1028,9 @@ class YAMLDrivenConverter:
             stream_configs = self.data_config.get("output", {}).get("streams", {})
             for stream_name in stream_names:
                 _, rot_fmt = stream_entry(stream_configs.get(stream_name, []))
-                if stream_name in streams_grp:
-                    data = np.array(streams_grp[stream_name], dtype=np.float32)
-                    data = _apply_rotation_format(data, rot_fmt, stream_name)
-                else:
-                    cached = self._shape_cache.get(stream_name)
-                    if cached is None:
-                        logger.warning(
-                            f"Stream '{stream_name}' missing in {demo_name} and has no "
-                            f"recorded shape anywhere in the batch; skipping."
-                        )
-                        continue
-                    feat_shape, dtype = cached
-                    if rot_fmt == "rpy" and feat_shape == (4,):
-                        # Keep zero-filled demos consistent with converted demos:
-                        # the shape cache stores the raw recorded (quat) shape.
-                        feat_shape = (3,)
-                    logger.warning(
-                        f"Stream '{stream_name}' missing in {demo_name}; zero-filling "
-                        f"with shape {feat_shape} inferred from the rest of the batch."
-                    )
-                    data = np.zeros((num_samples,) + feat_shape, dtype=dtype)
-
-                demo["obs"][stream_name] = data
+                # present in every converted demo: a missing stream skipped the demo in _demo_problem
+                data = np.array(streams_grp[stream_name], dtype=np.float32)
+                demo["obs"][stream_name] = _apply_rotation_format(data, rot_fmt, stream_name)
 
             actions_to_extract = self.data_config.get("actions_to_extract", [])
             delta_actions = self.data_config.get("delta_actions", [])
@@ -1098,16 +1103,8 @@ class YAMLDrivenConverter:
                 demo["obs"][obs_key] = raw
                 continue
 
-            cached = self._shape_cache.get(obs_key)
-            if cached is None:
-                logger.warning(
-                    f"'{obs_key}' not found in {demo_name} and has no recorded "
-                    f"shape anywhere in the batch; skipping."
-                )
-                continue
-            feat_shape, dtype = cached  # a missing camera / point cloud skipped the demo in _demo_problem
-            logger.warning(f"'{obs_key}' not found in {demo_name}; zero-filling with shape {feat_shape}.")
-            demo["obs"][obs_key] = np.zeros((num_samples,) + feat_shape, dtype=dtype)
+            # _demo_problem skips a demo missing any input, so this is a bug, never a demo to fill with zeros
+            raise ValueError(f"'{obs_key}' not found in {demo_name}")
 
     def _convert_single_demo(
         self,

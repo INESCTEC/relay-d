@@ -102,6 +102,8 @@ def stop(run_dir, grace: float = 10.0) -> bool:
             time.sleep(0.2)
     except ProcessLookupError:
         pass
+    if _alive(run_dir, pid):  # survived SIGKILL (stuck in the kernel?): it still reads as running
+        return False
     if not (run_dir / "exit_code").exists():
         (run_dir / "exit_code").write_text("143\n")  # so the run reads as "stopped", not "running"
-    return not _alive(run_dir, pid)
+    return True

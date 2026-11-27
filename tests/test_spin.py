@@ -1,7 +1,6 @@
 """TopicSubscribers' spin thread, shared by the GUI's Record page and AppAPI. Needs a sourced ROS 2 (rclpy)."""
 
 import statistics
-import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -65,11 +64,6 @@ def test_the_spin_thread_keeps_up_with_four_topics_at_100_hz(ros):
 
 
 def test_the_record_page_spins_its_subscribers_in_their_own_thread_not_the_qt_timer(qapp, ros, monkeypatch, tmp_path):
-    for name in ("PyQt5.QtMultimedia", "PyQt5.QtMultimediaWidgets"):  # not in every PyQt5 install; unused here
-        try:
-            __import__(name)
-        except ImportError:
-            monkeypatch.setitem(sys.modules, name, MagicMock())
     from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser
     from relay_d.acquisition.qt_app.ui.record.record_page import RecordPage
 

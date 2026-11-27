@@ -1,5 +1,6 @@
 """How the app start-up and live changes use the user settings. Pure functions (no Qt, no ROS), so they are tested."""
 
+import os
 from typing import Mapping
 
 _PAGES = ("start", "data", "review", "train", "import", "settings")
@@ -24,3 +25,12 @@ def live_changes(settings: Mapping, theme: str, spin_ms: int) -> dict:
     if int(settings.get("ros_spin_ms", spin_ms)) != spin_ms:
         changes["spin_ms"] = int(settings["ros_spin_ms"])
     return changes
+
+
+def theme_stylesheet(qss_path: str) -> str:
+    """The QSS of a theme file, with ``@ICONS@`` set to the absolute icons/ folder next to it (Qt resolves
+    ``url()`` against the working directory, not the stylesheet)."""
+    with open(qss_path, "r") as f:
+        qss = f.read()
+    icons = os.path.join(os.path.dirname(os.path.abspath(qss_path)), "icons").replace(os.sep, "/")
+    return qss.replace("@ICONS@", icons)

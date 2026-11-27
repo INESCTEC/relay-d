@@ -2,7 +2,10 @@
 
 import pytest
 
-from relay_d.acquisition.qt_app.settings_apply import live_changes, startup_page
+import os
+import re
+
+from relay_d.acquisition.qt_app.settings_apply import live_changes, startup_page, theme_stylesheet
 from relay_d.utils import user_settings
 
 
@@ -37,3 +40,11 @@ def test_only_the_record_page_needs_a_config():
 
     assert needs_config("start", False) and not needs_config("start", True)
     assert not any(needs_config(p, False) for p in ("data", "import", "review", "train", "settings", "help"))
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_theme_icons_resolve_to_existing_files(theme):
+    qss = theme_stylesheet(os.path.join("relay_d", "acquisition", "qt_app", "ui", "styles", f"relayd_{theme}.qss"))
+    urls = re.findall(r"url\(([^)]+)\)", qss)
+    assert "@ICONS@" not in qss and urls
+    assert all(os.path.isfile(u) for u in urls), urls

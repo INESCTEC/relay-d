@@ -16,6 +16,14 @@ is still built and checked, then logged ("[DRY RUN] ...") instead of sent.
 
 send_stop() (inference stops) publishes each topic entry's `stop:` values and
 cancels every goal it sent that is still active.
+
+`max_step` (with `joint_names`) limits each command to the robot's measured position (JointState on `state_topic`)
++- max_step, like LeRobot's max_relative_target: no command can jump further than that in one tick, whatever `limits`
+allows. Without a fresh measured position nothing is sent.
+
+`trajectory: true` entries publish trajectory_msgs/JointTrajectory (to a ros2_control joint_trajectory_controller,
+which interpolates at its own rate, e.g. over RTDE or FRI): the policy's whole chunk when it has one
+(dispatch_trajectory), else one point per tick. Their stop holds the measured position.
 """
 
 import re
@@ -30,6 +38,9 @@ from rclpy.action import ActionClient
 from typing import Any, Dict, Optional
 
 from rosidl_runtime_py.utilities import get_message
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils.config_loader import load_yaml_config
 
@@ -217,6 +228,10 @@ class ActionDispatcher:
         self._goals = []  # (name, accepted goal handle; None in a dry run) since the last stop: send_stop cancels them
         self._goals_lock = threading.Lock()  # goals are accepted on the executor thread
         self._not_ready_warned = set()  # action entries whose server was not ready (warned once)
+        self.period = 0.05  # seconds between ticks (set by InferenceSession.run): a trajectory's time step
+        self._joint_states: Dict[str, Any] = {}  # state_topic -> ({joint name: position}, monotonic arrival time)
+        self._state_lock = threading.Lock()  # joint states arrive on the executor thread
+        self._clip_logged: Dict[str, float] = {}  # entry -> last time a max_step clip was logged
 
         # feedback: -- opt-in ack-wait for topic entries (see _wait_for_ack)
         self._ack_latest: Dict[str, Any] = {}
@@ -242,7 +257,14 @@ class ActionDispatcher:
                                         or float(lim["lower_lim"]) > float(lim["upper_lim"])):
                     raise ValueError(f"[ActionDispatcher] '{name}': each 'limits' entry needs "
                                      f"lower_lim <= upper_lim, got {lim!r}.")
-            if cfg.get("action", False):
+            if "joint_names" in cfg or "max_step" in cfg or cfg.get("trajectory"):
+                self._check_joint_entry(name, cfg)
+            if cfg.get("trajectory"):
+                self._msg_classes[name] = JointTrajectory
+                if not dry_run:
+                    self._publishers[name] = node.create_publisher(JointTrajectory, cfg["topic"], 10)
+                logger.info(f"[ActionDispatcher] '{name}' -> TRAJECTORY {cfg['topic']} ({len(cfg['joint_names'])} joints)")
+            elif cfg.get("action", False):
                 if "action_type" not in cfg:
                     raise ValueError(
                         f"[ActionDispatcher] '{name}' has action: true "
@@ -314,12 +336,29 @@ class ActionDispatcher:
         for name, cfg in self._action_configs.items():
             if "stop" in cfg:
                 self._check_stop(name, cfg)
+            elif not cfg.get("action", False) and not cfg.get("trajectory"):  # goals are cancelled, trajectories hold
+                logger.warning(f"[ActionDispatcher] '{name}' has no 'stop:': when inference stops, its last command "
+                               f"stays active on the robot.")
+            if cfg.get("action", False) and "feedback" not in cfg:
+                logger.warning(f"[ActionDispatcher] '{name}' sends a new goal every tick, each one preempting the last "
+                               f"(a joint_trajectory_controller crashed under that at 20 Hz): for continuous control use a "
+                               f"trajectory: true entry; keep actions for discrete moves (with feedback).")
+            if "limits" not in cfg and "max_step" not in cfg:
+                logger.warning(f"[ActionDispatcher] '{name}' has no 'limits': the model's outputs are sent unclamped.")
+
+        state_topics = {cfg.get("state_topic", "/joint_states") for cfg in self._action_configs.values()
+                        if "max_step" in cfg or cfg.get("trajectory")}
+        for topic in sorted(state_topics):
+            if node is not None:  # read-only, also in a dry run (the commands are computed from it)
+                node.create_subscription(JointState, topic, lambda msg, t=topic: self._on_joint_state(msg, t), 10)
 
     # -------------------------------------------------------------------------
     # Public
     # -------------------------------------------------------------------------
 
-    def dispatch(self, action: np.ndarray) -> None:
+    def dispatch(self, action: np.ndarray, trajectories: bool = True) -> None:
+        """Send one action to every entry. ``trajectories=False``: skip the trajectory entries (their chunk was sent
+        with dispatch_trajectory)."""
         if not np.isfinite(action).all():
             logger.error(f"[ActionDispatcher] Non-finite action, not dispatching: {action}")
             self.send_stop()
@@ -329,11 +368,20 @@ class ActionDispatcher:
         # this raises before anything was sent, instead of moving the arm and skipping the gripper.
         outputs = []
         for name, cfg in self._action_configs.items():
+            if cfg.get("trajectory") and not trajectories:
+                continue
             slice_values = action[cfg["indices"]]
 
             # 1. Safety clamp to [lower_lim, upper_lim], in real units
             if "limits" in cfg:
                 slice_values = self._apply_limits(slice_values, cfg["limits"])
+            # 1b. No jump beyond max_step from the measured position
+            if "max_step" in cfg:
+                limited = self._step_limited(name, cfg, slice_values[np.newaxis])
+                if limited is None:
+                    self.send_stop()
+                    return
+                slice_values = limited[0]
 
             # 2. Optional further transform (threshold, euler_to_quat)
             if "transform" in cfg:
@@ -349,8 +397,10 @@ class ActionDispatcher:
         # Phase 2: send.
         self._stopped = False
         for name, cfg, transformed in outputs:
+            if cfg.get("trajectory"):  # no chunk from the policy: one point, reached by the next tick
+                self._publish_trajectory(name, cfg, transformed[np.newaxis])
             # ROS2 action client path
-            if cfg.get("action", False):
+            elif cfg.get("action", False):
                 key = str(transformed)
                 if self._last_sent.get(name) == key:
                     continue
@@ -382,6 +432,9 @@ class ActionDispatcher:
         for name, goal_handle in goals:
             self._cancel_goal(name, goal_handle)
         for name, cfg in self._action_configs.items():
+            if cfg.get("trajectory"):
+                self._hold(name, cfg)
+                continue
             if "stop" not in cfg:
                 continue
             try:
@@ -396,9 +449,141 @@ class ActionDispatcher:
             except Exception as e:
                 logger.error(f"[ActionDispatcher] '{name}': stop could not be sent: {e}")
 
+    @property
+    def has_trajectories(self) -> bool:
+        return any(cfg.get("trajectory") for cfg in self._action_configs.values())
+
+    def dispatch_trajectory(self, chunk: np.ndarray) -> None:
+        """Send a chunk of actions (n steps x action size) to the trajectory entries: one JointTrajectory each, its
+        points ``period`` apart, starting now. Every point is clamped to ``limits`` and to +- max_step from the
+        previous one (the first from the measured position)."""
+        chunk = np.atleast_2d(np.asarray(chunk, dtype=np.float64))
+        if not np.isfinite(chunk).all():
+            logger.error("[ActionDispatcher] Non-finite action chunk, not dispatching.")
+            self.send_stop()
+            return
+        outputs = []
+        for name, cfg in self._action_configs.items():
+            if not cfg.get("trajectory"):
+                continue
+            rows = chunk[:, cfg["indices"]]
+            if "limits" in cfg:
+                rows = np.stack([self._apply_limits(r, cfg["limits"]) for r in rows])
+            if "max_step" in cfg:
+                rows = self._step_limited(name, cfg, rows)
+                if rows is None:
+                    self.send_stop()
+                    return
+            outputs.append((name, cfg, rows))
+        self._stopped = False
+        for name, cfg, rows in outputs:
+            self._publish_trajectory(name, cfg, rows)
+
     # -------------------------------------------------------------------------
     # Private
     # -------------------------------------------------------------------------
+
+    def _check_joint_entry(self, name: str, cfg: dict) -> None:
+        """``joint_names`` / ``max_step`` / ``trajectory`` must fit the entry: a wrong one would limit or drive the
+        wrong joint."""
+        names = cfg.get("joint_names")
+        if not isinstance(names, list) or len(names) != len(cfg["indices"]):
+            raise ValueError(f"[ActionDispatcher] '{name}': 'joint_names' needs one joint name per index "
+                             f"({len(cfg['indices'])}) with max_step or trajectory, got {names!r}.")
+        if cfg.get("trajectory"):
+            extra = [k for k in ("action", "mapping", "goal_init", "transform", "feedback", "stop") if cfg.get(k)]
+            if extra or cfg.get("msg_type", "trajectory_msgs/msg/JointTrajectory") != "trajectory_msgs/msg/JointTrajectory":
+                raise ValueError(f"[ActionDispatcher] '{name}': a trajectory entry publishes JointTrajectory positions "
+                                 f"itself (its stop holds the measured position); remove {extra or ['msg_type']}.")
+            if any(not isinstance(n, str) for n in names):
+                raise ValueError(f"[ActionDispatcher] '{name}': every 'joint_names' entry of a trajectory is a joint name.")
+        if "max_step" in cfg:
+            steps = cfg["max_step"] if isinstance(cfg["max_step"], list) else [cfg["max_step"]]
+            if len(steps) not in (1, len(cfg["indices"])) or not all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) and v > 0 for v in steps):
+                raise ValueError(f"[ActionDispatcher] '{name}': 'max_step' needs 1 positive number or one per index "
+                                 f"({len(cfg['indices'])}), got {cfg['max_step']!r}.")
+
+    def _on_joint_state(self, msg: Any, topic: str) -> None:
+        with self._state_lock:
+            positions = dict(self._joint_states.get(topic, ({}, 0.0))[0])  # drivers may split joints over messages
+            positions.update(zip(msg.name, msg.position))
+            self._joint_states[topic] = (positions, time.monotonic())
+
+    def _measured(self, name: str, cfg: dict) -> Optional[np.ndarray]:
+        """The entry's measured joint positions (NaN for a null joint name), or None if they are missing or older than
+        the stale-input limit (infer_max_obs_age_s): commands must not be limited against an old position."""
+        topic = cfg.get("state_topic", "/joint_states")
+        with self._state_lock:
+            positions, stamp = self._joint_states.get(topic, ({}, 0.0))
+        max_age = float(user_settings.get("infer_max_obs_age_s") or 1.0)
+        missing = [j for j in cfg["joint_names"] if j is not None and j not in positions]
+        if not positions or missing or time.monotonic() - stamp > max_age:
+            why = f"no {missing} in" if positions and missing else "no fresh"
+            logger.error(f"[ActionDispatcher] '{name}': {why} {topic} (max_step / hold need the measured position): "
+                         f"not sending.")
+            return None
+        return np.array([np.nan if j is None else positions[j] for j in cfg["joint_names"]], dtype=np.float64)
+
+    def _step_limited(self, name: str, cfg: dict, rows: np.ndarray) -> Optional[np.ndarray]:
+        """``rows`` (n x joints) with each row within +- max_step of the previous one, the first of the measured
+        position; None (send nothing) without a fresh measured position."""
+        prev = self._measured(name, cfg)
+        if prev is None:
+            return None
+        step = np.broadcast_to(np.asarray(cfg["max_step"], dtype=np.float64), prev.shape)
+        out = np.array(rows, dtype=np.float64)
+        for i in range(len(out)):
+            free = np.isnan(prev)  # a null joint name: not limited
+            out[i] = np.where(free, out[i], np.clip(out[i], prev - step, prev + step))
+            prev = np.where(free, np.nan, out[i])
+        asked = float(np.max(np.abs(rows - out))) if len(out) else 0.0
+        if asked > 1e-6 and time.monotonic() - self._clip_logged.get(name, 0.0) > 1.0:
+            self._clip_logged[name] = time.monotonic()
+            logger.warning(f"[ActionDispatcher] '{name}': command cut by max_step {cfg['max_step']} "
+                           f"(the model asked {asked:.3f} further).")
+        return out
+
+    def _trajectory_message(self, cfg: dict, rows: np.ndarray) -> Any:
+        msg = JointTrajectory()  # header.stamp 0: start now, replacing the trajectory being executed
+        msg.joint_names = list(cfg["joint_names"])
+        for k, row in enumerate(rows):
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in row]
+            t = (k + 1) * float(self.period)
+            point.time_from_start.sec = int(t)
+            point.time_from_start.nanosec = int(round((t - int(t)) * 1e9))
+            msg.points.append(point)
+        return msg
+
+    def _publish_trajectory(self, name: str, cfg: dict, rows: np.ndarray) -> None:
+        msg = self._trajectory_message(cfg, rows)
+        if self._dry_run:
+            logger.info(f"[DRY RUN] '{name}' -> trajectory of {len(rows)} point(s), first {np.round(rows[0], 4).tolist()}, "
+                        f"last {np.round(rows[-1], 4).tolist()} over {len(rows) * self.period:.2f} s")
+            return
+        self._publishers[name].publish(msg)
+
+    def _hold(self, name: str, cfg: dict) -> None:
+        """A trajectory entry's stop: one point at the measured position (the controller holds it); without a fresh
+        measured position an empty trajectory, which a joint_trajectory_controller takes as stop the current one.
+        Never raises."""
+        try:
+            present = self._measured(name, cfg)
+            if present is None:
+                msg = JointTrajectory()
+                msg.joint_names = list(cfg["joint_names"])
+            else:
+                msg = self._trajectory_message(cfg, present[np.newaxis])
+            if self._dry_run:
+                logger.warning(f"[DRY RUN] '{name}' stop: hold {None if present is None else present.tolist()}")
+                return
+            self._publishers[name].publish(msg)
+            logger.warning(f"[ActionDispatcher] '{name}': stop, holding "
+                           f"{'the measured position' if present is not None else '(empty trajectory)'}")
+        except Exception as e:
+            logger.error(f"[ActionDispatcher] '{name}': stop could not be sent: {e}")
+
 
     def _track_goal(self, name: str, goal_handle: Any) -> None:
         """Remember a sent goal for send_stop; one accepted after the stop is cancelled at once."""
@@ -683,6 +868,14 @@ class ActionDispatcher:
                     for _ in range(value):
                         array.append(ARRAY_TYPES[first_name]())
                     continue
+
+                # "trajectory.points: 1" — pre-allocate a nested array (control_msgs/FollowJointTrajectory)
+                if len(parts) > 1 and type(value) is int:
+                    parent, last, last_indices = _walk(goal, field_path)
+                    if not last_indices and last in ARRAY_TYPES and isinstance(getattr(parent, last), list):
+                        for _ in range(value):
+                            getattr(parent, last).append(ARRAY_TYPES[last]())
+                        continue
 
                 _assign(goal, field_path, lambda _current, v=value: v)  # all other cases: set the value at the path
 

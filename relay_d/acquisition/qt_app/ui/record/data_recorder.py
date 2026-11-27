@@ -16,6 +16,15 @@ from collections import defaultdict
 from datetime import datetime
 from .message_encoding import encode_message
 
+def _stamp_key(msg):
+    """(sec, nanosec) of a message's header stamp, None without one or when it is zero (an all-static TF chain, a
+    publisher that leaves it unset): such inputs are only compared by identity."""
+    stamp = getattr(getattr(msg, "header", None), "stamp", None)
+    if stamp is None or not (stamp.sec or stamp.nanosec):
+        return None
+    return stamp.sec, stamp.nanosec
+
+
 def _sample_nbytes(sample: dict) -> int:
     """RAM held by one recorded sample: every array in it (image `data`, point cloud `points`, ...)."""
     return sum(v.nbytes for v in sample.values() if isinstance(v, np.ndarray))
@@ -58,11 +67,12 @@ class DataRecorder(Node):
         self._unsaved = False  # a save failed and the samples are still only in memory
         self.buffer_full = False  # the loop stopped sampling because max_buffer_bytes was reached
         self.loop_failed = False  # the loop stopped sampling because of repeated errors
+        self.stop_problem = ""  # why the last stop_recording() saved nothing although nothing failed ("" otherwise)
 
         self.output_directory = None
         self.recorded_data_dir = None
         self.h5_file = None
-        self.h5_file_path = None
+        self.h5_file_path = None  # the demo's .h5; written as <it>.partial until saved (a crash must not leave a "demo")
 
         self.timestamps = []
         self.timestamp_spreads = []
@@ -71,7 +81,7 @@ class DataRecorder(Node):
         self._fill_gaps_containers = set()
         self._fill_count_summary = {}
         self._held_counts = defaultdict(int)  # per input: ticks recorded without a fresh sample
-        self._last_msgs = {}  # per input: (message of the last tick, ticks it has been repeated)
+        self._last_msgs = {}  # per input: (message of the last tick, its stamp key, ticks it has been repeated)
         self._strict_drops = 0  # ticks skipped by sync_mode: strict
         self._partial_files = []  # half-written demos set aside by a failed save
         self._modalities = {}
@@ -285,10 +295,10 @@ class DataRecorder(Node):
                     # strict mode skips the sample entirely.
                     spread = 0.0
                     if self._sync_tolerance is not None:
-                        sync_cids = [
+                        sync_cids = [  # a stamp of 0 is unset (a publisher that does not fill it), not a time
                             cid for cid in all_data
                             if cid not in self._fill_gaps_containers
-                            and snap_timestamps.get(cid) is not None
+                            and snap_timestamps.get(cid)
                         ]
                         if len(sync_cids) >= 2:
                             ts_vals = [snap_timestamps[cid] for cid in sync_cids]
@@ -338,10 +348,13 @@ class DataRecorder(Node):
                     self.timestamps.append(timestamp_nsec)
                     data_processed = 0
                     for container_id, (msg_data, processed_data) in tick.items():
-                        last_msg, repeats = self._last_msgs.get(container_id, (None, 0))
-                        # identity, not equality: the subscriber stores a new object per message received
-                        repeats = repeats + 1 if msg_data is not None and msg_data is last_msg else 0
-                        self._last_msgs[container_id] = (msg_data, repeats)
+                        last_msg, last_stamp, repeats = self._last_msgs.get(container_id, (None, None, 0))
+                        # Same object (the subscriber stores a new one per message received), or same non-zero
+                        # header stamp: a TF lookup returns a new object every tick even when its source has stopped.
+                        stamp = _stamp_key(msg_data)
+                        same = msg_data is last_msg or (stamp is not None and stamp == last_stamp)
+                        repeats = repeats + 1 if msg_data is not None and same else 0
+                        self._last_msgs[container_id] = (msg_data, stamp, repeats)
                         if processed_data:
                             self._last_valid_raw[container_id] = processed_data
                             self._buffered_bytes += _sample_nbytes(processed_data)
@@ -444,6 +457,16 @@ class DataRecorder(Node):
                         f"({len(self.timestamps)} kept): inputs were more than {self._sync_tolerance}s apart."
                     )
 
+                self.stop_problem = ""
+                if not self.timestamps:  # nothing to save, nothing to retry: an empty demo must not look recorded
+                    self.stop_problem = (
+                        f"No sample was recorded: sync_mode strict dropped all {self._strict_drops} ticks "
+                        f"(inputs more than {self._sync_tolerance}s apart)." if self._strict_drops else
+                        "No sample was recorded (no input had data).")
+                    logger.error(f"{self.stop_problem} Nothing saved for {self.h5_file_path}.")
+                    self._discard_h5_file()
+                    return False
+
                 self._unsaved = True  # until the file is saved AND closed: a failed close must not lose the demo at the next Start
                 saved = self._save_recorded_data()
 
@@ -467,6 +490,12 @@ class DataRecorder(Node):
                     finally:
                         self.h5_file = None
 
+                if saved:
+                    try:
+                        self._finish_h5_file()
+                    except OSError as e:
+                        logger.error(f"Could not rename {self._partial_path()} to {self.h5_file_path}: {e}")
+                        saved = False
                 if not saved:
                     logger.error(f"Recording NOT saved to {self.h5_file_path}; data is still in memory")
                     self._set_aside_partial()
@@ -492,6 +521,8 @@ class DataRecorder(Node):
             self._create_h5_file(self.recording_metadata["demo_name"], mode="w")  # replaces its own partial file
             saved = self._save_recorded_data()
             self.h5_file.close()  # saved only once closed
+            if saved:
+                self._finish_h5_file()
         except Exception as e:
             logger.error(f"Retry save failed: {e}")
             saved = False
@@ -514,10 +545,31 @@ class DataRecorder(Node):
         self._partial_files = []
         return True
 
+    def _partial_path(self):
+        return self.h5_file_path + ".partial"
+
+    def _discard_h5_file(self):
+        """Close and delete the demo's file (a demo with nothing in it)."""
+        try:
+            if self.h5_file:
+                self.h5_file.close()
+        except Exception as e:
+            logger.error(f"Could not close {self._partial_path()}: {e}")
+        self.h5_file = None
+        if self.h5_file_path and os.path.exists(self._partial_path()):
+            os.remove(self._partial_path())
+
+    def _finish_h5_file(self):
+        """The demo is saved and closed: its .partial becomes the .h5 that Review and the converters list."""
+        if self.h5_file_path and os.path.exists(self._partial_path()):
+            os.replace(self._partial_path(), self.h5_file_path)
+
     def _set_aside_partial(self):
-        """Rename a half-written demo to ``<name>.h5.partial``: as a .h5 the Review page and the converters would
+        """Keep a half-written demo as ``<name>.h5.partial``: as a .h5 the Review page and the converters would
         take it for a demo. Removed once a retry saves the whole demo; kept (for inspection) after "Close anyway"."""
-        if self.h5_file_path and os.path.exists(self.h5_file_path):
+        if self.h5_file_path and os.path.exists(self._partial_path()):
+            self._partial_files.append(self._partial_path())
+        elif self.h5_file_path and os.path.exists(self.h5_file_path):
             try:
                 os.replace(self.h5_file_path, self.h5_file_path + ".partial")
                 self._partial_files.append(self.h5_file_path + ".partial")
@@ -551,9 +603,12 @@ class DataRecorder(Node):
 
             self.recorded_data_dir = output_dir
             self.h5_file_path = os.path.join(str(output_dir), f"{demo_name}.h5")
-            # "w-": never overwrite a demo already there
-            self.h5_file = h5py.File(self.h5_file_path, mode, libver="latest")
-            logger.info(f"Created H5 file: {self.h5_file_path}")
+            if mode == "w-" and os.path.exists(self.h5_file_path):  # never overwrite a demo already there
+                raise FileExistsError(f"{self.h5_file_path} already exists")
+            # Written as .partial and renamed once saved and closed (_finish_h5_file): until then Review and the
+            # converters do not list it, so a crash or kill mid-demo leaves no empty file that looks like a demo.
+            self.h5_file = h5py.File(self._partial_path(), mode, libver="latest")
+            logger.info(f"Created H5 file: {self._partial_path()}")
         except Exception as e:
             logger.error(f"Failed to create H5 file: {e}")
             raise

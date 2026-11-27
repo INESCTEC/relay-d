@@ -577,40 +577,23 @@ class TopicContainers:
             info_dict (dict): Dictionary with information to update
         """
         try:
-            topic_type = getattr(container, "topic_type", "unknown")
+            # Chosen by the widget the container loaded, not by topic_type: topic_type is the input name's first word
+            # ("camera" for camera_rgb), and every unknown word loads imageWidget.ui.
+            name_label = next((getattr(container, n) for n in ("label_topic_name", "text_data_display", "label_actuator_name")
+                               if hasattr(container, n)), None)
+            if name_label is not None and info_dict.get("input_name"):
+                name_label.setText(str(info_dict["input_name"]))
+                if info_dict.get("topic_path"):
+                    name_label.setToolTip(str(info_dict["topic_path"]))
 
-            if topic_type == "image":
-                image_labels = {
-                    "input_name": "label_topic_name",
-                    "topic_path": "label_topic_name",
-                    "status": "label_frame_rate",
-                }
-                for key, label_name in image_labels.items():
-                    if key in info_dict and hasattr(container, label_name):
-                        container.__getattribute__(label_name).setText(
-                            str(info_dict[key])
-                        )
-
-            elif topic_type in ["joint", "pose", "tf"]:
-                if "input_name" in info_dict and hasattr(
-                    container, "text_data_display"
-                ):
-                    container.text_data_display.setText(str(info_dict["input_name"]))
-                if "status" in info_dict and hasattr(container, "positionLabel"):
-                    container.positionLabel.setText(str(info_dict["status"]))
-
-            elif topic_type == "gripper":
-                if "input_name" in info_dict and hasattr(
-                    container, "label_actuator_name"
-                ):
-                    container.label_actuator_name.setText(str(info_dict["input_name"]))
-                if "status" in info_dict and hasattr(container, "label_actuator_state"):
-                    container.label_actuator_state.setText(str(info_dict["status"]))
-
-            else:
-                for key, value in info_dict.items():
-                    if hasattr(container, f"label_{key}"):
-                        getattr(container, f"label_{key}").setText(str(value))
+            # The status goes to a large text area, never to the small metric badges (it would be cut off there).
+            if "status" in info_dict:
+                status = str(info_dict["status"])
+                area = next((getattr(container, n) for n in ("label_actuator_state", "dataVisualizationLabel")
+                             if hasattr(container, n)), None)
+                if area is not None:
+                    area.setText(status)
+                container.setToolTip(status)
 
         except Exception as e:
             logger.error(f"Failed to update container info: {e}")

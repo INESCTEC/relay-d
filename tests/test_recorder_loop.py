@@ -159,11 +159,6 @@ def test_an_image_without_bgr8_conversion_is_kept_as_decoded(encoding, image, mo
 
 def test_record_page_ignores_config_changes_while_recording(qapp, monkeypatch):
     pytest.importorskip("rclpy")
-    for name in ("PyQt5.QtMultimedia", "PyQt5.QtMultimediaWidgets"):  # not in every PyQt5 install; unused here
-        try:
-            __import__(name)
-        except ImportError:
-            monkeypatch.setitem(sys.modules, name, MagicMock())
     from relay_d.acquisition.qt_app.ui.record.record_page import RecordPage
 
     page = RecordPage.__new__(RecordPage)
@@ -279,3 +274,63 @@ def test_strict_sync_counts_and_reports_dropped_ticks(recorder_cls, monkeypatch,
     rec.stop_recording()
     assert rec._strict_drops == 5 and rec.timestamps == []
     assert rec.recording_metadata["strict_sync_dropped_ticks"] == 5  # stored with the demo, not only logged
+
+
+def test_a_tf_whose_source_stopped_is_counted_as_held(recorder_cls, monkeypatch):
+    """A TF lookup returns a new object every tick, also when its source has stopped: the header stamp tells."""
+    msgs = _real_message_classes(recorder_cls)
+    rec = _loop_ready(recorder_cls, monkeypatch)
+    get = sys.modules[recorder_cls.__module__].user_settings.get
+    monkeypatch.setattr(sys.modules[recorder_cls.__module__].user_settings, "get",
+                        lambda k: 0.002 if k == "infer_max_obs_age_s" else get(k))  # 2 repeats at 1000 Hz
+
+    def tf(sec):
+        m = msgs.JointState()  # any message with a header: the loop only looks at the stamp
+        m.name, m.position = ["j"], [1.0]
+        m.header = SimpleNamespace(stamp=SimpleNamespace(sec=sec, nanosec=0), frame_id="")
+        return m
+
+    frames = [{"live": tf(1 + i), "dead": tf(5), "static": tf(0)} for i in range(6)]  # new objects every tick
+    subs = _FakeSubscribers(rec, frames, {"live": msgs.JointState, "dead": msgs.JointState, "static": msgs.JointState})
+    rec.topic_subscribers = subs
+    rec._standard_recording_loop(subs)
+    assert rec._held_counts.get("live", 0) == 0
+    assert rec._held_counts["dead"] == 3  # was 0: a stopped TF was saved as live data
+    assert rec._held_counts.get("static", 0) == 0  # stamp 0 (static chain): never marked as stopped
+
+
+def test_strict_sync_ignores_an_input_without_a_header_stamp(recorder_cls, monkeypatch, tmp_path):
+    """An unset stamp (0) is no time at all: it must not make every tick look out of sync."""
+    msgs = _real_message_classes(recorder_cls)
+    config = {"config": {"recording_frequency": 1000, "sync_mode": "strict", "sync_tolerance_sec": 0.05,
+                         "input": {"a": {"topic": "/a"}, "b": {"topic": "/b"}}}}
+    rec = _loop_ready(recorder_cls, monkeypatch, _config_parser(config))
+    rec.output_directory = str(tmp_path)
+    js = msgs.JointState()
+    js.name, js.position = ["j"], [1.0]
+    subs = _FakeSubscribers(rec, [{"a": js, "b": js}] * 5, {"a": msgs.JointState, "b": msgs.JointState})
+    subs.get_content_and_timestamps = lambda f=subs.get_content_and_timestamps: (f()[0], {"a": 1000.0, "b": 0.0})
+    subs.flush_latest_data = lambda: None
+    assert rec.start_recording(subs, "d") is True
+    rec.recording_thread.join(5)
+    assert rec.stop_recording() is True
+    assert rec._strict_drops == 0 and len(rec.timestamps) == 5  # was 5 drops and an empty demo
+
+
+def test_a_demo_with_no_sample_is_not_saved_and_says_why(recorder_cls, monkeypatch, tmp_path):
+    msgs = _real_message_classes(recorder_cls)
+    config = {"config": {"recording_frequency": 1000, "sync_mode": "strict", "sync_tolerance_sec": 0.05,
+                         "input": {"a": {"topic": "/a"}, "b": {"topic": "/b"}}}}
+    rec = _loop_ready(recorder_cls, monkeypatch, _config_parser(config))
+    rec.output_directory = str(tmp_path)
+    js = msgs.JointState()
+    js.name, js.position = ["j"], [1.0]
+    subs = _FakeSubscribers(rec, [{"a": js, "b": js}] * 5, {"a": msgs.JointState, "b": msgs.JointState})
+    subs.get_content_and_timestamps = lambda f=subs.get_content_and_timestamps: (f()[0], {"a": 1.0, "b": 2.0})  # 1 s apart
+    subs.flush_latest_data = lambda: None
+    assert rec.start_recording(subs, "d") is True
+    rec.recording_thread.join(5)
+    assert rec.stop_recording() is False  # was True: an empty demo reported as saved
+    assert list(tmp_path.rglob("d.h5*")) == []  # no empty demo left behind
+    assert rec._unsaved is False  # nothing to retry
+    assert "strict" in rec.stop_problem and "5" in rec.stop_problem

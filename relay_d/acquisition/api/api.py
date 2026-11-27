@@ -123,6 +123,10 @@ class AppAPI:
         return started
 
     def stop_recording(self) -> bool:
+        """Stop and save the demo. False when it was not saved, or when it was saved but sampling had stopped early
+        (buffer full, or the recording loop kept failing: the GUI shows a dialog for these); see the log."""
+        cut_short = ("the recording buffer was full" if getattr(self._data_recorder, "buffer_full", False) else
+                     "the recording loop kept failing" if getattr(self._data_recorder, "loop_failed", False) else "")
         result = self._data_recorder.stop_recording()
         if not self._data_recorder.is_recording:  # saved, or kept in memory for a retry: subscribe again at the next start
             self._topic_subscribers.clear_all_subscribers()
@@ -138,6 +142,9 @@ class AppAPI:
                         )
             except Exception as e:
                 logger.error(f"Error validating recording: {e}")
+        if result and cut_short:
+            logger.error(f"Demo saved but INCOMPLETE: sampling stopped before Stop because {cut_short} (see the log).")
+            return False
         return result
 
     def delete_demo(self, file_path: str) -> bool:

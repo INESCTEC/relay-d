@@ -279,3 +279,25 @@ def test_a_file_listed_twice_is_converted_once(tmp_path):
     conv = _converter()
     assert conv.convert_multiple_files("robomimic", [str(rec), str(rec)], str(out))
     assert conv.converted_demos == len(LENGTHS)  # was 2x: every demo duplicated in the dataset
+
+
+def test_a_second_conversion_into_the_same_folder_keeps_an_edited_action_config(workspace):
+    tmp, cfg, rec_dir = workspace
+    run = lambda name: cli_main(["--config", str(cfg), "--format", "robomimic",  # noqa: E731
+                                 "--input", str(rec_dir), "--output", str(tmp / "out" / name)])
+    assert run("ds1.h5") == 0
+    action_cfg = tmp / "out" / "action_dispatcher" / "action_config.yaml"
+    action_cfg.write_text("# tuned for our robot\n")
+    assert run("ds2.h5") == 0
+    assert action_cfg.read_text() == "# tuned for our robot\n"  # was the template again
+
+
+def test_converting_into_the_config_folder_with_its_options_file_writes_every_file(workspace, capsys):
+    tmp, cfg, rec_dir = workspace
+    (cfg.parent / "postprocess_config.yaml").write_text(yaml.safe_dump({
+        "postprocess": {"robomimic": {"splits": {"train_frac": 1.0, "val_frac": 0.0}}}
+    }))
+    assert cli_main(["--config", str(cfg), "--format", "robomimic", "--input", str(rec_dir),
+                     "--output", str(cfg.parent / "ds.h5")]) == 0
+    assert (cfg.parent / "action_dispatcher" / "obs_config.yaml").exists()  # was skipped: SameFileError
+    assert "warning" not in capsys.readouterr().err

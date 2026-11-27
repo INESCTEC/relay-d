@@ -1,7 +1,7 @@
 """Run tab: start a trained policy on the robot (``lfd-inference-node``) and stop it safely.
 
-The node runs as a child process; its output is shown in the log view. Stop sends SIGINT, the node's
-Ctrl+C path, which sends the safe stop and closes.
+The node runs as a child process; its output is shown in the log view. Stop sends SIGTERM, which the node
+handles like Ctrl+C: it sends the safe stop and closes.
 """
 
 import os
@@ -40,7 +40,8 @@ def build_args(checkpoint, dispatch_dir, device, hz, dry_run):
     args = ["-m", "relay_d.dispatch.inference_node", "--checkpoint", checkpoint,
             "--obs-config", os.path.join(dispatch_dir, DISPATCH_FILES[0]),
             "--action-config", os.path.join(dispatch_dir, DISPATCH_FILES[1]),
-            "--device", device]
+            "--device", device,
+            "--exit-with-parent"]  # if the GUI dies, the node stops the robot instead of driving it unattended
     if hz.strip():
         args += ["--hz", hz.strip()]
     if dry_run:
@@ -192,16 +193,16 @@ class RunPage:
         self._update_buttons()
 
     def stop(self):
-        """SIGINT (the node's Ctrl+C: safe stop, then exit); killed if still alive after 5 s."""
+        """SIGTERM (handled by the node like Ctrl+C: safe stop, then exit); killed if still alive after 5 s."""
         if not self.is_running():
             return
-        self.log.appendPlainText("Stopping (SIGINT)...")
-        os.kill(int(self.proc.processId()), signal.SIGINT)
+        self.log.appendPlainText("Stopping (SIGTERM)...")
+        os.kill(int(self.proc.processId()), signal.SIGTERM)
         self._kill_timer.start(KILL_AFTER_MS)
 
     def _kill_if_alive(self):
         if self.is_running():
-            msg = (f"The policy did not stop {KILL_AFTER_MS // 1000} s after SIGINT: KILLED. "
+            msg = (f"The policy did not stop {KILL_AFTER_MS // 1000} s after SIGTERM: KILLED. "
                    "The safe stop may NOT have been sent: check the robot.")
             logger.error(msg)
             self.log.appendPlainText(f"!!! {msg}")

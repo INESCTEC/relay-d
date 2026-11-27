@@ -31,6 +31,7 @@ re-exported below for direct/advanced use.
 from __future__ import annotations
 
 import logging
+import os
 import time
 import numpy as np
 
@@ -95,18 +96,26 @@ def _wait_for_obs(obs_node: ObsBuilder, obs_keys: List[str], timeout: float, pol
 
 def save_dispatch_templates(output_dir) -> List[Path]:
     """Copy the action_config.yaml template and the inference script into ``output_dir`` (the Post-process page's
-    action_dispatcher folder), so data prep writes the same config format that inference reads."""
+    action_dispatcher folder), so data prep writes the same config format that inference reads. A file already there
+    is kept: it may be tuned for the robot (a second conversion into the same folder must not reset it)."""
     package = resources.files("relay_d.dispatch")
     written = []
     for source, name in (("config_templates/action_config_template.yaml", "action_config.yaml"),
                          ("templates/inference_script_template.py", "inference_script.py")):
         destination = Path(output_dir) / name
+        if destination.exists():
+            logger.info(f"Kept the existing {destination}")
+            continue
         destination.write_bytes(package.joinpath(source).read_bytes())
         written.append(destination)
     return written
 
 class InferenceSession:
     """Owns one ObsBuilder + policy + ActionDispatcher for a single rclpy process."""
+
+    _chunked = False  # trajectory entries get the policy's whole chunk (see _setup_chunking)
+    _new_chunk = None  # a chunk predicted this tick, sent to the trajectory entries by dispatch()
+    _chunk_queue = ()
 
     def __init__(
         self,
@@ -140,7 +149,10 @@ class InferenceSession:
         self._rclpy_initialized = not rclpy.ok()  # shut down in close() only if this session started it
         if self._rclpy_initialized:
             user_settings.apply_ros_domain()  # same domain as the GUI and AppAPI
-            rclpy.init()
+            from rclpy.signals import SignalHandlerOptions
+
+            # No rclpy signal handlers: on Ctrl+C they shut ROS down before run()'s finally could publish the stop.
+            rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
 
         self.obs_node = ObsBuilder(obs_config)
 
@@ -157,6 +169,7 @@ class InferenceSession:
         self.obs_node.use_only(self.model.obs_keys)  # stale and pre-flight checks: only what the policy reads
         self.dispatcher = ActionDispatcher(self.obs_node, action_config, dry_run=dry_run)
         self._check_action_layout()
+        self._setup_chunking()
         self._was_stale = False  # after stale inputs the policy restarts: no queued actions or frames from before the gap
 
         # Single-threaded, as the recorder: rclpy's MultiThreadedExecutor could not keep up with 3 cameras at 20 Hz next to
@@ -232,13 +245,38 @@ class InferenceSession:
     def get_observation(self) -> Dict[str, np.ndarray]:
         return self.obs_node.get_obs()
 
+    def _setup_chunking(self) -> None:
+        """With trajectory entries and a policy whose chunk is what it executes (LeRobot ACT): the whole chunk goes to
+        the trajectory entries once per n_action_steps ticks, the other entries get one action of it per tick.
+        Otherwise every entry gets one action per tick (one-point trajectories)."""
+        from collections import deque
+
+        steps = int(getattr(self.model, "chunk_steps", 0) or 0)
+        self._chunked = bool(getattr(self.dispatcher, "has_trajectories", False) and steps > 0)
+        self._chunk_queue = deque()
+        self._new_chunk = None
+        if getattr(self.dispatcher, "has_trajectories", False) and not self._chunked:
+            logger.info("[InferenceSession] this policy gives one action per tick: trajectories get one point per tick.")
+
     def predict(self, obs: Optional[Dict[str, np.ndarray]] = None) -> np.ndarray:
         if obs is None:
             obs = self.get_observation()
-        return self.model.get_action(obs)
+        if not self._chunked:
+            return self.model.get_action(obs)
+        if not self._chunk_queue:
+            chunk = self.model.get_action_chunk(obs)
+            self._new_chunk = chunk
+            self._chunk_queue.extend(chunk[: self.model.chunk_steps])
+        return self._chunk_queue.popleft()
 
     def dispatch(self, action: np.ndarray) -> None:
-        self.dispatcher.dispatch(action)
+        chunk, self._new_chunk = self._new_chunk, None
+        if chunk is not None:
+            self.dispatcher.dispatch_trajectory(chunk)
+        if self._chunked:  # the trajectory entries got the chunk: the others get this step
+            self.dispatcher.dispatch(action, trajectories=False)
+        else:
+            self.dispatcher.dispatch(action)
 
     def _stale_inputs(self, max_obs_age: float) -> Dict[str, float]:
         """Inputs, and the observations the model uses, that have not refreshed within max_obs_age."""
@@ -280,6 +318,9 @@ class InferenceSession:
 
     def reset(self) -> None:
         self.model.reset()
+        if self._chunked:  # a new episode (or after stale inputs): no actions predicted before it
+            self._chunk_queue.clear()
+            self._new_chunk = None
 
     def _reset_after_stale(self) -> None:
         if self._was_stale:
@@ -291,10 +332,13 @@ class InferenceSession:
     # -------------------------------------------------------------------
 
     def run(self, hz: Optional[float] = None, max_steps: Optional[int] = None,
-            validate_timeout: Optional[float] = None, max_obs_age: Optional[float] = None) -> bool:
+            validate_timeout: Optional[float] = None, max_obs_age: Optional[float] = None,
+            parent_pid: Optional[int] = None) -> bool:
         """The inference loop until Ctrl+C, max_steps or a model error; always ends with the safe stop.
         ``hz``: control rate, 0 = as fast as possible (default: the rate the policy was trained at, else the infer_hz
         setting). None for the others = the user setting (infer_obs_wait_s, infer_max_obs_age_s).
+        ``parent_pid``: the loop also ends when this process is no longer the parent (the GUI that started the node
+        died: nobody could stop it any more).
         Returns False if it ended on a model error, True otherwise."""
         fps = getattr(self.model, "fps", None)
         # Each predicted action is one step of the training data: at another rate the robot moves faster or slower than shown.
@@ -340,12 +384,18 @@ class InferenceSession:
         self.reset()
 
         min_dt = (1.0 / hz) if hz > 0 else 0.0
+        # A trajectory's points are one control period apart (unthrottled: the rate the policy was trained at).
+        self.dispatcher.period = min_dt or (1.0 / fps if fps else getattr(self.dispatcher, "period", 0.05))
         step_count = 0
         model_failed = False
 
         try:
             while rclpy.ok():
                 t0 = time.monotonic()
+                if parent_pid is not None and os.getppid() != parent_pid:
+                    self.obs_node.get_logger().error(
+                        f"The process that started inference ({parent_pid}) is gone: stopping the robot.")
+                    break
 
                 try:
                     action = self.step(max_obs_age)
