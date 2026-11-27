@@ -102,9 +102,8 @@ def test_subprocess_policy_runner_end_to_end_shm_chunk_resize_and_cleanup(tmp_pa
         assert action.dtype == np.float32 and action.shape == (4,)
         np.testing.assert_allclose(action, [6.0, 120.0, 48.0, 1.0])
 
-        # Slot files must be unlinked immediately after map_shm so zero /dev/shm files leak on SIGKILL.
-        remaining_slots = [p for p in os.listdir(ipc_dir) if p.startswith("slot_")]
-        assert remaining_slots == []
+        # Zero slot files (and on Linux memfd, zero IPC dir at all) so nothing leaks in /dev/shm on SIGKILL.
+        assert not os.path.exists(ipc_dir) or [p for p in os.listdir(ipc_dir) if p.startswith("slot_")] == []
 
         # Second call reuses existing mmap slots with new pixel values.
         obs["cam_top"] = np.full((64, 80, 3), 200, dtype=np.uint8)
@@ -117,7 +116,7 @@ def test_subprocess_policy_runner_end_to_end_shm_chunk_resize_and_cleanup(tmp_pa
         obs["cam_wrist"] = np.full((96, 128, 3), 10, dtype=np.uint8)
         action2 = runner.get_action(obs)
         np.testing.assert_allclose(action2, [6.0, 200.0, 96.0, 1.0])
-        assert [p for p in os.listdir(ipc_dir) if p.startswith("slot_")] == []
+        assert not os.path.exists(ipc_dir) or [p for p in os.listdir(ipc_dir) if p.startswith("slot_")] == []
 
         # Errors inside the worker propagate as RuntimeError (so InferenceSession triggers safe stop).
         bad_obs = dict(obs, state=np.array([-100.0, 0.0, 0.0], dtype=np.float32))

@@ -31,7 +31,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from relay_d.utils.coloring_logger import logger
-from .policy_worker import recv_frame, send_frame
+from .policy_worker import recv_frame, send_fds, send_frame
 
 
 @dataclass
@@ -98,9 +98,14 @@ class SubprocessPolicyRunner:
         python_executable: Optional[str] = None,
         worker_module: str = "relay_d.dispatch.policy_worker",
         connect_timeout: float = 30.0,
+        step_timeout: float = 30.0,
+        init_timeout: float = 300.0,
     ):
         self._closed = False
         self._backend = backend
+        self._step_timeout = float(step_timeout)
+        self._init_timeout = float(init_timeout)
+        self._use_memfd = hasattr(os, "memfd_create") and hasattr(socket, "SCM_RIGHTS")
         self._proc: Optional[subprocess.Popen] = None
         self._server_sock: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
@@ -120,18 +125,24 @@ class SubprocessPolicyRunner:
             self._server_sock.setblocking(False)
 
             py = _worker_python(backend, python_executable)
-            cmd = [py, "-m", worker_module, "--socket", self._sock_path]
+            cmd = [py, "-m", worker_module, "--socket", self._sock_path, "--parent-pid", str(os.getpid())]
             logger.info(f"[SubprocessPolicyRunner] Spawning {backend} worker with {py}")
             self._proc = subprocess.Popen(cmd, env=_worker_env())
 
             self._conn = self._accept_worker(timeout=connect_timeout)
-            # Socket path is no longer needed once connected.
+            # Socket path is no longer needed once connected; with memfd we can remove the IPC dir too
+            # so zero filesystem entries exist in /dev/shm even if the parent is SIGKILL'd.
             self._server_sock.close()
             self._server_sock = None
             try:
                 os.unlink(self._sock_path)
             except OSError:
                 pass
+            if self._use_memfd:
+                try:
+                    os.rmdir(self._ipc_dir)
+                except OSError:
+                    pass
 
             reply, _ = self._rpc(
                 {
@@ -142,7 +153,8 @@ class SubprocessPolicyRunner:
                     "state_keys": state_keys,
                     "fallback_state_keys": fallback_state_keys,
                     "task": task,
-                }
+                },
+                timeout=self._init_timeout,
             )
             self.obs_keys: List[str] = list(reply.get("obs_keys", []))
             self.action_dim: Optional[int] = reply.get("action_dim")
@@ -172,18 +184,37 @@ class SubprocessPolicyRunner:
                     f"[SubprocessPolicyRunner] {self._backend} worker exited early (code {code}) before connecting."
                 )
 
-    def _rpc(self, req: dict, payload: bytes = b"") -> Tuple[dict, bytes]:
+    def _rpc(
+        self,
+        req: dict,
+        payload: bytes = b"",
+        timeout: Optional[float] = None,
+        fds: Optional[List[int]] = None,
+    ) -> Tuple[dict, bytes]:
         if self._closed or self._conn is None:
             raise RuntimeError("[SubprocessPolicyRunner] Policy worker is closed.")
         try:
             send_frame(self._conn, req, payload)
+            if fds:
+                send_fds(self._conn, fds)
         except OSError as exc:
             raise RuntimeError(f"[SubprocessPolicyRunner] Failed sending '{req.get('cmd')}' to worker: {exc}") from exc
 
-        # Poll readability alongside proc.poll() so a crashing worker or Ctrl+C surfaces promptly
-        # while slow model loads (e.g. SmolVLA onto CUDA) never hit an artificial short timeout.
+        deadline = (time.monotonic() + timeout) if (timeout is not None and timeout > 0) else None
+        # Poll readability alongside proc.poll() so a crashing or wedged worker surfaces promptly
+        # and InferenceSession can trigger send_stop().
         while True:
-            ready, _, _ = select.select([self._conn], [], [], 0.25)
+            wait = 0.25
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.close()
+                    raise TimeoutError(
+                        f"[SubprocessPolicyRunner] {self._backend} worker timed out after {timeout:.1f}s "
+                        f"during '{req.get('cmd')}'."
+                    )
+                wait = min(wait, remaining)
+            ready, _, _ = select.select([self._conn], [], [], wait)
             if ready:
                 frame = recv_frame(self._conn)
                 if frame is None:
@@ -214,57 +245,78 @@ class SubprocessPolicyRunner:
             keys = list(obs_dict.keys())
 
         arrays: Dict[str, np.ndarray] = {}
-        to_map: Dict[str, dict] = {}
+        to_map_paths: Dict[str, dict] = {}
         new_paths: List[str] = []
+        to_map_specs: List[dict] = []
+        to_map_fds: List[int] = []
 
-        for key in keys:
-            arr = np.ascontiguousarray(obs_dict[key])
-            arrays[key] = arr
-            shape = tuple(arr.shape)
-            dtype_str = arr.dtype.str
-            nbytes = int(arr.nbytes)
+        try:
+            for key in keys:
+                arr = np.ascontiguousarray(obs_dict[key])
+                arrays[key] = arr
+                shape = tuple(arr.shape)
+                dtype_str = arr.dtype.str
+                nbytes = int(arr.nbytes)
 
-            existing = self._slots.get(key)
-            if (
-                existing is not None
-                and existing.shape == shape
-                and existing.dtype_str == dtype_str
-                and existing.nbytes == nbytes
-            ):
-                continue
+                existing = self._slots.get(key)
+                if (
+                    existing is not None
+                    and existing.shape == shape
+                    and existing.dtype_str == dtype_str
+                    and existing.nbytes == nbytes
+                ):
+                    continue
 
-            if existing is not None:
-                existing.close()
-                del self._slots[key]
+                if existing is not None:
+                    existing.close()
+                    del self._slots[key]
 
-            self._slot_counter += 1
-            slot_path = os.path.join(self._ipc_dir, f"slot_{self._slot_counter}.bin")
-            fd = os.open(slot_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-            try:
-                os.ftruncate(fd, max(1, nbytes))
-                mm = mmap.mmap(fd, max(1, nbytes), access=mmap.ACCESS_WRITE)
-            finally:
-                os.close(fd)
-
-            if arr.size == 0:
-                view = np.empty(shape, dtype=arr.dtype)
-            else:
-                view = np.frombuffer(mm, dtype=arr.dtype, count=arr.size).reshape(shape)
-            self._slots[key] = _ClientSlot(mm=mm, view=view, shape=shape, dtype_str=dtype_str, nbytes=nbytes)
-            to_map[key] = {"path": slot_path, "shape": list(shape), "dtype": dtype_str, "nbytes": nbytes}
-            new_paths.append(slot_path)
-
-        if to_map:
-            try:
-                self._rpc({"cmd": "map_shm", "slots": to_map})
-            finally:
-                # Immediately unlink slot paths once mapped (or on failure): both processes keep
-                # their live mmap handles and the kernel reclaims the tmpfs RAM even on SIGKILL.
-                for p in new_paths:
+                self._slot_counter += 1
+                size = max(1, nbytes)
+                if self._use_memfd:
+                    fd = os.memfd_create(f"relayd_slot_{self._slot_counter}")
                     try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
+                        os.ftruncate(fd, size)
+                        mm = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
+                    except BaseException:
+                        os.close(fd)
+                        raise
+                    to_map_fds.append(fd)
+                    to_map_specs.append({"key": key, "shape": list(shape), "dtype": dtype_str, "nbytes": nbytes})
+                else:
+                    slot_path = os.path.join(self._ipc_dir, f"slot_{self._slot_counter}.bin")
+                    fd = os.open(slot_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                    try:
+                        os.ftruncate(fd, size)
+                        mm = mmap.mmap(fd, size, access=mmap.ACCESS_WRITE)
+                    finally:
+                        os.close(fd)
+                    to_map_paths[key] = {"path": slot_path, "shape": list(shape), "dtype": dtype_str, "nbytes": nbytes}
+                    new_paths.append(slot_path)
+
+                if arr.size == 0:
+                    view = np.empty(shape, dtype=arr.dtype)
+                else:
+                    view = np.frombuffer(mm, dtype=arr.dtype, count=arr.size).reshape(shape)
+                self._slots[key] = _ClientSlot(mm=mm, view=view, shape=shape, dtype_str=dtype_str, nbytes=nbytes)
+
+            if to_map_specs:
+                self._rpc({"cmd": "map_shm_fd", "slots": to_map_specs}, timeout=self._step_timeout, fds=to_map_fds)
+            elif to_map_paths:
+                self._rpc({"cmd": "map_shm", "slots": to_map_paths}, timeout=self._step_timeout)
+        finally:
+            for fd in to_map_fds:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            # Immediately unlink slot paths once mapped (or on failure): both processes keep
+            # their live mmap handles and the kernel reclaims the tmpfs RAM even on SIGKILL.
+            for p in new_paths:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
         for key, arr in arrays.items():
             if arr.size > 0:
@@ -276,16 +328,16 @@ class SubprocessPolicyRunner:
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        self._rpc({"cmd": "reset"})
+        self._rpc({"cmd": "reset"}, timeout=self._step_timeout)
 
     def get_action(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
         keys = self._sync_obs_to_shm(obs_dict)
-        reply, payload = self._rpc({"cmd": "get_action", "keys": keys})
+        reply, payload = self._rpc({"cmd": "get_action", "keys": keys}, timeout=self._step_timeout)
         return np.frombuffer(payload, dtype=np.dtype(reply["dtype"])).reshape(reply["shape"]).copy()
 
     def get_action_chunk(self, obs_dict: Dict[str, np.ndarray]) -> np.ndarray:
         keys = self._sync_obs_to_shm(obs_dict)
-        reply, payload = self._rpc({"cmd": "get_action_chunk", "keys": keys})
+        reply, payload = self._rpc({"cmd": "get_action_chunk", "keys": keys}, timeout=self._step_timeout)
         return np.frombuffer(payload, dtype=np.dtype(reply["dtype"])).reshape(reply["shape"]).copy()
 
     def close(self) -> None:

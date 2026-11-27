@@ -32,7 +32,9 @@ _PRIMARY_DATASET_KEYS = (
     "joint_positions",
     "positions",
     "translations",
+    "linear_velocities",
     "images",
+    "points",
     "compressed_data",
 )
 
@@ -112,6 +114,7 @@ class DemoValidator:
                 self._check_sample_rate(demo_group, result)
                 self._check_sample_counts(demo_group, result)
                 self._check_joint_counts(demo_group, result)
+                self._check_finite_streams(demo_group, result)
                 self._check_gap_fill(demo_group, result)
         except Exception as e:
             result.checks.append(CheckResult("read_error", CheckStatus.FAIL, str(e)))
@@ -332,6 +335,26 @@ class DemoValidator:
                     CheckStatus.PASS,
                     "Joint counts consistent with joint_names",
                 )
+            )
+
+    def _check_finite_streams(self, grp, result):
+        if "streams" not in grp:
+            return
+        bad = []
+        for name, ds in grp["streams"].items():
+            if not isinstance(ds, h5py.Dataset) or not np.issubdtype(ds.dtype, np.floating):
+                continue
+            arr = ds[:]
+            if not np.isfinite(arr).all():
+                rows = int((~np.isfinite(arr).all(axis=tuple(range(1, arr.ndim)))).sum()) if arr.ndim > 1 else int((~np.isfinite(arr)).sum())
+                bad.append(f"streams/{name}: {rows} row(s) with NaN/Inf")
+        if bad:
+            result.checks.append(
+                CheckResult("finite_streams", CheckStatus.FAIL, "; ".join(bad))
+            )
+        else:
+            result.checks.append(
+                CheckResult("finite_streams", CheckStatus.PASS, "All numeric streams are finite")
             )
 
     def _check_gap_fill(self, grp, result):

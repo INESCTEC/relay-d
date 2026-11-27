@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from typing import Dict, Optional, Set, Tuple
 
 import h5py
@@ -78,8 +79,10 @@ class StreamingH5Writer:
         self._queue: queue.Queue = queue.Queue()
         self._bytes_lock = threading.Lock()
         self._queued_bytes = 0
+        self._written_items = 0
         self._error: Optional[Exception] = None
         self._closed = False
+        self._abort_flag = False
 
         self._states: Dict[str, _ContainerStreamState] = {}
         self._demo_group: Optional[h5py.Group] = None
@@ -101,6 +104,10 @@ class StreamingH5Writer:
     def error(self) -> Optional[Exception]:
         return self._error
 
+    @property
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
+
     def frame_count(self, container_id: str) -> int:
         return self._counts.get(container_id, 0)
 
@@ -109,7 +116,7 @@ class StreamingH5Writer:
 
         Returns False if the writer already failed or has been closed.
         """
-        if self._closed or self._error is not None:
+        if self._closed or self._error is not None or self._abort_flag:
             return False
         repeat = max(1, int(repeat))
         arr = _sample_array(sample)
@@ -121,15 +128,47 @@ class StreamingH5Writer:
         self._queue.put((container_id, sample, repeat, nbytes))
         return True
 
-    def finish(self, timeout: float = 30.0) -> Tuple[bool, Set[str], Optional[Exception]]:
-        """Drain all queued frames, flush the HDF5 file, and join the writer thread."""
+    def finish(
+        self,
+        timeout: float = 30.0,
+        stall_timeout: Optional[float] = None,
+    ) -> Tuple[bool, Set[str], Optional[Exception]]:
+        """Drain all queued frames, flush the HDF5 file, and join the writer thread.
+
+        Uses stall-aware draining: as long as frames are actively being written to disk (e.g. flushing
+        a large buffer to a slow HDD/USB drive), draining continues up to ``max(timeout, 180.0)`` when
+        ``timeout >= 15.0``, aborting only if no write progress happens for ``stall_timeout`` seconds.
+        """
         if not self._closed:
             self._closed = True
             self._queue.put(_SENTINEL)
+
         if self._thread.is_alive():
-            self._thread.join(timeout=timeout)
+            eff_stall = float(stall_timeout) if stall_timeout is not None else min(15.0, float(timeout))
+            max_wait = max(float(timeout), 180.0) if (stall_timeout is not None or timeout >= 15.0) else float(timeout)
+            now = time.monotonic()
+            hard_deadline = now + max_wait
+            stall_deadline = now + eff_stall
+            with self._bytes_lock:
+                last_written = self._written_items
+
+            while self._thread.is_alive():
+                now = time.monotonic()
+                if now >= hard_deadline or now >= stall_deadline:
+                    break
+                step = min(0.25, hard_deadline - now, stall_deadline - now)
+                self._thread.join(timeout=max(0.01, step))
+                with self._bytes_lock:
+                    cur_written = self._written_items
+                if cur_written != last_written:
+                    last_written = cur_written
+                    stall_deadline = time.monotonic() + eff_stall
+
         if self._thread.is_alive():
-            err = TimeoutError(f"StreamingH5Writer did not finish draining within {timeout:.1f}s")
+            self._abort_flag = True
+            self._thread.join(timeout=0.5)
+        if self._thread.is_alive():
+            err = TimeoutError(f"StreamingH5Writer stalled / did not finish draining within {timeout:.1f}s")
             self._error = self._error or err
         return self._error is None, set(self._streamed_containers), self._error
 
@@ -145,7 +184,7 @@ class StreamingH5Writer:
                     break
                 container_id, sample, repeat, nbytes = item
                 try:
-                    if self._error is None:
+                    if self._error is None and not self._abort_flag:
                         self._write_item(container_id, sample, repeat)
                 except Exception as exc:
                     self._error = exc
@@ -153,7 +192,8 @@ class StreamingH5Writer:
                 finally:
                     with self._bytes_lock:
                         self._queued_bytes = max(0, self._queued_bytes - nbytes)
-            if self._error is None:
+                        self._written_items += 1
+            if self._error is None and not self._abort_flag:
                 self._h5_file.flush()
         except Exception as exc:
             self._error = self._error or exc

@@ -236,6 +236,11 @@ class InferenceSession:
                 model_close()
         finally:
             self._executor.shutdown()
+            spin_thread = getattr(self, "_spin_thread", None)
+            if spin_thread is not None:
+                import threading
+                if spin_thread.is_alive() and spin_thread is not threading.current_thread():
+                    spin_thread.join(timeout=2.0)
             self.obs_node.destroy_node()
             if self._rclpy_initialized and rclpy.ok():
                 rclpy.shutdown()
@@ -313,6 +318,8 @@ class InferenceSession:
         """One full tick: get latest obs -> predict -> dispatch. Returns the action, or None
         (nothing dispatched) if an input is older than max_obs_age, like run()."""
         max_obs_age = user_settings.get("infer_max_obs_age_s") if max_obs_age is None else max_obs_age
+        if hasattr(self.dispatcher, "max_state_age"):
+            self.dispatcher.max_state_age = max_obs_age
         self._model_failed = False
         obs = self.get_observation()
         if logger.isEnabledFor(logging.DEBUG):  # vectors only: never format whole camera frames
@@ -412,6 +419,9 @@ class InferenceSession:
         self.dispatcher.period = min_dt or (1.0 / fps if fps else getattr(self.dispatcher, "period", 0.05))
         step_count = 0
         model_failed = False
+        # Drift-corrected monotonic anchor (same strategy as DataRecorder): prevents Linux time.sleep()
+        # oversleep from accumulating every tick and slowing down 50-100 Hz control loops.
+        next_tick = time.monotonic()
 
         try:
             while rclpy.ok():
@@ -431,6 +441,7 @@ class InferenceSession:
                     break
                 if action is None:  # stale inputs
                     time.sleep(0.05)
+                    next_tick = time.monotonic()
                     continue
 
                 logger.debug(f"[InferenceSession] raw action (full {action.shape[0]}-dim): {action.round(5)}")
@@ -446,10 +457,13 @@ class InferenceSession:
                     break
 
                 if min_dt > 0:
-                    elapsed = time.monotonic() - t0
-                    sleep_time = min_dt - elapsed
+                    next_tick += min_dt
+                    sleep_time = next_tick - time.monotonic()
                     if sleep_time > 0:
                         time.sleep(sleep_time)
+                    else:
+                        # Tick overran min_dt (or waited on feedback/ack): re-anchor instead of bursting.
+                        next_tick = time.monotonic()
 
         except KeyboardInterrupt:
             self.obs_node.get_logger().info("Shutting down inference session.")

@@ -208,12 +208,18 @@ class DataRecorder(Node):
                 return True
 
         except Exception as e:
+            writer_alive = False
             if self._stream_writer is not None:
                 try:
                     self._stream_writer.finish(timeout=5.0)
+                    writer_alive = self._stream_writer.is_alive
                 except Exception:
                     pass
                 self._stream_writer = None
+            if not writer_alive:
+                self._discard_h5_file()
+            else:
+                self.h5_file = None
             logger.error(f"Failed to start recording: {e}")
             return False
 
@@ -263,20 +269,14 @@ class DataRecorder(Node):
                 try:
                     # No spin_once here: TopicSubscribers' own spin thread drains the callbacks, and spinning the
                     # node on the global executor would take it out of that thread's executor.
-                    # Refresh all TF transforms before snapshotting data so that
-                    # every input (topics and TF alike) reflects the same moment.
-                    topic_subscribers.update_tf_lookups()
-
-                    # Atomic snapshot of data AND timestamps — both dicts are read
-                    # under a single lock so topic callbacks cannot update one after
-                    # the other has been read, which would inflate the apparent spread.
+                    # Atomic snapshot of topic data AND timestamps under a single lock.
                     all_data, snap_timestamps = (
                         topic_subscribers.get_content_and_timestamps()
                     )
 
-                    # Re-look up TF containers at the header.stamp of the most recently-stamped
-                    # topic message. This ensures TF and topic data share the same robot-clock
-                    # timestamp without any additional subscriptions.
+                    # Look up TF containers directly at the header.stamp of the most recently-stamped
+                    # topic message so TF and topics share the same robot-clock timestamp in one lookup
+                    # (falling back to latest TF only if no stamped topic exists or aligned lookup misses).
                     ref_ros_time = None
                     ref_nsec = 0
                     for cid, msg in all_data.items():
@@ -292,13 +292,25 @@ class DataRecorder(Node):
                                 ref_ros_time = rclpy.time.Time(
                                     seconds=s.sec, nanoseconds=s.nanosec
                                 )
-                    if ref_ros_time is not None and topic_subscribers.tf_lookup_containers:
-                        for tf_cid in list(topic_subscribers.tf_lookup_containers.keys()):
-                            tf_msg = topic_subscribers.lookup_tf_at_time(
-                                tf_cid, ref_ros_time, timeout_sec=0.0
-                            )
-                            if tf_msg is not None:
-                                all_data[tf_cid] = tf_msg
+                    if topic_subscribers.tf_lookup_containers:
+                        missed_tf = []
+                        if ref_ros_time is not None:
+                            for tf_cid in list(topic_subscribers.tf_lookup_containers.keys()):
+                                tf_msg = topic_subscribers.lookup_tf_at_time(
+                                    tf_cid, ref_ros_time, timeout_sec=0.0
+                                )
+                                if tf_msg is not None:
+                                    all_data[tf_cid] = tf_msg
+                                else:
+                                    missed_tf.append(tf_cid)
+                        else:
+                            missed_tf = list(topic_subscribers.tf_lookup_containers.keys())
+                        if missed_tf:
+                            topic_subscribers.update_tf_lookups()
+                            for tf_cid in missed_tf:
+                                fallback = topic_subscribers.get_content(tf_cid)
+                                if fallback is not None:
+                                    all_data[tf_cid] = fallback
 
                     # Refresh snapshot timestamps for TF containers to reflect the
                     # time-aligned data now in all_data. If lookup_tf_at_time succeeded,
@@ -500,9 +512,11 @@ class DataRecorder(Node):
                         logger.error("Recording loop did not stop within 30 s; saving what is buffered")
 
                 stream_ok = True
+                writer_still_alive = False
                 streamed_counts = {}
                 if self._stream_writer is not None:
                     stream_ok, streamed_cids, stream_err = self._stream_writer.finish()
+                    writer_still_alive = self._stream_writer.is_alive
                     streamed_counts = {
                         cid: self._stream_writer.frame_count(cid) for cid in streamed_cids
                     }
@@ -555,9 +569,18 @@ class DataRecorder(Node):
                 has_streamed = bool(self._streamed_containers)
                 # Only keep _unsaved=True for retry_save() when every container's samples still live in memory.
                 self._unsaved = not has_streamed
-                saved = stream_ok and self._save_recorded_data()
-                if not stream_ok and self.write_error:
-                    self.stop_problem = f"Disk write failed while streaming frames: {self.write_error}"
+                if writer_still_alive:
+                    # Never write to or close self.h5_file while the background writer thread is still
+                    # inside libhdf5 — concurrent HDF5 handle access can segfault.
+                    saved = False
+                    self.h5_file = None
+                    self.stop_problem = (
+                        f"Disk write stalled while streaming frames: {self.write_error or 'writer thread still active'}"
+                    )
+                else:
+                    saved = stream_ok and self._save_recorded_data()
+                    if not stream_ok and self.write_error:
+                        self.stop_problem = f"Disk write failed while streaming frames: {self.write_error}"
 
                 if self._fill_count_summary:
                     total_filled = sum(self._fill_count_summary.values())

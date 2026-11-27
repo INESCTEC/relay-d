@@ -16,6 +16,8 @@ logs still appear live in the CLI and the Run tab.
 from __future__ import annotations
 
 import argparse
+import array
+import ctypes
 import json
 import mmap
 import os
@@ -25,7 +27,7 @@ import struct
 import sys
 import traceback
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -107,12 +109,47 @@ def _load_runner(req: dict):
     raise ValueError(f"Unknown policy backend: {backend!r}")
 
 
-def _map_slot(spec: dict) -> _MappedSlot:
-    path = spec["path"]
+def send_fds(sock: socket.socket, fds: List[int]) -> None:
+    """Pass file descriptors over a Unix domain socket via SCM_RIGHTS."""
+    sock.sendmsg([b"\x01"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+
+
+def recv_fds(sock: socket.socket, count: int) -> List[int]:
+    """Receive ``count`` file descriptors over a Unix domain socket via SCM_RIGHTS."""
+    fds = array.array("i")
+    cmsg_len = socket.CMSG_SPACE(count * fds.itemsize)
+    while len(fds) < count:
+        msg, ancdata, _flags, _addr = sock.recvmsg(1, cmsg_len)
+        if not msg and not ancdata:
+            raise EOFError("Socket closed while receiving shared-memory file descriptors")
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+                n = len(cmsg_data) - (len(cmsg_data) % fds.itemsize)
+                fds.frombytes(cmsg_data[:n])
+    return list(fds[:count])
+
+
+def _set_pdeathsig(parent_pid: Optional[int]) -> bool:
+    """Ask the Linux kernel to send SIGTERM if our parent dies (e.g. parent SIGKILL).
+
+    Returns False if the parent already died before prctl() ran.
+    """
+    if parent_pid is None:
+        return True
+    if sys.platform.startswith("linux"):
+        try:
+            PR_SET_PDEATHSIG = 1
+            libc = ctypes.CDLL("libc.so.6", use_errno=True)
+            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+        except Exception:
+            pass
+    return os.getppid() == parent_pid
+
+
+def _map_slot_fd(fd: int, spec: dict) -> _MappedSlot:
     shape = tuple(int(d) for d in spec["shape"])
     dtype = np.dtype(spec["dtype"])
     nbytes = int(spec["nbytes"])
-    fd = os.open(path, os.O_RDONLY)
     try:
         mm = mmap.mmap(fd, max(1, nbytes), access=mmap.ACCESS_READ)
     finally:
@@ -126,8 +163,15 @@ def _map_slot(spec: dict) -> _MappedSlot:
     return _MappedSlot(mm=mm, view=view, nbytes=nbytes)
 
 
-def serve(socket_path: str) -> int:
+def _map_slot(spec: dict) -> _MappedSlot:
+    fd = os.open(spec["path"], os.O_RDONLY)
+    return _map_slot_fd(fd, spec)
+
+
+def serve(socket_path: str, parent_pid: Optional[int] = None) -> int:
     """Connect to the parent's Unix socket and serve policy RPC requests until shutdown or EOF."""
+    if not _set_pdeathsig(parent_pid):
+        return 0
     # The parent ROS node handles SIGINT/SIGTERM, sends the robot's safe stop first,
     # and then sends a shutdown command (or closes the socket) to exit this worker.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -169,6 +213,27 @@ def serve(socket_path: str) -> int:
                         if old is not None:
                             old.close()
                         slots[key] = _map_slot(spec)
+                    send_frame(sock, {"ok": True})
+
+                elif cmd == "map_shm_fd":
+                    specs = req.get("slots", [])
+                    fds = recv_fds(sock, len(specs))
+                    try:
+                        for idx, (spec, fd) in enumerate(zip(specs, fds)):
+                            key = spec["key"]
+                            old = slots.pop(key, None)
+                            if old is not None:
+                                old.close()
+                            # _map_slot_fd takes ownership and closes fd
+                            fds[idx] = -1
+                            slots[key] = _map_slot_fd(fd, spec)
+                    finally:
+                        for remaining_fd in fds:
+                            if remaining_fd >= 0:
+                                try:
+                                    os.close(remaining_fd)
+                                except OSError:
+                                    pass
                     send_frame(sock, {"ok": True})
 
                 elif cmd == "reset":
@@ -220,8 +285,9 @@ def serve(socket_path: str) -> int:
 def main(argv: Optional[list] = None) -> None:
     parser = argparse.ArgumentParser(description="Relay-D isolated ML policy worker")
     parser.add_argument("--socket", required=True, help="Path to parent's Unix domain socket")
+    parser.add_argument("--parent-pid", type=int, default=None, help="Parent PID for kernel PR_SET_PDEATHSIG guard")
     args = parser.parse_args(argv)
-    sys.exit(serve(args.socket))
+    sys.exit(serve(args.socket, parent_pid=args.parent_pid))
 
 
 if __name__ == "__main__":

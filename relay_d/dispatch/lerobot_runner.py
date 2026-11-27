@@ -119,7 +119,9 @@ def build_batch(obs: Dict[str, np.ndarray], state_keys: List[str], images: Dict[
                 "(only an odd row / column of difference is cropped, like the dataset writer does)."
             )
         rgb = frame[:h, :w, ::-1]  # live frames are BGR, the dataset video (and so the policy) is RGB
-        batch[feature] = np.ascontiguousarray(rgb.transpose(2, 0, 1), dtype=np.float32) / 255.0
+        chw = np.ascontiguousarray(rgb.transpose(2, 0, 1), dtype=np.float32)
+        chw *= np.float32(1.0 / 255.0)
+        batch[feature] = chw
     if task is not None:
         batch["task"] = task
     return batch
@@ -248,8 +250,10 @@ class LeRobotPolicyRunner:
         tensors = self._tensors(obs_dict)
         with self._torch.no_grad():
             chunk = self._policy.predict_action_chunk(self._pre(tensors))  # (1, steps, action)
-            steps = [self._post(chunk[:, i]) for i in range(chunk.shape[1])]
-        return np.stack([a.detach().cpu().numpy().reshape(-1) for a in steps]).astype(np.float32)
+            steps = [self._post(chunk[:, i]).reshape(-1) for i in range(chunk.shape[1])]
+            # Single device->host transfer for the whole chunk instead of one CUDA sync per step.
+            stacked = self._torch.stack(steps, dim=0)
+        return stacked.detach().cpu().numpy().astype(np.float32, copy=False)
 
     def _tensors(self, obs_dict: Dict[str, np.ndarray]) -> dict:
         batch = build_batch(obs_dict, self.state_keys, self._images, self.task)

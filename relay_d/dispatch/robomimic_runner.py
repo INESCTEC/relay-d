@@ -139,7 +139,7 @@ class RobomimicPolicyRunner:
                 raise KeyError(
                     f"[RobomimicPolicyRunner] Missing obs key '{k}'. Expected: {self.obs_keys}"
                 )
-            frame[k] = ObsUtils.process_obs(obs_dict[k].astype(np.float32), obs_key=k)
+            frame[k] = ObsUtils.process_obs(obs_dict[k].astype(np.float32, copy=False), obs_key=k)
 
         if self._obs_horizon <= 1:
             stacked = frame

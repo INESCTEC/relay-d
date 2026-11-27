@@ -438,8 +438,11 @@ class YAMLDrivenConverter:
             logger.error(self.last_error)
             return False
 
+        # Write to a .partial sibling and atomically rename on close so SIGKILL / disk errors
+        # never leave a corrupted .h5 at output_path.
+        partial_path = output_path + ".partial"
         try:
-            with h5py.File(output_path, "w-") as out_f:
+            with h5py.File(partial_path, "w") as out_f:
                 data_grp = out_f.create_group("data")
                 total_demos = 0
                 processed: List[str] = []
@@ -484,7 +487,7 @@ class YAMLDrivenConverter:
                 if counter == 0:
                     self.last_error = "No demos could be converted."
                     logger.error(self.last_error)
-                    self._discard_output(output_path)
+                    self._discard_output(partial_path)
                     return False
 
                 # Robomimic requires `total` = number of demos (not total timesteps)
@@ -495,9 +498,10 @@ class YAMLDrivenConverter:
 
                 splits = self.options.splits()
                 if not self._create_data_mask(out_f.create_group("mask"), processed, splits["train_frac"], splits["val_frac"]):
-                    self._discard_output(output_path)
+                    self._discard_output(partial_path)
                     return False
 
+            os.replace(partial_path, output_path)
             if skipped:
                 logger.warning(
                     f"Skipped {len(skipped)} file(s) (corrupted or unreadable): {skipped}"
@@ -512,7 +516,7 @@ class YAMLDrivenConverter:
             self.last_error = f"Fatal error during conversion: {e}"
             logger.error(self.last_error)
             traceback.print_exc()
-            self._discard_output(output_path)
+            self._discard_output(partial_path)
             return False
 
     def _iter_convertible_demos(self, files: List[str], engine: DataTransformEngine, freq: float, verb: str):
@@ -1017,7 +1021,13 @@ class YAMLDrivenConverter:
                 _, rot_fmt = stream_entry(stream_configs.get(stream_name, []))
                 # present in every converted demo: a missing stream skipped the demo in _demo_problem
                 data = np.array(streams_grp[stream_name], dtype=np.float32)
-                demo["obs"][stream_name] = _apply_rotation_format(data, rot_fmt, stream_name)
+                arr = _apply_rotation_format(data, rot_fmt, stream_name)
+                if not np.isfinite(arr).all():
+                    bad = int((~np.isfinite(arr).all(axis=tuple(range(1, arr.ndim)))).sum()) if arr.ndim > 1 else int((~np.isfinite(arr)).sum())
+                    raise ValueError(
+                        f"stream '{stream_name}' contains NaN/Inf in {bad} of {len(arr)} row(s)"
+                    )
+                demo["obs"][stream_name] = arr
 
             actions_to_extract = self.data_config.get("actions_to_extract", [])
             delta_actions = self.data_config.get("delta_actions", [])
@@ -1027,7 +1037,11 @@ class YAMLDrivenConverter:
                 action_parts.append(_action_part(part, stream_name, stream_configs, delta_actions))
 
             action_parts = [p for p in action_parts if p.ndim < 2 or p.shape[1] > 0]
-            demo["actions"] = np.concatenate(action_parts, axis=1)  # all zero-width: ValueError, the demo fails
+            actions = np.concatenate(action_parts, axis=1)  # all zero-width: ValueError, the demo fails
+            if not np.isfinite(actions).all():
+                bad = int((~np.isfinite(actions).all(axis=1)).sum())
+                raise ValueError(f"actions contain NaN/Inf in {bad} of {len(actions)} row(s)")
+            demo["actions"] = actions
 
             demo["rewards"] = _end_flags(num_samples)
             demo["dones"] = _end_flags(num_samples)
@@ -1151,12 +1165,45 @@ class YAMLDrivenConverter:
                 # Per-frame chunking for efficient sequential reads during training
                 kwargs["chunks"] = (1,) + data.shape[1:]
 
-            if isinstance(data, h5py.Dataset):  # a camera still in the recording: copy it in slices, not whole
+            if isinstance(data, h5py.Dataset):  # a camera still in the recording: copy raw chunks or in slices
                 out = grp.create_dataset(key, shape=data.shape, **kwargs)
-                for i in range(0, data.shape[0], 64):
-                    out[i:i + 64] = data[i:i + 64]
+                self._copy_h5_dataset(data, out)
             else:
                 grp.create_dataset(key, data=data, **kwargs)
+
+    @staticmethod
+    def _can_direct_chunk_copy(src: h5py.Dataset, dst: h5py.Dataset) -> bool:
+        """True when raw compressed chunks can be copied byte-for-byte without decompress + recompress."""
+        return (
+            src.chunks is not None
+            and dst.chunks is not None
+            and src.chunks == dst.chunks
+            and src.shape == dst.shape
+            and src.dtype == dst.dtype
+            and src.compression == dst.compression
+            and src.compression_opts == dst.compression_opts
+            and src.shuffle == dst.shuffle
+            and src.fletcher32 == dst.fletcher32
+            and len(src.chunks) >= 1
+            and src.chunks[0] == 1
+            and all(c == s for c, s in zip(src.chunks[1:], src.shape[1:]))
+        )
+
+    @classmethod
+    def _copy_h5_dataset(cls, src: h5py.Dataset, dst: h5py.Dataset) -> None:
+        if cls._can_direct_chunk_copy(src, dst):
+            zeros = (0,) * (src.ndim - 1)
+            try:
+                for i in range(src.shape[0]):
+                    offset = (i,) + zeros
+                    filter_mask, raw = src.id.read_direct_chunk(offset)
+                    dst.id.write_direct_chunk(offset, raw, filter_mask)
+                return
+            except Exception:
+                # Fall back to normal slice copy (e.g. unallocated sparse chunks or exotic filters).
+                pass
+        for i in range(0, src.shape[0], 64):
+            dst[i:i + 64] = src[i:i + 64]
 
     def _create_data_mask(self, mask_group: h5py.Group, demo_names: List[str], train: float, val: float):
         """mask/train and mask/valid; demos left over by rounding or train + val < 1 also train."""

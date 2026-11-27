@@ -80,6 +80,7 @@ class RunPage:
         self._kill_timer = QTimer(self.ui.page_run)
         self._kill_timer.setSingleShot(True)
         self._kill_timer.timeout.connect(self._kill_if_alive)
+        self._used_setsid = False
         self._build_ui()
         self._update_buttons()
 
@@ -186,7 +187,8 @@ class RunPage:
                               "run_last_dispatch_dir": self.edit_dispatch.text()})
         program, args = self.command()
         self.log.appendPlainText(f"$ {program} {' '.join(args)}")
-        if shutil.which("setsid"):  # own process group: a terminal Ctrl+C reaches only the GUI, which stops the node once
+        self._used_setsid = bool(shutil.which("setsid"))
+        if self._used_setsid:  # own process group: a terminal Ctrl+C reaches only the GUI, which stops the node once
             program, args = "setsid", [program, *args]  # the child is no group leader, so setsid execs: same PID
         self.proc.start(program, args)
         self.label_state.setText("Running")
@@ -196,8 +198,14 @@ class RunPage:
         """SIGTERM (handled by the node like Ctrl+C: safe stop, then exit); killed if still alive after 5 s."""
         if not self.is_running():
             return
+        pid = int(self.proc.processId())
+        if pid <= 0:  # QProcess returns 0 before spawn completes or after exit; os.kill(0, ...) would kill the GUI!
+            return
         self.log.appendPlainText("Stopping (SIGTERM)...")
-        os.kill(int(self.proc.processId()), signal.SIGTERM)
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
         self._kill_timer.start(KILL_AFTER_MS)
 
     def _kill_if_alive(self):
@@ -206,6 +214,17 @@ class RunPage:
                    "The safe stop may NOT have been sent: check the robot.")
             logger.error(msg)
             self.log.appendPlainText(f"!!! {msg}")
+            pid = int(self.proc.processId())
+            if self._used_setsid and pid > 0:
+                try:
+                    pgid = os.getpgid(pid)
+                    if pgid != os.getpgrp():
+                        os.killpg(pgid, signal.SIGKILL)
+                        return
+                except ProcessLookupError:
+                    return
+                except OSError:
+                    pass
             self.proc.kill()
 
     def shutdown(self):
