@@ -104,6 +104,32 @@ class AppAPI:
     def start_spinning(self):
         self._topic_subscribers.start_spinning()
 
+    @property
+    def is_recording(self) -> bool:
+        return bool(self._data_recorder.is_recording)
+
+    @property
+    def session_files(self) -> list:
+        """Recorded demo HDF5 paths kept in this session (copy)."""
+        return list(self._session_h5_files)
+
+    @property
+    def last_saved_file(self) -> Optional[str]:
+        """Most recently saved demo path in this session, or None."""
+        return self._session_h5_files[-1] if self._session_h5_files else None
+
+    def recording_health(self) -> dict:
+        """Snapshot of live recording progress and background write health."""
+        rec = self._data_recorder
+        return {
+            "is_recording": bool(rec.is_recording),
+            "sample_count": int(getattr(rec, "recording_sample_count", 0)),
+            "buffer_full": bool(getattr(rec, "buffer_full", False)),
+            "loop_failed": bool(getattr(rec, "loop_failed", False)),
+            "write_error": getattr(rec, "write_error", None),
+            "stop_problem": getattr(rec, "stop_problem", ""),
+        }
+
     def start_recording(self, demo_name: Optional[str] = None) -> bool:
         """Start a demo, named like the GUI's (``{dataset_name}_{ms}``) unless ``demo_name`` is given."""
         if self._data_recorder.is_recording:  # refused before start_demo, which would subscribe every input again
@@ -201,9 +227,13 @@ class AppAPI:
             logger.error(f"Error converting recording to dataset: {e}")
             return False
 
-    def shutdown(self) -> bool:
-        """Save a running recording, convert the session and stop ROS. Returns False, and leaves everything
-        running, if a recording could not be saved: its samples are only in memory (fix the disk and call again)."""
+    def shutdown(self, convert: bool = True, output_format: Optional[str] = None) -> bool:
+        """Save a running recording, optionally convert the session, and stop ROS.
+
+        Returns False, and leaves everything running, if a recording could not be saved: its samples are only
+        in memory (fix the disk and call again). Set ``convert=False`` to skip dataset conversion on close, or
+        pass ``output_format`` (``"robomimic"`` / ``"lerobot"``) to override ``postprocess_default_format``.
+        """
         if self._data_recorder.is_recording:  # its samples are only in memory: save them before converting
             self.stop_recording()
         if getattr(self._data_recorder, "_unsaved", False):
@@ -214,7 +244,9 @@ class AppAPI:
                 )
                 return False
             self._session_h5_files.append(self._data_recorder.retried_file)
-        self.convert_recording_to_dataset(user_settings.get("postprocess_default_format") or "robomimic")
+        if convert:
+            fmt = output_format or user_settings.get("postprocess_default_format") or "robomimic"
+            self.convert_recording_to_dataset(fmt)
         self._topic_subscribers.close()  # stops its spin thread (no self-join when called from a callback)
         if self._rclpy_initialized:
             rclpy.shutdown()

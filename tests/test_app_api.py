@@ -264,3 +264,32 @@ def test_stop_reports_a_demo_whose_sampling_stopped_early(tmp_path, flag):
     setattr(api._data_recorder, flag, False)
     api.start_recording()
     assert api.stop_recording() is True
+
+
+def test_session_properties_health_and_shutdown_format_options():
+    api = _recording_api()
+    api._session_h5_files = ["/rec/a.h5", "/rec/b.h5"]
+    api._data_recorder.recording_sample_count = 42
+    api._data_recorder.buffer_full = False
+    api._data_recorder.loop_failed = False
+    api._data_recorder.write_error = None
+    api._data_recorder.stop_problem = ""
+
+    assert api.is_recording is False
+    assert api.session_files == ["/rec/a.h5", "/rec/b.h5"]
+    assert api.last_saved_file == "/rec/b.h5"
+    health = api.recording_health()
+    assert health["sample_count"] == 42 and health["buffer_full"] is False
+
+    # shutdown(convert=False) closes without converting
+    converted = []
+    closed = []
+    api.convert_recording_to_dataset = lambda fmt="robomimic": converted.append(fmt) or True
+    api._rclpy_initialized = False
+    api._topic_subscribers = SimpleNamespace(close=lambda: closed.append(1))
+    assert api.shutdown(convert=False) is True
+    assert converted == [] and closed == [1]
+
+    # shutdown(convert=True, output_format="lerobot") passes explicit format
+    assert api.shutdown(convert=True, output_format="lerobot") is True
+    assert converted == ["lerobot"]
