@@ -321,7 +321,7 @@ class UI(QMainWindow):
                 self.page_run_ui.shutdown()
 
             if hasattr(self, "page_record") and self.page_record is not None:
-                # Stop TF update timerexit_code
+                # Stop TF update timer
                 if hasattr(self.page_record, "tf_update_timer"):
                     self.page_record.tf_update_timer.stop()
 
@@ -379,14 +379,10 @@ def main(args=None):
 
     node = Node("qt_visualizer_node")
 
-    logger.info("DEBUG: About to create QApplication")
     app = QApplication(sys.argv)
-    logger.info("DEBUG: QApplication created, about to create UI")
     window = UI(node)
     close_on_ctrl_c(window)
-    logger.info("DEBUG: UI created, about to call app.exec_()")
     exit_code = app.exec_()
-    logger.info(f"DEBUG: app.exec_() returned {exit_code}")
 
     # Clean up ROS
     try:

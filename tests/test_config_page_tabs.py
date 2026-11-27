@@ -4,10 +4,8 @@ import pytest
 
 pytest.importorskip("PyQt5")
 
-from PyQt5.QtWidgets import QMainWindow  # noqa: E402
-
+from helpers import load_main_window_ui  # noqa: E402
 from relay_d.acquisition.qt_app.ui.config import config_page as cp  # noqa: E402
-from relay_d.acquisition.qt_app.ui.containers.mainWindow_ui import Ui_MainWindow  # noqa: E402
 
 
 @pytest.fixture
@@ -15,9 +13,8 @@ def page(qapp, monkeypatch):
     boxes = []
     for name in ("info", "error", "warning"):
         monkeypatch.setattr(cp.CustomMessageBox, name, staticmethod(lambda *a, _n=name, **k: boxes.append((_n, a))))
-    window, ui = QMainWindow(), Ui_MainWindow()
-    ui.setupUi(window)
-    p = cp.ConfigPage(ui)
+    window = load_main_window_ui()
+    p = cp.ConfigPage(window)
     p.window, p.boxes = window, boxes
     return p
 

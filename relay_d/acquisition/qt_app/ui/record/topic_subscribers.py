@@ -15,7 +15,7 @@ from relay_d.utils.tf_topic import (
 )
 from threading import Lock, Thread, current_thread
 from rclpy.executors import SingleThreadedExecutor
-import importlib
+from rosidl_runtime_py.utilities import get_message
 import time
 
 
@@ -291,9 +291,8 @@ class TopicSubscribers(Node):
         since a wrong type subscribes fine and then never receives a message."""
         if topic_type_msg in self.message_type_cache:
             return self.message_type_cache[topic_type_msg]
-        parts = (topic_type_msg or "").split("/")
         try:
-            msg_class = getattr(importlib.import_module(f"{parts[0]}.msg"), parts[-1])
+            msg_class = get_message(topic_type_msg or "")
         except Exception as e:
             logger.error(f"Cannot import the message type {topic_type_msg!r} of {topic_path}: {e}. "
                          f"Source the workspace that defines it, then restart.")

@@ -11,7 +11,7 @@ import yaml
 from helpers import DATA_CONFIG
 
 pytest.importorskip("rclpy")
-from relay_d.acquisition.api.api import AppAPI  # noqa: E402
+from relay_d.acquisition.api import AppAPI  # noqa: E402
 from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser  # noqa: E402
 from relay_d.acquisition.qt_app.ui.review.demo_validator import CheckStatus  # noqa: E402
 from relay_d.utils.tf_topic import TfTopicSubscriptionError  # noqa: E402
@@ -233,7 +233,7 @@ def test_delete_demo_with_a_relative_path_drops_it_from_the_session(tmp_path, mo
 
 
 def test_a_rejected_config_raises_and_releases_ros(monkeypatch):
-    import relay_d.acquisition.api.api as mod
+    import relay_d.acquisition.api as mod
 
     calls = []
     monkeypatch.setattr(mod.rclpy, "init", lambda: calls.append("init"))

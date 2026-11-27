@@ -6,7 +6,10 @@ import pytest
 @pytest.mark.parametrize("input_name, label", [
     ("camera_rgb", "label_topic_name"),  # "camera" has no .ui of its own: imageWidget.ui
     ("image_1", "label_topic_name"),
+    ("pointcloud_1", "label_topic_name"),  # previously referenced non-existent pointcloudWidget.ui
+    ("tool_1", "label_topic_name"),        # previously referenced non-existent toolWidget.ui
     ("joint_1", "text_data_display"),
+    ("gripper_1", "label_actuator_name"),  # actuatorWidget.ui (fixed typo)
 ])
 def test_card_shows_input_name_and_status_off_the_badges(qapp, input_name, label):
     from PyQt5.QtWidgets import QWidget

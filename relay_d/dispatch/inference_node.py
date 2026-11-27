@@ -68,16 +68,20 @@ def main():
                         help="Run the full loop but publish nothing and send no goals: every command is logged instead")
     parser.add_argument("--exit-with-parent", action="store_true",
                         help="Send the safe stop and exit if the process that started this one dies (the Run tab uses it)")
+    parser.add_argument("--in-process",    action="store_true",
+                        help="Run the ML policy in the same Python process as ROS 2 (uses reexec into the backend env "
+                             "if needed) instead of the isolated shared-memory policy worker")
     args = parser.parse_args()
 
-    try:  # the package of the backend may live in another environment (the one built by the Train tab)
-        backend = args.backend if args.backend != "auto" else detect_backend(args.checkpoint)
-        reexec_if_needed(backend, ["-m", "relay_d.dispatch.inference_node", *sys.argv[1:]])
-    except ValueError:
-        pass  # an unknown checkpoint: InferenceSession reports it
+    if args.in_process:
+        try:  # in-process mode: the backend package may live in another environment (the one built by the Train tab)
+            backend = args.backend if args.backend != "auto" else detect_backend(args.checkpoint)
+            reexec_if_needed(backend, ["-m", "relay_d.dispatch.inference_node", *sys.argv[1:]])
+        except ValueError:
+            pass  # an unknown checkpoint: InferenceSession reports it
 
     state_keys = [k.strip() for k in args.state_keys.split(",")] if args.state_keys else None
-    parent_pid = os.getppid() if args.exit_with_parent else None  # read early: after the re-exec above, same parent
+    parent_pid = os.getppid() if args.exit_with_parent else None  # read early: after any re-exec above, same parent
 
     session = InferenceSession(
         checkpoint=args.checkpoint,
@@ -88,6 +92,7 @@ def main():
         state_keys=state_keys,
         task=args.task,
         dry_run=args.dry_run,
+        isolate_policy=not args.in_process,
     )
     try:
         signals_run_the_safe_stop()

@@ -11,6 +11,7 @@ idea
 # ignore all logs
 *.log
 *.pyc
+*_ui.py
 .venv/
 .venv-robomimic/
 *.h5

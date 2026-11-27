@@ -127,12 +127,15 @@ class InferenceSession:
         state_keys: Optional[List[str]] = None,
         task: Optional[str] = None,
         dry_run: bool = False,
+        isolate_policy: bool = True,
     ):
         """``device``: torch device (default: the infer_device setting). ``backend``: "robomimic", "lerobot" or "auto" (default: the infer_backend setting, "auto" detects it from
         the checkpoint). ``state_keys``: LeRobot only, the observations that form observation.state, in order
         (default: read from the dataset the policy was trained on). ``task``: LeRobot only, the instruction a language-conditioned
         policy (SmolVLA) follows (default: the training dataset's task). ``dry_run``: log every command instead of
-        publishing it or sending a goal (the robot does not move)."""
+        publishing it or sending a goal (the robot does not move). ``isolate_policy``: run the ML policy in an isolated
+        worker subprocess over ``/dev/shm`` mmap + Unix socket IPC (default True, avoiding ROS/PyTorch GIL contention
+        and venv ``PYTHONPATH`` mixing; False runs the policy in-process)."""
         if _ROS_IMPORT_ERROR is not None:
             raise ImportError(
                 "InferenceSession requires a sourced ROS2 environment "
@@ -156,7 +159,17 @@ class InferenceSession:
 
         self.obs_node = ObsBuilder(obs_config)
 
-        if backend == "robomimic":
+        if isolate_policy:
+            from .remote_runner import SubprocessPolicyRunner
+            self.model = SubprocessPolicyRunner(
+                backend=backend,
+                checkpoint=checkpoint,
+                device=device,
+                state_keys=state_keys,
+                fallback_state_keys=self.obs_node.low_dim_obs_names,
+                task=task,
+            )
+        elif backend == "robomimic":
             from .robomimic_runner import RobomimicPolicyRunner
             self.model = RobomimicPolicyRunner(checkpoint, device=device)
         else:
@@ -166,10 +179,16 @@ class InferenceSession:
                 fallback_state_keys=self.obs_node.low_dim_obs_names, task=task,
             )
 
-        self.obs_node.use_only(self.model.obs_keys)  # stale and pre-flight checks: only what the policy reads
-        self.dispatcher = ActionDispatcher(self.obs_node, action_config, dry_run=dry_run)
-        self._check_action_layout()
-        self._setup_chunking()
+        try:
+            self.obs_node.use_only(self.model.obs_keys)  # stale and pre-flight checks: only what the policy reads
+            self.dispatcher = ActionDispatcher(self.obs_node, action_config, dry_run=dry_run)
+            self._check_action_layout()
+            self._setup_chunking()
+        except BaseException:
+            model_close = getattr(self.model, "close", None)
+            if callable(model_close):
+                model_close()
+            raise
         self._was_stale = False  # after stale inputs the policy restarts: no queued actions or frames from before the gap
 
         # Single-threaded, as the recorder: rclpy's MultiThreadedExecutor could not keep up with 3 cameras at 20 Hz next to
@@ -211,10 +230,15 @@ class InferenceSession:
 
     def close(self) -> None:
         self.dispatcher.send_stop()  # once: nothing is sent if run() already stopped and nothing was dispatched since
-        self._executor.shutdown()
-        self.obs_node.destroy_node()
-        if self._rclpy_initialized and rclpy.ok():
-            rclpy.shutdown()
+        try:
+            model_close = getattr(getattr(self, "model", None), "close", None)
+            if callable(model_close):
+                model_close()
+        finally:
+            self._executor.shutdown()
+            self.obs_node.destroy_node()
+            if self._rclpy_initialized and rclpy.ok():
+                rclpy.shutdown()
 
     def __enter__(self) -> "InferenceSession":
         self.start()

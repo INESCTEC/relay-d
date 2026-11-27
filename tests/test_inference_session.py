@@ -217,6 +217,7 @@ def test_run_defaults_to_the_policy_rate_else_the_infer_hz_setting(monkeypatch, 
 def test_device_defaults_to_the_infer_device_setting(monkeypatch):
     import relay_d.dispatch.api as api
     import relay_d.dispatch.lerobot_runner as lr
+    import relay_d.dispatch.remote_runner as rr
 
     devices = []
     real_get = api.user_settings.get
@@ -227,10 +228,11 @@ def test_device_defaults_to_the_infer_device_setting(monkeypatch):
     monkeypatch.setattr(api, "ActionDispatcher", lambda *a, **k: SimpleNamespace(_action_configs={}))
     executors = []
     monkeypatch.setattr(api, "SingleThreadedExecutor", lambda: executors.append(1) or SimpleNamespace(add_node=lambda n: None))
-    monkeypatch.setattr(lr, "LeRobotPolicyRunner", lambda ckpt, device, **k: devices.append(device) or SimpleNamespace(obs_keys=[]))
+    monkeypatch.setattr(rr, "SubprocessPolicyRunner", lambda **k: devices.append(("isolated", k["device"])) or SimpleNamespace(obs_keys=[]))
+    monkeypatch.setattr(lr, "LeRobotPolicyRunner", lambda ckpt, device, **k: devices.append(("in_process", device)) or SimpleNamespace(obs_keys=[]))
     InferenceSession("m", "o.yaml", "a.yaml", backend="lerobot")
-    InferenceSession("m", "o.yaml", "a.yaml", device="cpu", backend="lerobot")
-    assert devices == ["cuda:7", "cpu"]  # the API runs where the CLI and the Run tab run
+    InferenceSession("m", "o.yaml", "a.yaml", device="cpu", backend="lerobot", isolate_policy=False)
+    assert devices == [("isolated", "cuda:7"), ("in_process", "cpu")]  # isolated default + in-process fallback
     assert len(executors) == 2  # single-threaded spin: the multi-threaded one dropped to ~6 Hz with 3 cameras
 
 

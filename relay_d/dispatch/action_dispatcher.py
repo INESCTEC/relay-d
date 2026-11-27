@@ -37,7 +37,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from typing import Any, Dict, Optional
 
-from rosidl_runtime_py.utilities import get_message
+from rosidl_runtime_py.utilities import get_action as _rosidl_get_action, get_message
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from relay_d.utils import user_settings
@@ -59,19 +59,14 @@ _REMOVED_TRANSFORMS = {
 }
 
 def get_action(action_type_str: str):
-    """
-    Dynamically load a ROS2 action class from a string like
-    'move_arm_skill_msgs/action/MoveArmSkill'
-    """
+    """Dynamically load a ROS2 action class from a string like 'move_arm_skill_msgs/action/MoveArmSkill'."""
     parts = action_type_str.split("/")
     if len(parts) != 3 or parts[1] != "action":
         raise ValueError(
             f"Invalid action_type format: '{action_type_str}'. "
             f"Expected '<pkg>/action/<Name>'"
         )
-    pkg, _, name = parts
-    module = __import__(f"{pkg}.action", fromlist=[name])
-    return getattr(module, name)
+    return _rosidl_get_action(action_type_str)
 
 # ---------------------------------------------------------------------------
 # Path helpers

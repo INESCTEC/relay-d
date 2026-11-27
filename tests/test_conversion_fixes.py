@@ -11,7 +11,7 @@ pytest.importorskip("av")
 from relay_d.acquisition.convert_cli import main as cli_main  # noqa: E402
 from relay_d.acquisition.qt_app.ui.config.builder.config_check import ERROR, check_config  # noqa: E402
 from relay_d.acquisition.qt_app.ui.postprocess import lerobot_writer  # noqa: E402
-from relay_d.acquisition.qt_app.ui.postprocess.robomimic_config_handler import classify_observations  # noqa: E402
+from relay_d.training.robomimic_config import classify_observations  # noqa: E402
 from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter  # noqa: E402
 
 from helpers import DATA_CONFIG, LENGTHS, write_recording  # noqa: E402

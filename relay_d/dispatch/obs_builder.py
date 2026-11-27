@@ -95,6 +95,8 @@ class ObsBuilder(Node):
         self._joint_mismatch_warned: set  = set()  # throttle: warn once per joint filter input
         self._desync_warned: set          = set()  # throttle: warn once per desynced obs
         self._passthrough_decode_warned: set = set()  # throttle: warn once per bad passthrough source
+        # input_name -> (raw_msg_obj, read_only_decoded_ndarray): keeps lazy decode at most once per unique message
+        self._decoded_passthrough_cache: Dict[str, Tuple[Any, np.ndarray]] = {}
 
 
         # Classify inputs
@@ -327,6 +329,33 @@ class ObsBuilder(Node):
             )
         return decoded
 
+    def _validate_passthrough_msg(self, input_name: str, msg: Any) -> bool:
+        """Fast O(1) check on the ROS executor thread before accepting a passthrough message.
+
+        Actual pixel/point decoding is deferred to _evaluate_all() so high-rate cameras never
+        decode unused frames on the rclpy spin thread.
+        """
+        if isinstance(msg, Image):
+            return True
+        if isinstance(msg, PointCloud2):
+            if msg.height > 1:
+                return True
+            if input_name not in self._passthrough_decode_warned:
+                self._passthrough_decode_warned.add(input_name)
+                self.get_logger().error(
+                    f"Input '{input_name}': PointCloud2 is unorganized (height<=1) — "
+                    f"not supported as an obs; see the 'output.streams' comment block in config_template.yaml."
+                )
+            return False
+        if input_name not in self._passthrough_decode_warned:
+            self._passthrough_decode_warned.add(input_name)
+            self.get_logger().error(
+                f"Input '{input_name}' is a {type(msg).__name__}, not an "
+                f"Image or PointCloud2 — every obs with 'source: "
+                f"{input_name}' will never produce data."
+            )
+        return False
+
     def _topic_callback(self, msg: Any, input_name: str) -> None:
         if not self._is_used(input_name):
             return  # subscribed before use_only(): the policy does not read it
@@ -336,11 +365,10 @@ class ObsBuilder(Node):
         ts = stamp_to_sec(msg.header.stamp) if hasattr(msg, "header") else None
 
         if input_name in self._passthrough_sources:
-            decoded = self._decode_passthrough(input_name, msg)
-            if decoded is None:
-                return   # sample-and-hold: leave any previous value untouched
+            if not self._validate_passthrough_msg(input_name, msg):
+                return   # sample-and-hold: leave any previous value and arrival untouched
             with self._lock:
-                self._latest_inputs[input_name] = decoded
+                self._latest_inputs[input_name] = msg
                 if ts is not None:
                     self._input_timestamps[input_name] = ts
                 self._arrival[input_name] = time.monotonic()
@@ -438,15 +466,30 @@ class ObsBuilder(Node):
             if ok:
                 new_vals[obs_name] = np.array(row, dtype=np.float32)
 
-        # Passthrough obs (camera/organized-pointcloud): the decoded array is
-        # used as-is — no flatten, no float32 cast, no rotation.
+        # Passthrough obs (camera/organized-pointcloud): decode lazily once per unique message
+        # here rather than on every incoming callback on the rclpy spin thread.
+        cache = getattr(self, "_decoded_passthrough_cache", None)
         for obs_name, input_name in self._passthrough_obs.items():
             if not inputs_in_sync({input_name}, ts_snapshot, self._sync_threshold):
                 self._warn_desync(obs_name, {input_name}, ts_snapshot)
                 continue
-            arr = snapshot.get(input_name)
-            if arr is not None:
-                new_vals[obs_name] = arr
+            raw = snapshot.get(input_name)
+            if raw is None:
+                continue
+            if isinstance(raw, np.ndarray):
+                arr = raw
+            else:
+                cached = cache.get(input_name) if cache is not None else None
+                if cached is not None and cached[0] is raw:
+                    arr = cached[1]
+                else:
+                    arr = self._decode_passthrough(input_name, raw)
+                    if arr is None:
+                        continue
+                    arr.setflags(write=False)
+                    if cache is not None:
+                        cache[input_name] = (raw, arr)
+            new_vals[obs_name] = arr
 
         if new_vals:
             now_mono = time.monotonic()
@@ -483,7 +526,8 @@ class ObsBuilder(Node):
         """
         self._evaluate_all()
         with self._lock:
-            return {k: v.copy() for k, v in self._latest.items()}
+            # Read-only arrays (decoded camera/pointcloud frames) are immutable and returned zero-copy.
+            return {k: (v if not v.flags.writeable else v.copy()) for k, v in self._latest.items()}
 
     def use_only(self, obs_keys) -> None:
         """Limit the node to the inputs behind these observations (the policy's): obs_config lists every recorded

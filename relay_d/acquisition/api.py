@@ -4,18 +4,18 @@ from datetime import datetime
 import rclpy
 from typing import Optional
 
-from ..qt_app.ui.config.yaml_parser import YamlParser
-from ..qt_app.ui.record.topic_subscribers import TopicSubscribers
-from ..qt_app.ui.record.data_recorder import DataRecorder
-from ..qt_app.ui.record.demo_start import start_demo
-from ..qt_app.ui.config.builder.config_check import check_config
-from ..qt_app.utils.stream_builder import StreamBuilder
+from .qt_app.ui.config.yaml_parser import YamlParser
+from .qt_app.ui.record.topic_subscribers import TopicSubscribers
+from .qt_app.ui.record.data_recorder import DataRecorder
+from .qt_app.ui.record.demo_start import start_demo
+from .qt_app.ui.config.builder.config_check import check_config
+from .qt_app.utils.stream_builder import StreamBuilder
 from relay_d.utils.tf_topic import TfTopicSubscriptionError
-from ..qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
-from ..qt_app.ui.postprocess.offline_config import load_conversion_config, write_dataset_files
-from ..qt_app.ui.postprocess.postprocess_options import dataset_output_paths
-from ..qt_app.ui.review.demo_validator import CheckStatus, DemoValidator
-from ..qt_app.utils.demo_file_ops import delete_demo_file
+from .qt_app.ui.postprocess.yaml_driven_converter import YAMLDrivenConverter
+from .qt_app.ui.postprocess.offline_config import load_conversion_config, write_dataset_files
+from .qt_app.ui.postprocess.postprocess_options import dataset_output_paths
+from .qt_app.ui.review.demo_validator import CheckStatus, DemoValidator
+from .qt_app.utils.demo_file_ops import delete_demo_file
 from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 
@@ -125,8 +125,10 @@ class AppAPI:
     def stop_recording(self) -> bool:
         """Stop and save the demo. False when it was not saved, or when it was saved but sampling had stopped early
         (buffer full, or the recording loop kept failing: the GUI shows a dialog for these); see the log."""
+        write_err = getattr(self._data_recorder, "write_error", None)
         cut_short = ("the recording buffer was full" if getattr(self._data_recorder, "buffer_full", False) else
-                     "the recording loop kept failing" if getattr(self._data_recorder, "loop_failed", False) else "")
+                     "the recording loop kept failing" if getattr(self._data_recorder, "loop_failed", False) else
+                     f"disk write failed ({write_err})" if isinstance(write_err, str) and write_err else "")
         result = self._data_recorder.stop_recording()
         if not self._data_recorder.is_recording:  # saved, or kept in memory for a retry: subscribe again at the next start
             self._topic_subscribers.clear_all_subscribers()

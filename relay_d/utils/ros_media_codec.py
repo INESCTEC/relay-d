@@ -48,10 +48,15 @@ def imgmsg_to_cv2(img_msg, desired_encoding: str = "passthrough"):
     dtype = np.dtype(dtype).newbyteorder(">" if img_msg.is_bigendian else "<")
     h, w = img_msg.height, img_msg.width
     itemsize = dtype.itemsize
-    # `step` may include row padding, so view rows first then crop.
-    rows = np.frombuffer(img_msg.data, dtype=np.uint8, count=h * img_msg.step)
-    rows = rows.reshape(h, img_msg.step)[:, : w * channels * itemsize]
-    img = np.ascontiguousarray(rows).view(dtype).reshape(h, w, channels)
+    row_bytes = w * channels * itemsize
+    raw = np.frombuffer(img_msg.data, dtype=np.uint8, count=h * img_msg.step)
+    if img_msg.step == row_bytes:
+        # Unpadded rows (the common case): view directly without a full-frame copy.
+        img = raw.view(dtype).reshape(h, w, channels)
+    else:
+        # `step` includes row padding: crop per row and pack contiguously before viewing.
+        rows = raw.reshape(h, img_msg.step)[:, :row_bytes]
+        img = np.ascontiguousarray(rows).view(dtype).reshape(h, w, channels)
     img = img.astype(dtype.newbyteorder("="), copy=False)
     if channels == 1:
         img = img[:, :, 0]
@@ -63,7 +68,9 @@ def imgmsg_to_cv2(img_msg, desired_encoding: str = "passthrough"):
     codes = {
         ("rgb8", "bgr8"): cv2.COLOR_RGB2BGR, ("bgr8", "rgb8"): cv2.COLOR_BGR2RGB,
         ("bgra8", "bgr8"): cv2.COLOR_BGRA2BGR, ("rgba8", "bgr8"): cv2.COLOR_RGBA2BGR,
+        ("bgra8", "rgb8"): cv2.COLOR_BGRA2RGB, ("rgba8", "rgb8"): cv2.COLOR_RGBA2RGB,
         ("mono8", "bgr8"): cv2.COLOR_GRAY2BGR, ("8UC1", "bgr8"): cv2.COLOR_GRAY2BGR,
+        ("mono8", "rgb8"): cv2.COLOR_GRAY2RGB, ("8UC1", "rgb8"): cv2.COLOR_GRAY2RGB,
         ("bgr8", "mono8"): cv2.COLOR_BGR2GRAY, ("rgb8", "mono8"): cv2.COLOR_RGB2GRAY,
     }
     if (src, dst) not in codes:

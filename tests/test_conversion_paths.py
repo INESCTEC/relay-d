@@ -70,7 +70,7 @@ def test_acquisition_config_is_dumped_when_the_parser_was_edited_after_loading(w
 # --- B2: AppAPI converts like the GUI
 def _api(cfg, rec_dir, options=None):
     pytest.importorskip("rclpy")
-    from relay_d.acquisition.api.api import AppAPI
+    from relay_d.acquisition.api import AppAPI
 
     api = AppAPI.__new__(AppAPI)  # no ROS: only the conversion part
     api._load_conversion_config(str(cfg), options)
@@ -83,7 +83,7 @@ def _api(cfg, rec_dir, options=None):
 def test_api_writes_a_new_dataset_folder_with_the_dispatcher_files(workspace, fmt, monkeypatch):
     tmp, cfg, rec_dir = workspace
     api = _api(cfg, rec_dir)
-    from relay_d.acquisition.api import api as api_mod
+    from relay_d.acquisition import api as api_mod
 
     now = datetime(2026, 11, 3, 11, 0, 0)
     monkeypatch.setattr(api_mod, "datetime", SimpleNamespace(now=lambda: now))
@@ -103,7 +103,7 @@ def test_api_refuses_a_bad_options_file(workspace):
 
 def test_api_shutdown_converts_to_the_default_format_setting(settings_file):
     pytest.importorskip("rclpy")
-    from relay_d.acquisition.api.api import AppAPI
+    from relay_d.acquisition.api import AppAPI
     from relay_d.utils import user_settings
 
     user_settings.save({**user_settings.values(), "postprocess_default_format": "lerobot"})
@@ -121,19 +121,13 @@ def test_api_shutdown_converts_to_the_default_format_setting(settings_file):
 @pytest.fixture
 def page(monkeypatch, qapp):
     pytest.importorskip("PyQt5")
-    from PyQt5.QtWidgets import QMainWindow
-    import relay_d.acquisition.qt_app as qt_app
-
-    monkeypatch.syspath_prepend(os.path.dirname(qt_app.__file__))
+    from helpers import load_main_window_ui
     from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser
-    from relay_d.acquisition.qt_app.ui.containers.mainWindow_ui import Ui_MainWindow
     from relay_d.acquisition.qt_app.ui.postprocess import postprocess_page as pp
 
     monkeypatch.setattr(pp.CustomMessageBox, "warning", lambda *a, **k: None)
-    window = QMainWindow()
-    ui = Ui_MainWindow()
-    ui.setupUi(window)
-    p = pp.PostProcessPage(ui, YamlParser())
+    window = load_main_window_ui()
+    p = pp.PostProcessPage(window, YamlParser())
     p._window = window
     return p
 

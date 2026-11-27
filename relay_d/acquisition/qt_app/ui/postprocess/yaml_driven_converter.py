@@ -11,10 +11,10 @@ import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Set
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils import user_settings
+from relay_d.utils.config_loader import explicit_modalities, output_bridge_map
 from relay_d.utils.numerics import RATE_TOLERANCE, median_rate, quat_to_euler, stream_entry
 from relay_d.acquisition.qt_app.ui.config.builder.config_check import normalization_error, stream_width
 from .postprocess_options import FORMAT_SUFFIX, PostprocessOptions, removed_key_errors
-from .robomimic_config_handler import explicit_modalities
 import re
 import json
 import os
@@ -228,21 +228,8 @@ class DataTransformEngine:
     # ------------------------------------------------------------------
 
     def _build_bridge_map(self) -> Dict[str, str]:
-        """
-        Build logical_key -> recorded_path mapping from data_config.yaml `output`.
-
-        Example entry in data_config.yaml:
-            output:
-              robot0_eef_pos: robot0_eef/translations
-        """
-        bridge_map = {}
-        output_section = self.data_config.get("output", {})
-
-        for logical_key, recorded_path in output_section.items():
-            if logical_key in ("prefix_path", "streams"):
-                continue
-            bridge_map[logical_key] = recorded_path
-
+        """Build logical_key -> recorded_path mapping from data_config.yaml ``output``."""
+        bridge_map = output_bridge_map(self.data_config)
         logger.debug(
             f"Bridge map built with {len(bridge_map)} entries: {list(bridge_map.keys())}"
         )

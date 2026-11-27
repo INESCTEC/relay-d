@@ -198,9 +198,9 @@ def test_the_default_python_is_not_saved_as_a_setting(page, tmp_path, monkeypatc
 def test_a_saved_robomimic_config_is_the_default_policy_like_the_cli(page):
     import shutil
 
-    from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
+    from relay_d.training.robomimic_config import robomimic_template_path
 
-    template = PostprocessConfigLoader().get_output_train_config(launcher.ROBOMIMIC, "diffusion_policy")
+    template = robomimic_template_path("diffusion_policy")
     shutil.copy(template, page.folder_path / "robomimic_config.json")  # what an older Post-process saved
     page.load_folder(str(page.folder_path))
     assert page.combo_policy.itemText(0) == tp.SAVED_POLICY

@@ -3,22 +3,18 @@
 import pytest
 
 pytest.importorskip("PyQt5")
-from PyQt5.QtWidgets import QMainWindow  # noqa: E402
 
+from helpers import load_main_window_ui  # noqa: E402
 from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser  # noqa: E402
 from relay_d.acquisition.qt_app.ui.postprocess import postprocess_page as pp  # noqa: E402
 
 
 @pytest.fixture
 def page(monkeypatch, qapp):
-    from relay_d.acquisition.qt_app.ui.containers.mainWindow_ui import Ui_MainWindow
-
-    window = QMainWindow()
-    ui = Ui_MainWindow()
-    ui.setupUi(window)
-    p = pp.PostProcessPage(ui, YamlParser())
+    window = load_main_window_ui()
+    p = pp.PostProcessPage(window, YamlParser())
     p._window = window  # keep alive
-    yield p, ui, qapp
+    yield p, window, qapp
 
 
 def _state(page, ui):

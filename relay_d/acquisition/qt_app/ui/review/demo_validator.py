@@ -25,7 +25,7 @@ _SEVERITY = {CheckStatus.PASS: 0, CheckStatus.WARN: 1, CheckStatus.FAIL: 2}
 
 # Groups under data/<demo_name>/ that are not "raw input" containers and
 # should be skipped when scanning for per-input sample-count/joint checks.
-NON_INPUT_GROUPS = {"streams", "metadata", "gripper_states"}
+NON_INPUT_GROUPS = {"streams", "metadata"}
 
 # Dataset keys (in priority order) used to determine an input group's sample count.
 _PRIMARY_DATASET_KEYS = (
