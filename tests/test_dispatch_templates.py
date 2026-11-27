@@ -67,7 +67,7 @@ def test_cli_dry_run_flag_reaches_the_session(monkeypatch):
 
     monkeypatch.setattr(inference_node, "InferenceSession", fake_session)
     monkeypatch.setattr(inference_node, "reexec_if_needed", lambda *a: None)
-    monkeypatch.setattr(inference_node, "sigterm_runs_the_safe_stop", lambda: None)  # keep this process's SIGTERM
+    monkeypatch.setattr(inference_node, "signals_run_the_safe_stop", lambda: None)  # keep this process's SIGTERM and SIGINT
     base = ["lfd-inference-node", "--checkpoint", "m.pth", "--obs-config", "o.yaml", "--action-config", "a.yaml",
             "--backend", "robomimic"]
     for extra, expected in (([], False), (["--dry-run"], True)):  # the Run tab passes exactly --dry-run

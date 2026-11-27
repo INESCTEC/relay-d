@@ -322,3 +322,30 @@ def test_robomimic_camera_obs_are_normalized_like_in_training_with_real_robomimi
 
     expected = (processed[3] - stats["cam_image"]["offset"][0]) / stats["cam_image"]["scale"][0]
     np.testing.assert_allclose(seen["cam_image"][0].numpy(), expected, atol=1e-6)
+
+
+def test_get_action_chunk_returns_the_whole_postprocessed_chunk():
+    """ACT's select_action is predict_action_chunk()[:n_action_steps]: the chunk can be sent as a trajectory."""
+    torch = pytest.importorskip("torch")
+    from relay_d.dispatch import lerobot_runner as lr
+
+    runner = lr.LeRobotPolicyRunner.__new__(lr.LeRobotPolicyRunner)
+    runner._torch, runner.state_keys, runner._images, runner.task, runner._state_dim = torch, ["x"], {}, None, 1
+    chunk = torch.arange(12, dtype=torch.float32).reshape(1, 4, 3)  # (batch, steps, action)
+    runner._policy = types.SimpleNamespace(predict_action_chunk=lambda batch: chunk)
+    runner._pre = lambda x: x
+    runner._post = lambda a: a * 10  # unnormalize, one step at a time
+    out = runner.get_action_chunk({"x": np.array([1.0])})
+    assert out.shape == (4, 3) and out.dtype == np.float32
+    assert out[1].tolist() == [30.0, 40.0, 50.0]
+
+
+@pytest.mark.parametrize("cfg, steps", [
+    (dict(type="act", n_action_steps=10, temporal_ensemble_coeff=None), 10),
+    (dict(type="act", n_action_steps=1, temporal_ensemble_coeff=0.01), 0),  # ensembled: one action per tick
+    (dict(type="diffusion", n_action_steps=8), 0),  # keeps an observation history inside select_action
+])
+def test_only_policies_whose_chunk_is_what_they_execute_send_chunks(cfg, steps):
+    from relay_d.dispatch.lerobot_runner import chunk_steps
+
+    assert chunk_steps(types.SimpleNamespace(**cfg)) == steps

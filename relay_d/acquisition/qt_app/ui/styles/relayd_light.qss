@@ -361,10 +361,9 @@ QComboBox::drop-down {
 }
 
 QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #6B7280;
+    image: url(@ICONS@/chevron_down_light.svg);
+    width: 12px;
+    height: 12px;
     margin-right: 8px;
 }
 
@@ -398,6 +397,51 @@ QDoubleSpinBox:focus {
 }
 
 
+QSpinBox::up-button,
+QDoubleSpinBox::up-button,
+QSpinBox::down-button,
+QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 22px;
+    border: none;
+    border-left: 1px solid #E2E5EA;
+    background: transparent;
+}
+
+QSpinBox::up-button,
+QDoubleSpinBox::up-button {
+    subcontrol-position: top right;
+    border-top-right-radius: 6px;
+}
+
+QSpinBox::down-button,
+QDoubleSpinBox::down-button {
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: 6px;
+}
+
+QSpinBox::up-button:hover,
+QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover,
+QDoubleSpinBox::down-button:hover {
+    background: #F3F4F6;
+}
+
+QSpinBox::up-arrow,
+QDoubleSpinBox::up-arrow {
+    image: url(@ICONS@/chevron_up_light.svg);
+    width: 10px;
+    height: 10px;
+}
+
+QSpinBox::down-arrow,
+QDoubleSpinBox::down-arrow {
+    image: url(@ICONS@/chevron_down_light.svg);
+    width: 10px;
+    height: 10px;
+}
+
+
 /* ---------------------------------------------------------------------------
  * 8. CHECKBOXES & RADIO BUTTONS
  * --------------------------------------------------------------------------- */
@@ -423,7 +467,7 @@ QCheckBox::indicator:hover {
 QCheckBox::indicator:checked {
     background-color: #3B82F6;
     border-color: #3B82F6;
-    image: none;
+    image: url(@ICONS@/check.svg);
 }
 
 QRadioButton {
@@ -579,15 +623,13 @@ QScrollBar::sub-line:horizontal {
 
 /* Video feed area */
 
-QVideoWidget,
-QVideoWidget#widget_video {
+QLabel#label_image {
     background-color: #111827;
     border: 1px solid #D1D5DB;
     border-radius: 8px;
 }
 
-QVideoWidget:hover,
-QVideoWidget#widget_video:hover {
+QLabel#label_image:hover {
     border-color: #93C5FD;
 }
 
@@ -616,7 +658,7 @@ QLabel#label_frame_rate {
     color: #166534;
     font-weight: 600;
     font-size: 12px;
-    padding: 8px 12px;
+    padding: 8px 8px;
 }
 
 QLabel#label_timestamp {
@@ -627,7 +669,7 @@ QLabel#label_timestamp {
     color: #92400E;
     font-weight: 600;
     font-size: 12px;
-    padding: 8px 12px;
+    padding: 8px 8px;
 }
 
 
@@ -665,7 +707,7 @@ QLabel#positionLabel {
     color: #166534;
     font-size: 12px;
     font-weight: 600;
-    padding: 8px 12px;
+    padding: 8px 8px;
 }
 
 QLabel#velocityLabel {
@@ -676,7 +718,7 @@ QLabel#velocityLabel {
     color: #92400E;
     font-size: 12px;
     font-weight: 600;
-    padding: 8px 12px;
+    padding: 8px 8px;
 }
 
 QLabel#torqueLabel {
@@ -687,7 +729,7 @@ QLabel#torqueLabel {
     color: #991B1B;
     font-size: 12px;
     font-weight: 600;
-    padding: 8px 12px;
+    padding: 8px 8px;
 }
 
 QLabel#dataVisualizationLabel {

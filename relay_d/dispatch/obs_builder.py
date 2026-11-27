@@ -11,6 +11,7 @@ A custom `tf_topic` that cannot be subscribed to, or never produces its
 transform, raises TfTopicSubscriptionError; it never falls back to /tf silently.
 """
 
+import math
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -95,6 +96,11 @@ class ObsBuilder(Node):
         self._joint_mismatch_warned: set  = set()  # throttle: warn once per joint filter input
         self._desync_warned: set          = set()  # throttle: warn once per desynced obs
         self._passthrough_decode_warned: set = set()  # throttle: warn once per bad passthrough source
+        self._nan_obs_warned: set         = set()  # throttle: warn once per obs with non-finite values
+        # input_name -> (raw_msg_obj, read_only_decoded_ndarray): keeps lazy decode at most once per unique message
+        self._decoded_passthrough_cache: Dict[str, Tuple[Any, np.ndarray]] = {}
+        self._input_subs: Dict[str, Any] = {}  # never shadow rclpy.node.Node._subscriptions (list)
+        self._tf_timer = None
 
 
         # Classify inputs
@@ -155,7 +161,7 @@ class ObsBuilder(Node):
         self._setup_subscriptions()
 
         if self._tf_inputs:
-            self.create_timer(0.02, self._tf_callback)   # 50 Hz TF poll
+            self._tf_timer = self.create_timer(0.02, self._tf_callback)   # 50 Hz TF poll
 
         self.get_logger().info("ObsBuilder ready.")
 
@@ -266,12 +272,13 @@ class ObsBuilder(Node):
             self._retry_timer = self.create_timer(1.0, self._retry_subscriptions)
 
     def _subscribe(self, input_name: str, topic: str, msg_class) -> None:
-        self.create_subscription(
+        sub = self.create_subscription(
             msg_class,
             topic,
             lambda msg, n=input_name: self._topic_callback(msg, n),
             subscription_qos(self, topic),
         )
+        self._input_subs[input_name] = sub
         self.get_logger().info(
             f"Subscribed to '{topic}' ({msg_class.__name__}) as input '{input_name}'"
         )
@@ -327,6 +334,33 @@ class ObsBuilder(Node):
             )
         return decoded
 
+    def _validate_passthrough_msg(self, input_name: str, msg: Any) -> bool:
+        """Fast O(1) check on the ROS executor thread before accepting a passthrough message.
+
+        Actual pixel/point decoding is deferred to _evaluate_all() so high-rate cameras never
+        decode unused frames on the rclpy spin thread.
+        """
+        if isinstance(msg, Image):
+            return True
+        if isinstance(msg, PointCloud2):
+            if msg.height > 1:
+                return True
+            if input_name not in self._passthrough_decode_warned:
+                self._passthrough_decode_warned.add(input_name)
+                self.get_logger().error(
+                    f"Input '{input_name}': PointCloud2 is unorganized (height<=1) — "
+                    f"not supported as an obs; see the 'output.streams' comment block in config_template.yaml."
+                )
+            return False
+        if input_name not in self._passthrough_decode_warned:
+            self._passthrough_decode_warned.add(input_name)
+            self.get_logger().error(
+                f"Input '{input_name}' is a {type(msg).__name__}, not an "
+                f"Image or PointCloud2 — every obs with 'source: "
+                f"{input_name}' will never produce data."
+            )
+        return False
+
     def _topic_callback(self, msg: Any, input_name: str) -> None:
         if not self._is_used(input_name):
             return  # subscribed before use_only(): the policy does not read it
@@ -336,11 +370,10 @@ class ObsBuilder(Node):
         ts = stamp_to_sec(msg.header.stamp) if hasattr(msg, "header") else None
 
         if input_name in self._passthrough_sources:
-            decoded = self._decode_passthrough(input_name, msg)
-            if decoded is None:
-                return   # sample-and-hold: leave any previous value untouched
+            if not self._validate_passthrough_msg(input_name, msg):
+                return   # sample-and-hold: leave any previous value and arrival untouched
             with self._lock:
-                self._latest_inputs[input_name] = decoded
+                self._latest_inputs[input_name] = msg
                 if ts is not None:
                     self._input_timestamps[input_name] = ts
                 self._arrival[input_name] = time.monotonic()
@@ -374,6 +407,7 @@ class ObsBuilder(Node):
     def _tf_callback(self) -> None:
         updates = {}
         ts_updates = {}
+        tf_warned = getattr(self, "_tf_warned", None)
         for name in self._tf_inputs:
             spec = self._input_cfg[name]
             try:
@@ -382,15 +416,28 @@ class ObsBuilder(Node):
                     spec["child_frame"],
                     rclpy.time.Time(),
                 )
+                t, r = tf.transform.translation, tf.transform.rotation
+                if not all(math.isfinite(v) for v in (t.x, t.y, t.z, r.x, r.y, r.z, r.w)):
+                    if tf_warned is not None and f"nan:{name}" not in tf_warned:
+                        tf_warned.add(f"nan:{name}")
+                        get_logger = getattr(self, "get_logger", None)
+                        if callable(get_logger):
+                            get_logger().warn(
+                                f"[TF] Non-finite transform for '{name}' "
+                                f"({spec['parent_frame']} → {spec['child_frame']}); holding last value."
+                            )
+                    continue
                 updates[name] = enriched_tf(tf)
                 ts_updates[name] = stamp_to_sec(tf.header.stamp)
             except Exception as exc:
-                if name not in self._tf_warned:
-                    self._tf_warned.add(name)
-                    self.get_logger().warn(
-                        f"[TF] Lookup failed for '{name}' "
-                        f"({spec['parent_frame']} → {spec['child_frame']}): {exc}"
-                    )
+                if tf_warned is not None and name not in tf_warned:
+                    tf_warned.add(name)
+                    get_logger = getattr(self, "get_logger", None)
+                    if callable(get_logger):
+                        get_logger().warn(
+                            f"[TF] Lookup failed for '{name}' "
+                            f"({spec['parent_frame']} → {spec['child_frame']}): {exc}"
+                        )
         if updates:
             with self._lock:
                 self._latest_inputs.update(updates)
@@ -434,19 +481,44 @@ class ObsBuilder(Node):
                 # conversion refuses too: hold the last value (it goes stale) instead of feeding NaN to the policy
                 with np.errstate(invalid="ignore", divide="ignore"):  # a zero quaternion: handled just below
                     row = [float(v) for v in quat_to_euler(row)]
-                ok = bool(np.isfinite(row).all())
             if ok:
-                new_vals[obs_name] = np.array(row, dtype=np.float32)
+                arr = np.array(row, dtype=np.float32)
+                if np.isfinite(arr).all():
+                    new_vals[obs_name] = arr
+                else:
+                    warned = getattr(self, "_nan_obs_warned", None)
+                    if warned is not None and obs_name not in warned:
+                        warned.add(obs_name)
+                        get_logger = getattr(self, "get_logger", None)
+                        if callable(get_logger):
+                            get_logger().warn(
+                                f"[ObsBuilder] obs '{obs_name}' contained NaN/Inf; holding last finite value."
+                            )
 
-        # Passthrough obs (camera/organized-pointcloud): the decoded array is
-        # used as-is — no flatten, no float32 cast, no rotation.
+        # Passthrough obs (camera/organized-pointcloud): decode lazily once per unique message
+        # here rather than on every incoming callback on the rclpy spin thread.
+        cache = getattr(self, "_decoded_passthrough_cache", None)
         for obs_name, input_name in self._passthrough_obs.items():
             if not inputs_in_sync({input_name}, ts_snapshot, self._sync_threshold):
                 self._warn_desync(obs_name, {input_name}, ts_snapshot)
                 continue
-            arr = snapshot.get(input_name)
-            if arr is not None:
-                new_vals[obs_name] = arr
+            raw = snapshot.get(input_name)
+            if raw is None:
+                continue
+            if isinstance(raw, np.ndarray):
+                arr = raw
+            else:
+                cached = cache.get(input_name) if cache is not None else None
+                if cached is not None and cached[0] is raw:
+                    arr = cached[1]
+                else:
+                    arr = self._decode_passthrough(input_name, raw)
+                    if arr is None:
+                        continue
+                    arr.setflags(write=False)
+                    if cache is not None:
+                        cache[input_name] = (raw, arr)
+            new_vals[obs_name] = arr
 
         if new_vals:
             now_mono = time.monotonic()
@@ -483,7 +555,8 @@ class ObsBuilder(Node):
         """
         self._evaluate_all()
         with self._lock:
-            return {k: v.copy() for k, v in self._latest.items()}
+            # Read-only arrays (decoded camera/pointcloud frames) are immutable and returned zero-copy.
+            return {k: (v if not v.flags.writeable else v.copy()) for k, v in self._latest.items()}
 
     def use_only(self, obs_keys) -> None:
         """Limit the node to the inputs behind these observations (the policy's): obs_config lists every recorded
@@ -501,6 +574,43 @@ class ObsBuilder(Node):
         self._passthrough_sources &= used
         self._tf_inputs &= used
         self._pending_topics = [p for p in self._pending_topics if p[0] in used]
+
+        # Tear down unused DDS subscriptions so FastDDS/CycloneDDS stops transferring & deserializing
+        # high-bandwidth cameras / point clouds the loaded policy never reads.
+        subs = getattr(self, "_input_subs", None)
+        if subs:
+            destroy_sub = getattr(self, "destroy_subscription", None)
+            for inp_name in [n for n in subs if n not in used]:
+                sub = subs.pop(inp_name)
+                if callable(destroy_sub):
+                    try:
+                        destroy_sub(sub)
+                    except Exception:
+                        pass
+        if not self._tf_inputs:
+            tf_timer = getattr(self, "_tf_timer", None)
+            if tf_timer is not None:
+                try:
+                    tf_timer.cancel()
+                except Exception:
+                    pass
+                self._tf_timer = None
+            tf_listeners = getattr(self, "_tf_listeners", None)
+            if tf_listeners:
+                for key in list(tf_listeners):
+                    try:
+                        tf_listeners[key].unregister()
+                    except Exception:
+                        pass
+                tf_listeners.clear()
+        if not self._pending_topics:
+            retry_timer = getattr(self, "_retry_timer", None)
+            if retry_timer is not None:
+                try:
+                    retry_timer.cancel()
+                except Exception:
+                    pass
+                self._retry_timer = None
 
     def _is_used(self, input_name: str) -> bool:
         return self._used_inputs is None or input_name in self._used_inputs

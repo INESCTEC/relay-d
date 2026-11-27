@@ -136,3 +136,24 @@ def test_cli_check_prints_the_report_and_writes_nothing(tmp_path, capsys):
     cfg.write_text(yaml.safe_dump({"config": bad}))
     assert cli_main(["--config", str(cfg), "--format", "robomimic", "--input", str(rec), "--check"]) == 1
     assert "robot0_gripper" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("fmt", ["robomimic", "lerobot"])
+def test_a_demo_missing_an_obs_or_with_another_width_is_skipped_not_zero_filled(tmp_path, fmt):
+    """Zeros for a missing observation (or mixed joint counts) would train the policy on false data."""
+    rec = tmp_path / "rec.h5"
+    write_recording(rec, [14, 12, 11])
+    with h5py.File(rec, "a") as f:
+        d = f["data"]
+        for i in range(3):
+            _stamp(d[f"demo_{i}"], FPS, recorded_hz=FPS)
+        del d["demo_1/streams/eef_translation"]
+        wide = np.zeros((11, 6), np.float32)  # 6 joints where the other demos have 4
+        del d["demo_2/streams/robot_joint_pos"]
+        d["demo_2/streams"].create_dataset("robot_joint_pos", data=wide)
+    report = _converter().precheck(fmt, [str(rec)])
+    reasons = {d["demo"]: d["reason"] for d in report["demos"]}
+    assert reasons["demo_0"] == ""
+    assert reasons["demo_1"] == "no eef_translation (observation stream)"  # was "": zero-filled
+    assert "robot_joint_pos" in reasons["demo_2"] and "(6,)" in reasons["demo_2"] and "(4,)" in reasons["demo_2"]
+    assert report["converted"] == 1

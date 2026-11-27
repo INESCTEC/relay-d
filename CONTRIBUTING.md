@@ -50,17 +50,18 @@ including the optional `robomimic` extra.
 
 ## Regenerating Qt UI files
 
-If you edit a `.ui` file under `relay_d/acquisition/qt_app/ui/`, regenerate its
-compiled counterpart with `pyuic5` from the repo root (so the generated header
-comment records a relative path, not your local absolute path):
+The app loads every `.ui` file at runtime with `uic.loadUi`. Only `mainWindow.ui` also
+has a compiled counterpart (`mainWindow_ui.py`, used by the tests): if you edit it,
+regenerate it with `pyuic5` from the repo root (so the generated header comment records
+a relative path, not your local absolute path):
 
 ```bash
 pyuic5 relay_d/acquisition/qt_app/ui/containers/mainWindow.ui \
     -o relay_d/acquisition/qt_app/ui/containers/mainWindow_ui.py
 ```
 
-If you change `resources.qrc` (icons/images), regenerate `resources_rc.py`
-with `pyrcc5` the same way.
+Icons and images are plain files in `relay_d/acquisition/qt_app/resources/`: the `.ui` files refer to
+them by relative path, so there is nothing to compile.
 
 ## Submitting a pull request
 

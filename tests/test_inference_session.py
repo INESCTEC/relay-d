@@ -217,6 +217,7 @@ def test_run_defaults_to_the_policy_rate_else_the_infer_hz_setting(monkeypatch, 
 def test_device_defaults_to_the_infer_device_setting(monkeypatch):
     import relay_d.dispatch.api as api
     import relay_d.dispatch.lerobot_runner as lr
+    import relay_d.dispatch.remote_runner as rr
 
     devices = []
     real_get = api.user_settings.get
@@ -227,10 +228,11 @@ def test_device_defaults_to_the_infer_device_setting(monkeypatch):
     monkeypatch.setattr(api, "ActionDispatcher", lambda *a, **k: SimpleNamespace(_action_configs={}))
     executors = []
     monkeypatch.setattr(api, "SingleThreadedExecutor", lambda: executors.append(1) or SimpleNamespace(add_node=lambda n: None))
-    monkeypatch.setattr(lr, "LeRobotPolicyRunner", lambda ckpt, device, **k: devices.append(device) or SimpleNamespace(obs_keys=[]))
+    monkeypatch.setattr(rr, "SubprocessPolicyRunner", lambda **k: devices.append(("isolated", k["device"])) or SimpleNamespace(obs_keys=[]))
+    monkeypatch.setattr(lr, "LeRobotPolicyRunner", lambda ckpt, device, **k: devices.append(("in_process", device)) or SimpleNamespace(obs_keys=[]))
     InferenceSession("m", "o.yaml", "a.yaml", backend="lerobot")
-    InferenceSession("m", "o.yaml", "a.yaml", device="cpu", backend="lerobot")
-    assert devices == ["cuda:7", "cpu"]  # the API runs where the CLI and the Run tab run
+    InferenceSession("m", "o.yaml", "a.yaml", device="cpu", backend="lerobot", isolate_policy=False)
+    assert devices == [("isolated", "cuda:7"), ("in_process", "cpu")]  # isolated default + in-process fallback
     assert len(executors) == 2  # single-threaded spin: the multi-threaded one dropped to ~6 Hz with 3 cameras
 
 
@@ -243,50 +245,66 @@ def test_node_passes_its_rate_through_and_exits_1_on_a_model_error(monkeypatch):
         def __init__(self, **kw):
             calls.append(("device", kw["device"]))
 
-        def run(self, hz, validate_timeout, max_obs_age):
+        def run(self, hz, validate_timeout, max_obs_age, parent_pid):
             calls.append(("hz", hz))
+            calls.append(("parent_pid", parent_pid))
             return False
 
         def close(self):
             calls.append("close")
 
     monkeypatch.setattr(node, "InferenceSession", FakeSession)
-    monkeypatch.setattr(node, "sigterm_runs_the_safe_stop", lambda: calls.append("sigterm"))
+    monkeypatch.setattr(node, "signals_run_the_safe_stop", lambda: calls.append("sigterm"))
     monkeypatch.setattr(node.sys, "argv", ["node", "--checkpoint", "/nope", "--obs-config", "o", "--action-config", "a"])
     with pytest.raises(SystemExit) as e:
         node.main()
     assert e.value.code == 1
     assert ("hz", None) in calls and "sigterm" in calls and calls[-1] == "close"  # run() picks the rate; the stop still runs
+    assert ("parent_pid", None) in calls  # started by hand: no --exit-with-parent, the parent is not watched
 
 
-SIGTERM_PROBE = """
+SIGNAL_PROBE = """
 import time, rclpy
 from std_msgs.msg import Float64
-from relay_d.dispatch.inference_node import sigterm_runs_the_safe_stop
-rclpy.init()  # installs rclpy's own handlers, as InferenceSession does
-sigterm_runs_the_safe_stop()
-node = rclpy.create_node("sigterm_probe")
-pub = node.create_publisher(Float64, "/sigterm_probe_stop", 1)
+from relay_d.dispatch.inference_node import signals_run_the_safe_stop
+rclpy.init()  # installs rclpy's own handlers (InferenceSession no longer does, but an app that inits rclpy may)
+signals_run_the_safe_stop()
+node = rclpy.create_node("signal_probe")
+pub = node.create_publisher(Float64, "/signal_probe_stop", 1)
 print("ready", flush=True)
 try:
     while True:
         time.sleep(0.05)
 finally:
-    pub.publish(Float64(data=0.0))
+    pub.publish(Float64(data=0.0))  # fails if rclpy's handler shut the context down first
     print("STOP PUBLISHED", flush=True)
 """
 
 
-def test_sigterm_takes_the_safe_stop_path():
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGINT"])  # SIGTERM: the Run tab's STOP; SIGINT: Ctrl+C
+def test_a_stop_signal_takes_the_safe_stop_path(signame):
     import signal
     import subprocess
     import sys
 
-    p = subprocess.Popen([sys.executable, "-c", SIGTERM_PROBE], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    p = subprocess.Popen([sys.executable, "-c", SIGNAL_PROBE], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     assert p.stdout.readline().strip() == "ready"
-    p.send_signal(signal.SIGTERM)
+    p.send_signal(getattr(signal, signame))
     out, _ = p.communicate(timeout=20)
-    assert "STOP PUBLISHED" in out, out  # rclpy's default SIGTERM handling exits without running finally
+    assert "STOP PUBLISHED" in out, out  # SIGINT: rclpy invalidated the context, the stop was never published
+
+
+def test_a_session_that_starts_rclpy_leaves_ctrl_c_to_python(monkeypatch):
+    """rclpy's SIGINT handler shuts the context down before run()'s finally can publish the stop."""
+    import relay_d.dispatch.api as api
+
+    seen = {}
+    monkeypatch.setattr(api.rclpy, "ok", lambda: False)
+    monkeypatch.setattr(api.rclpy, "init", lambda **kw: seen.update(kw))
+    monkeypatch.setattr(api, "ObsBuilder", lambda cfg: (_ for _ in ()).throw(RuntimeError("stop here")))
+    with pytest.raises(RuntimeError, match="stop here"):
+        InferenceSession(checkpoint="x.pth", obs_config="o", action_config="a", backend="robomimic")
+    assert "signal_handler_options" in seen and seen["signal_handler_options"].name == "NO"
 
 
 def test_quat_rotation_format_is_accepted_like_when_recording():
@@ -414,3 +432,58 @@ def test_close_shuts_rclpy_down_only_if_the_session_started_it(monkeypatch, init
     monkeypatch.setattr(api.rclpy, "shutdown", lambda: shutdowns.append(1))
     s.close()
     assert shutdowns == ([1] if initialized else [])  # an embedding app's rclpy context is left running
+
+
+def test_run_stops_the_robot_when_its_parent_gui_is_gone(monkeypatch):
+    """Started by the GUI, the node must not keep driving the robot after the GUI died (nobody could stop it)."""
+    import os
+
+    s = InferenceSession.__new__(InferenceSession)
+    stops, predicted = [], []
+    s.dispatcher = SimpleNamespace(send_stop=lambda: stops.append(1), dispatch=lambda action: None)
+    s.obs_node = SimpleNamespace(get_input_ages=lambda: {}, get_obs_ages=lambda: {},
+                                 get_logger=lambda: SimpleNamespace(info=print, error=print))
+    s.model = SimpleNamespace(obs_keys=[], reset=lambda: None)
+    s._was_stale = False
+    s.start = lambda: None
+    s.validate = lambda timeout: (True, {"inputs": {}, "obs_keys_ready": True})
+    s.get_observation = lambda: {}
+    s.predict = lambda obs: predicted.append(1) or np.zeros(1)
+    monkeypatch.setattr("relay_d.dispatch.api.rclpy.ok", lambda: True)
+    assert s.run(hz=0, validate_timeout=0.1, max_obs_age=1.0, max_steps=50, parent_pid=os.getppid() + 1) is True
+    assert predicted == [] and stops == [1]  # was 50 steps: the loop never looked at its parent
+    predicted.clear()
+    assert s.run(hz=0, validate_timeout=0.1, max_obs_age=1.0, max_steps=3, parent_pid=os.getppid()) is True
+    assert len(predicted) == 3  # parent alive: runs as before
+
+
+def _chunk_session(chunk_steps, has_trajectories=True):
+    s = InferenceSession.__new__(InferenceSession)
+    calls = []
+    s.dispatcher = SimpleNamespace(
+        has_trajectories=has_trajectories, send_stop=lambda: None,
+        dispatch=lambda action, trajectories=True: calls.append(("tick", float(action[0]), trajectories)),
+        dispatch_trajectory=lambda chunk: calls.append(("traj", len(chunk))),
+    )
+    chunks = iter(np.arange(100, dtype=np.float32).reshape(5, 20, 1))  # chunks of 20 steps
+    s.model = SimpleNamespace(chunk_steps=chunk_steps, get_action_chunk=lambda obs: next(chunks),
+                              get_action=lambda obs: np.array([-1.0]), reset=lambda: None)
+    s._setup_chunking()
+    return s, calls
+
+
+def test_a_trajectory_gets_the_whole_chunk_once_and_the_other_outputs_each_step():
+    s, calls = _chunk_session(chunk_steps=3)
+    for _ in range(4):
+        s.dispatch(s.predict({}))
+    assert calls == [("traj", 20), ("tick", 0.0, False), ("tick", 1.0, False), ("tick", 2.0, False),
+                     ("traj", 20), ("tick", 20.0, False)]  # a new chunk every n_action_steps ticks
+    s.reset()
+    s.dispatch(s.predict({}))
+    assert calls[-2:] == [("traj", 20), ("tick", 40.0, False)]  # after a reset (stale inputs): a fresh chunk
+
+
+def test_without_a_chunk_every_output_is_sent_each_tick():
+    s, calls = _chunk_session(chunk_steps=0)
+    s.dispatch(s.predict({}))
+    assert calls == [("tick", -1.0, True)]  # one-point trajectories from select_action

@@ -23,12 +23,14 @@ Usage::
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import shutil
+import tempfile
 from fractions import Fraction
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -148,6 +150,67 @@ class _Frames:
         for i in range(0, self.shape[0], self._BATCH):
             yield from self[i : i + self._BATCH]
 
+    def iter_raw_batches(self):
+        """Yield ``(start_idx, batch)`` without BGR->RGB flipping so PyAV can encode ``bgr24`` directly."""
+        h, w = self.shape[1], self.shape[2]
+        for i in range(0, self.shape[0], self._BATCH):
+            batch = np.asarray(self.src[i : i + self._BATCH])
+            if batch.shape[1] != h or batch.shape[2] != w:
+                batch = batch[..., :h, :w, :]
+            yield i, batch
+
+
+_UINT8_UNIT = np.arange(256, dtype=np.float64) / 255.0
+
+
+def _stats_from_rgb_samples(sampled_u8: np.ndarray, total_frames: int) -> Dict[str, np.ndarray]:
+    """Compute exact per-channel [0, 1] image stats from (S, h, w, C) uint8 RGB samples.
+
+    Uses a 256-bin ``np.bincount`` histogram per channel: mathematically identical (to ~1e-15) to
+    converting all pixels to float64 and calling ``np.quantile`` / ``mean`` / ``std``, without
+    allocating or sorting multi-million-element float64 arrays.
+    """
+    channels = sampled_u8.shape[3]
+    n_pix = int(sampled_u8.shape[0] * sampled_u8.shape[1] * sampled_u8.shape[2])
+    mins = np.empty(channels, dtype=np.float64)
+    maxs = np.empty(channels, dtype=np.float64)
+    means = np.empty(channels, dtype=np.float64)
+    stds = np.empty(channels, dtype=np.float64)
+    quants = np.empty((len(_QUANTILES), channels), dtype=np.float64)
+
+    q_pos = np.asarray(_QUANTILES, dtype=np.float64) * max(0, n_pix - 1)
+    q_lo = np.floor(q_pos).astype(np.int64)
+    q_hi = np.ceil(q_pos).astype(np.int64)
+    q_frac = q_pos - q_lo
+
+    for c in range(channels):
+        hist = np.bincount(sampled_u8[..., c].ravel(), minlength=256).astype(np.int64)
+        nz = np.nonzero(hist)[0]
+        mins[c] = _UINT8_UNIT[nz[0]]
+        maxs[c] = _UINT8_UNIT[nz[-1]]
+        weights = hist.astype(np.float64)
+        mean = float(np.dot(weights, _UINT8_UNIT) / n_pix)
+        var = float(np.dot(weights, (_UINT8_UNIT - mean) ** 2) / n_pix)
+        means[c] = mean
+        stds[c] = float(np.sqrt(max(0.0, var)))
+
+        cdf = np.cumsum(hist)
+        v_lo = np.searchsorted(cdf, q_lo + 1, side="left")
+        v_hi = np.searchsorted(cdf, q_hi + 1, side="left")
+        quants[:, c] = (v_lo + q_frac * (v_hi - v_lo)) / 255.0
+
+    out: Dict[str, np.ndarray] = {
+        "min": mins,
+        "max": maxs,
+        "mean": means,
+        "std": stds,
+    }
+    for key, row in zip(_QUANTILE_KEYS, quants):
+        out[key] = row
+    out = {k: v.reshape(-1, 1, 1) for k, v in out.items()}
+    out["count"] = np.array([total_frames], dtype=np.int64)
+    return out
+
 
 def _image_stats(frames: _Frames) -> Dict[str, np.ndarray]:
     """Per-channel stats over sampled frames, scaled to [0, 1], shape (C, 1, 1)."""
@@ -155,21 +218,8 @@ def _image_stats(frames: _Frames) -> Dict[str, np.ndarray]:
     idx = np.unique(np.linspace(0, n - 1, min(n, _MAX_STAT_FRAMES)).astype(int))
     h, w = frames.shape[1:3]
     step = max(1, max(h, w) // _MAX_STAT_SIDE)
-    sampled = frames[idx][:, ::step, ::step, :].astype(np.float64) / 255.0
-    # (S, h, w, C) -> (C, S*h*w)
-    flat = sampled.transpose(3, 0, 1, 2).reshape(sampled.shape[3], -1)
-    out = {
-        "min": flat.min(axis=1),
-        "max": flat.max(axis=1),
-        "mean": flat.mean(axis=1),
-        "std": flat.std(axis=1),
-    }
-    q = np.quantile(flat, _QUANTILES, axis=1)
-    for key, row in zip(_QUANTILE_KEYS, q):
-        out[key] = row
-    out = {k: v.reshape(-1, 1, 1) for k, v in out.items()}
-    out["count"] = np.array([n], dtype=np.int64)
-    return out
+    sampled = frames[idx][:, ::step, ::step, :]
+    return _stats_from_rgb_samples(sampled, n)
 
 
 def _aggregate_stats(episode_stats: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
@@ -188,7 +238,7 @@ def _aggregate_stats(episode_stats: List[Dict[str, np.ndarray]]) -> Dict[str, np
         "min": stack("min").min(axis=0),
         "max": stack("max").max(axis=0),
         "mean": total_mean,
-        "std": np.sqrt(var),
+        "std": np.sqrt(np.maximum(var, 0.0)),  # clamp negative-zero FP rounding so std is never NaN
         "count": np.array([int(total)], dtype=np.int64),
     }
     for key in _QUANTILE_KEYS:
@@ -249,16 +299,33 @@ class _VideoFile:
         self.stream.height = height
         self.stream.pix_fmt = _PIX_FMT
         self.stream.codec_context.time_base = Fraction(1, fps)
+        self.stream.codec_context.thread_type = "AUTO"
         self.frames = 0
         self.bytes = 0
+
+    def write_batch(self, batch: np.ndarray, pixel_format: str = "rgb24") -> None:
+        import av
+
+        contiguous = batch.flags.c_contiguous
+        tb = Fraction(1, self.fps)
+        for frame_arr in batch:
+            arr = frame_arr if contiguous else np.ascontiguousarray(frame_arr)
+            frame = av.VideoFrame.from_ndarray(arr, format=pixel_format)
+            frame.pts = self.frames
+            frame.time_base = tb
+            self.frames += 1
+            for packet in self.stream.encode(frame):
+                self.bytes += packet.size
+                self.container.mux(packet)
 
     def write(self, frames_rgb: np.ndarray) -> None:
         import av
 
+        tb = Fraction(1, self.fps)
         for frame_rgb in frames_rgb:
             frame = av.VideoFrame.from_ndarray(np.ascontiguousarray(frame_rgb), format="rgb24")
             frame.pts = self.frames
-            frame.time_base = Fraction(1, self.fps)
+            frame.time_base = tb
             self.frames += 1
             for packet in self.stream.encode(frame):
                 self.bytes += packet.size
@@ -294,7 +361,11 @@ class LeRobotDatasetWriter:
         self.root = Path(root)
         if self.root.exists() and any(self.root.iterdir()):
             raise LeRobotWriterError(f"Output directory is not empty: {self.root}")
-        self.root.mkdir(parents=True, exist_ok=True)
+        self._root_existed = self.root.exists()
+        self.root.parent.mkdir(parents=True, exist_ok=True)
+        # Stage all writes into a hidden sibling directory and atomically rename to self.root in
+        # finalize(), so SIGKILL or power loss never leaves a corrupt dataset at the final path.
+        self._stage_root = Path(tempfile.mkdtemp(prefix=f".{self.root.name}.partial_", dir=self.root.parent))
 
         self.fps = fps
         self.robot_type = robot_type
@@ -322,6 +393,8 @@ class LeRobotDatasetWriter:
 
         # per-camera video state: key -> {"chunk", "file", "video": _VideoFile}
         self._videos: Dict[str, Dict] = {}
+        # per-camera single-worker executors for parallel multi-camera x264 encoding (preserving frame order)
+        self._video_executors: Dict[str, ThreadPoolExecutor] = {}
         self._finalized = False
         self._aborted = False
 
@@ -364,6 +437,12 @@ class LeRobotDatasetWriter:
             raise LeRobotWriterError(
                 f"state ({state.shape[0]}) and action ({action.shape[0]}) need the same non-zero length"
             )
+        if not np.isfinite(state).all():
+            bad = int((~np.isfinite(state).all(axis=1)).sum())
+            raise LeRobotWriterError(f"observation.state contains NaN/Inf in {bad} of {n} frame(s)")
+        if not np.isfinite(action).all():
+            bad = int((~np.isfinite(action).all(axis=1)).sum())
+            raise LeRobotWriterError(f"action contains NaN/Inf in {bad} of {n} frame(s)")
 
         images = {k: self._prepare_frames(k, v, n) for k, v in (images or {}).items()}
         if self._features is None:
@@ -385,8 +464,6 @@ class LeRobotDatasetWriter:
         }
 
         stats = {name: _vector_stats(arr) for name, arr in cols.items()}
-        for key, frames in images.items():
-            stats[key] = _image_stats(frames)
 
         row = {
             "episode_index": episode_index,
@@ -395,8 +472,15 @@ class LeRobotDatasetWriter:
         }
         try:
             row.update(self._write_data(cols, n, start))
-            for key, frames in images.items():
-                row.update(self._write_video(key, frames))
+            if images:
+                if type(self)._write_video is _DEFAULT_WRITE_VIDEO:
+                    video_meta, video_stats = self._write_videos_and_stats(images)
+                    row.update(video_meta)
+                    stats.update(video_stats)
+                else:
+                    for key, frames in images.items():
+                        stats[key] = _image_stats(frames)
+                        row.update(self._write_video(key, frames))
         except Exception as e:
             # rows (and maybe some videos) of this episode are already on disk: the next one would reuse its indices
             self._abort()
@@ -420,9 +504,11 @@ class LeRobotDatasetWriter:
             self._abort()
             raise LeRobotWriterError("No episodes were added")
         try:
+            self._shutdown_video_executors()
             self._close_data_writer()
             for key, state in self._videos.items():
-                state["video"].close()
+                if state["video"] is not None:
+                    state["video"].close()
             self._write_tasks()
             self._write_episodes()
             global_stats = {
@@ -431,6 +517,10 @@ class LeRobotDatasetWriter:
             }
             self._write_json(STATS_PATH, {f: {k: np.asarray(v).tolist() for k, v in s.items()} for f, s in global_stats.items()})
             self._write_info()
+            # Atomically move completed staging directory into place at self.root.
+            if self.root.exists():
+                self.root.rmdir()
+            os.rename(self._stage_root, self.root)
         except BaseException:
             self._abort()
             raise
@@ -538,7 +628,7 @@ class LeRobotDatasetWriter:
     # ------------------------------------------------------------------- data
 
     def _data_path(self) -> Path:
-        return self.root / DATA_PATH.format(chunk_index=self._data_chunk, file_index=self._data_file)
+        return self._stage_root / DATA_PATH.format(chunk_index=self._data_chunk, file_index=self._data_file)
 
     def _close_data_writer(self) -> None:
         if self._data_writer is not None:
@@ -589,12 +679,11 @@ class LeRobotDatasetWriter:
     # ------------------------------------------------------------------ video
 
     def _video_path(self, key: str, chunk: int, file: int) -> Path:
-        return self.root / VIDEO_PATH.format(video_key=key, chunk_index=chunk, file_index=file)
+        return self._stage_root / VIDEO_PATH.format(video_key=key, chunk_index=chunk, file_index=file)
 
-    def _write_video(self, key: str, frames: _Frames) -> Dict:
+    def _prepare_video_stream(self, key: str, n: int) -> Tuple[Dict, _VideoFile, float]:
         assert self._features is not None
         h, w, _ = self._features[key]["shape"]
-        n = frames.shape[0]
         state = self._videos.get(key)
         if state is not None and state["video"].frames > 0:
             video: _VideoFile = state["video"]
@@ -613,22 +702,111 @@ class LeRobotDatasetWriter:
                 self._video_path(key, state["chunk"], state["file"]), self.fps, w, h,
                 crf=self.video_crf, preset=self.video_preset, gop=self.video_gop,
             )
-
         video = state["video"]
-        from_ts = video.frames / self.fps
-        video.write(frames)
-        to_ts = video.frames / self.fps
-        return {
-            f"videos/{key}/chunk_index": state["chunk"],
-            f"videos/{key}/file_index": state["file"],
-            f"videos/{key}/from_timestamp": float(from_ts),
-            f"videos/{key}/to_timestamp": float(to_ts),
-        }
+        return state, video, video.frames / self.fps
+
+    def _shutdown_video_executors(self) -> None:
+        for pool in self._video_executors.values():
+            pool.shutdown(wait=True)
+        self._video_executors.clear()
+
+    def _write_videos_and_stats(
+        self, images: Dict[str, _Frames]
+    ) -> Tuple[Dict, Dict[str, Dict[str, np.ndarray]]]:
+        """Single-pass video encode + image stats across all cameras.
+
+        HDF5 batch reads stay serialized on the calling thread (libhdf5 is not thread-safe on one handle),
+        while PyAV/libx264 encoding runs concurrently across cameras (one single-worker executor per camera
+        to preserve strict frame order) with direct ``bgr24`` input (no per-frame Python channel flip/copy).
+        """
+        meta: Dict = {}
+        stats: Dict[str, Dict[str, np.ndarray]] = {}
+        parallel = len(images) > 1
+        pixel_format = "bgr24" if self.images_are_bgr else "rgb24"
+
+        cams = {}
+        for key, frames in images.items():
+            n = frames.shape[0]
+            h, w = frames.shape[1], frames.shape[2]
+            state, video, from_ts = self._prepare_video_stream(key, n)
+            target_idx = np.unique(np.linspace(0, n - 1, min(n, _MAX_STAT_FRAMES)).astype(int))
+            step = max(1, max(h, w) // _MAX_STAT_SIDE)
+            if parallel and key not in self._video_executors:
+                self._video_executors[key] = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"vid_{key}")
+            cams[key] = {
+                "frames": frames,
+                "state": state,
+                "video": video,
+                "from_ts": from_ts,
+                "iter": frames.iter_raw_batches(),
+                "target_idx": target_idx,
+                "target_pos": 0,
+                "step": step,
+                "samples": [],
+                "pending": None,
+            }
+
+        # Interleave batch reads across cameras so libx264 threads overlap while bounding in-flight RAM
+        # to at most 2 batches (~64 frames) per camera.
+        active = list(cams.keys())
+        while active:
+            next_active = []
+            for key in active:
+                c = cams[key]
+                batch_item = next(c["iter"], None)
+                if batch_item is None:
+                    continue
+                next_active.append(key)
+                start_i, batch = batch_item
+                end_i = start_i + len(batch)
+
+                # Collect downsampled thumbnails for image stats from the batch already in RAM.
+                t_idx = c["target_idx"]
+                t_pos = c["target_pos"]
+                step = c["step"]
+                while t_pos < len(t_idx) and t_idx[t_pos] < end_i:
+                    local_i = int(t_idx[t_pos] - start_i)
+                    c["samples"].append(batch[local_i, ::step, ::step, :].copy())
+                    t_pos += 1
+                c["target_pos"] = t_pos
+
+                if parallel:
+                    if c["pending"] is not None:
+                        c["pending"].result()
+                    c["pending"] = self._video_executors[key].submit(
+                        c["video"].write_batch, batch, pixel_format
+                    )
+                else:
+                    c["video"].write_batch(batch, pixel_format)
+            active = next_active
+
+        for key, c in cams.items():
+            if c["pending"] is not None:
+                c["pending"].result()
+                c["pending"] = None
+            state, video = c["state"], c["video"]
+            to_ts = video.frames / self.fps
+            meta.update({
+                f"videos/{key}/chunk_index": state["chunk"],
+                f"videos/{key}/file_index": state["file"],
+                f"videos/{key}/from_timestamp": float(c["from_ts"]),
+                f"videos/{key}/to_timestamp": float(to_ts),
+            })
+            sampled = np.stack(c["samples"], axis=0)
+            if self.images_are_bgr:
+                sampled = sampled[..., ::-1]
+            stats[key] = _stats_from_rgb_samples(sampled, c["frames"].shape[0])
+
+        return meta, stats
+
+    def _write_video(self, key: str, frames: _Frames) -> Dict:
+        meta, _ = self._write_videos_and_stats({key: frames})
+        return meta
 
     # --------------------------------------------------------------- metadata
 
     def _write_json(self, rel: str, obj) -> None:
-        path = self.root / rel
+        path = self._stage_root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(obj, f, indent=4)
@@ -644,7 +822,7 @@ class LeRobotDatasetWriter:
             [pa.array([i for _, i in tasks], pa.int64()), pa.array([t for t, _ in tasks], pa.string())],
             schema=schema,
         )
-        path = self.root / TASKS_PATH
+        path = self._stage_root / TASKS_PATH
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, path)
 
@@ -659,7 +837,7 @@ class LeRobotDatasetWriter:
             for name, value in full.items():
                 columns.setdefault(name, []).append(value)
         table = pa.table({name: pa.array(values) for name, values in columns.items()})
-        path = self.root / EPISODES_PATH.format(chunk_index=0, file_index=0)
+        path = self._stage_root / EPISODES_PATH.format(chunk_index=0, file_index=0)
         path.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(table, path, compression="snappy")
 
@@ -683,9 +861,12 @@ class LeRobotDatasetWriter:
         self._write_json(INFO_PATH, info)
 
     def _abort(self) -> None:
-        """Release file handles and delete the half-written dataset (the constructor
-        checked that the folder was empty, so everything in it is ours)."""
+        """Release file handles and delete the staging directory (never leaves partial output at self.root)."""
         self._finalized = self._aborted = True
+        try:
+            self._shutdown_video_executors()
+        except Exception:
+            pass
         try:
             self._close_data_writer()
         except Exception:
@@ -696,4 +877,12 @@ class LeRobotDatasetWriter:
                     state["video"].close()
             except Exception:
                 pass
-        shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self._stage_root, ignore_errors=True)
+        if not self._root_existed and self.root.exists() and not any(self.root.iterdir()):
+            try:
+                self.root.rmdir()
+            except OSError:
+                pass
+
+
+_DEFAULT_WRITE_VIDEO = LeRobotDatasetWriter._write_video

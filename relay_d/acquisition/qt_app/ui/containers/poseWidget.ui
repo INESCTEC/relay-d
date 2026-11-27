@@ -513,7 +513,7 @@
         </size>
        </property>
        <property name="text">
-        <string>📊 FPS: --</string>
+        <string>-- FPS</string>
        </property>
        <property name="scaledContents">
         <bool>false</bool>
@@ -547,7 +547,7 @@
         </size>
        </property>
        <property name="text">
-        <string>🕒 Timestamp: --</string>
+        <string>--:--:--</string>
        </property>
        <property name="scaledContents">
         <bool>false</bool>

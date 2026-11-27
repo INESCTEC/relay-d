@@ -15,19 +15,12 @@ from PyQt5.QtCore import QTimer, QFileSystemWatcher
 from relay_d.utils import user_settings
 from .ctrl_c import close_on_ctrl_c
 from .first_run import ask_save_folder
-from .settings_apply import live_changes, needs_config, startup_page
+from .settings_apply import live_changes, needs_config, startup_page, theme_stylesheet
 from .ui.settings.config_manager import config
 from .utils.custom_message_box import CustomMessageBox
+from .utils.icon_tint import IconTinter
 
 from relay_d.utils.coloring_logger import logger, apply_user_level
-
-try:
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.insert(0, script_dir)
-    import resources_rc
-except ImportError:
-    logger.error("Failed to import resources_rc. Make sure the .qrc file is compiled correctly.")
-    pass
 
 try:
     from .ui.config.config_page import ConfigPage
@@ -61,6 +54,10 @@ class UI(QMainWindow):
         ui_file_path = os.path.join(script_dir, "ui/containers/mainWindow.ui")
 
         uic.loadUi(ui_file_path, self)
+        # Icons and images are files next to the package (the .ui refers to them relative to itself); the help page's
+        # HTML finds its images through the search path.
+        self.textBrowser.setSearchPaths([os.path.join(script_dir, "resources")])
+        self.textBrowser.setHtml(self.textBrowser.toHtml())
 
         self.setup_menu_buttons([
             "btn_start",
@@ -260,18 +257,27 @@ class UI(QMainWindow):
         """Callback disparado quando o ficheiro QSS é guardado no VS Code."""
         logger.info(f"Alteração detetada no QSS: {path}")
         try:
-            with open(path, "r") as f:
-                self.setStyleSheet(f.read())
+            self._apply_stylesheet(theme_stylesheet(path))
         except Exception as e:
             logger.error(f"Erro ao recarregar QSS: {e}")
+
+    _ICON_BUTTONS = ("btn_start", "btn_data_post_process", "btn_review", "btn_train", "btn_run", "btn_import",
+                     "btn_start_record", "btn_stop_record", "btn_settings", "btn_help")
+
+    def _apply_stylesheet(self, qss):
+        """Set the theme, then redraw the black PNG icons in each button's text colour (else unreadable in dark)."""
+        self.setStyleSheet(qss)
+        if not hasattr(self, "_icon_tinter"):
+            buttons = [getattr(self, name) for name in self._ICON_BUTTONS if hasattr(self, name)]
+            self._icon_tinter = IconTinter(buttons, parent=self)
+        self._icon_tinter.retint_all()
 
     def load_theme(self, theme="light"):
         """Load external QSS theme. Options: 'light', 'dark'."""
         script_dir = os.path.dirname(os.path.abspath(__file__))
         qss_path = os.path.join(script_dir, "ui", "styles", f"relayd_{theme}.qss")
         try:
-            with open(qss_path, "r") as f:
-                self.setStyleSheet(f.read())
+            self._apply_stylesheet(theme_stylesheet(qss_path))
             # Atualiza o watcher sempre que o tema muda manualmente
             if hasattr(self, "qss_watcher"):
                 self._update_watcher_path(theme)
@@ -315,7 +321,7 @@ class UI(QMainWindow):
                 self.page_run_ui.shutdown()
 
             if hasattr(self, "page_record") and self.page_record is not None:
-                # Stop TF update timerexit_code
+                # Stop TF update timer
                 if hasattr(self.page_record, "tf_update_timer"):
                     self.page_record.tf_update_timer.stop()
 
@@ -373,14 +379,10 @@ def main(args=None):
 
     node = Node("qt_visualizer_node")
 
-    logger.info("DEBUG: About to create QApplication")
     app = QApplication(sys.argv)
-    logger.info("DEBUG: QApplication created, about to create UI")
     window = UI(node)
     close_on_ctrl_c(window)
-    logger.info("DEBUG: UI created, about to call app.exec_()")
     exit_code = app.exec_()
-    logger.info(f"DEBUG: app.exec_() returned {exit_code}")
 
     # Clean up ROS
     try:

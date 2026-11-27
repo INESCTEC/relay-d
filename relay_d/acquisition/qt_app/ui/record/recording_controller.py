@@ -87,6 +87,13 @@ class RecordingController:
                 "Press Stop to save what was recorded.",
                 title="Recording Stopped",
             )
+        elif isinstance(getattr(self.data_recorder, "write_error", None), str) and self.data_recorder.write_error:
+            self._buffer_timer.stop()
+            CustomMessageBox.error(
+                f"Disk write failed while streaming frames ({self.data_recorder.write_error}): "
+                "sampling has stopped. Check free disk space and press Stop.",
+                title="Recording Write Error",
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -225,7 +232,9 @@ class RecordingController:
                         "Stopped (Data Available)", "Stopped (No Data)"
                     )
                     self.update_buttons()
+                    problem = getattr(self.data_recorder, "stop_problem", "")
                     CustomMessageBox.error(
+                        f"{problem}\n\nNothing was saved for this demo." if problem else
                         "The recording could not be saved (check the disk). The data is still in "
                         "memory: fix the problem and press Start to retry the save.",
                         title="Recording Not Saved",

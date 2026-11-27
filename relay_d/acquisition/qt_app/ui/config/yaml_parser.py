@@ -4,6 +4,7 @@ import re
 import html
 
 from relay_d.utils.coloring_logger import logger
+from relay_d.utils.config_loader import output_bridge_map
 
 
 # VSCode Dark+ theme colors for YAML
@@ -309,19 +310,10 @@ class YamlParser:
         return self.yaml_streams_data
 
     def get_output_bridge_map(self) -> dict:
-        """Flat {logical_key: recorded_path} bridge-map entries from
-        `config.output` — top-level keys other than `streams`/`prefix_path`,
-        e.g. `agentview_image: camera_rgb/images`. Mirrors the converter's
-        (yaml_driven_converter.DataTransformEngine._build_bridge_map).
-        """
+        """Flat {logical_key: recorded_path} bridge-map entries from ``config.output``."""
         if not self.yaml_data:
             return {}
-        output_section = (self.yaml_data.get("config") or {}).get("output") or {}
-        return {
-            key: value
-            for key, value in output_section.items()
-            if key not in ("streams", "prefix_path") and isinstance(value, str)
-        }
+        return output_bridge_map(self.yaml_data.get("config") or {})
 
     def get_obs_config(self):
         # Bridge-map entries (camera/organized-pointcloud obs, e.g.

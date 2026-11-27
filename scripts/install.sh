@@ -32,7 +32,7 @@ fi
 # 2. System packages: Qt, OpenCV, NumPy, YAML from apt, built against the NumPy ROS uses; rviz2 and
 #    robot_state_publisher for Review playback; sensor_msgs_py (relay_d imports it).
 sudo apt-get update
-sudo apt-get install -y python3-pip python3-venv python3-numpy python3-yaml python3-opencv python3-pyqt5 python3-pyqt5.qtmultimedia \
+sudo apt-get install -y python3-pip python3-venv python3-numpy python3-yaml python3-opencv python3-pyqt5 \
     ros-jazzy-tf2-ros ros-jazzy-geometry-msgs ros-jazzy-std-msgs ros-jazzy-sensor-msgs \
     ros-jazzy-image-transport ros-jazzy-xacro ros-jazzy-rviz2 ros-jazzy-robot-state-publisher ros-jazzy-sensor-msgs-py
 

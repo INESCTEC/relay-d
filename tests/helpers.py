@@ -71,3 +71,16 @@ def image_sample():
 
 def joint_sample(n=1):
     return {"type": "joint_state", "names": ["a"] * n, "positions": [1.0] * n, "velocities": [], "efforts": []}
+
+
+def load_main_window_ui():
+    """Load the real ``mainWindow.ui`` onto a QMainWindow (exact same path as ``app.py``)."""
+    import os
+    from PyQt5 import uic
+    from PyQt5.QtWidgets import QMainWindow
+    import relay_d.acquisition.qt_app as qt_app
+
+    window = QMainWindow()
+    ui_path = os.path.join(os.path.dirname(qt_app.__file__), "ui", "containers", "mainWindow.ui")
+    uic.loadUi(ui_path, window)
+    return window

@@ -11,7 +11,7 @@ import yaml
 from helpers import DATA_CONFIG
 
 pytest.importorskip("rclpy")
-from relay_d.acquisition.api.api import AppAPI  # noqa: E402
+from relay_d.acquisition.api import AppAPI  # noqa: E402
 from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser  # noqa: E402
 from relay_d.acquisition.qt_app.ui.review.demo_validator import CheckStatus  # noqa: E402
 from relay_d.utils.tf_topic import TfTopicSubscriptionError  # noqa: E402
@@ -233,7 +233,7 @@ def test_delete_demo_with_a_relative_path_drops_it_from_the_session(tmp_path, mo
 
 
 def test_a_rejected_config_raises_and_releases_ros(monkeypatch):
-    import relay_d.acquisition.api.api as mod
+    import relay_d.acquisition.api as mod
 
     calls = []
     monkeypatch.setattr(mod.rclpy, "init", lambda: calls.append("init"))
@@ -245,3 +245,51 @@ def test_a_rejected_config_raises_and_releases_ros(monkeypatch):
     with pytest.raises(ValueError, match="Config rejected"):
         mod.AppAPI("cfg.yaml")  # the GUI shows an error dialog; this returned a half-made object
     assert calls == ["init", "close", "shutdown"]
+
+
+@pytest.mark.parametrize("flag", ["buffer_full", "loop_failed"])
+def test_stop_reports_a_demo_whose_sampling_stopped_early(tmp_path, flag):
+    """The GUI shows a dialog when sampling stops early; a script only had a log line and a True."""
+    api = _recording_api()
+    api.initialize("cfg.yaml")
+    api._validator = SimpleNamespace(validate=lambda path: SimpleNamespace(checks=[]))
+    saved = tmp_path / "stack_1.h5"
+    saved.write_bytes(b"x")
+    api._data_recorder.h5_file_path = str(saved)
+    api._data_recorder.buffer_full = api._data_recorder.loop_failed = False
+    setattr(api._data_recorder, flag, True)
+    api.start_recording()
+    assert api.stop_recording() is False  # was True: the demo is shorter than the operator recorded
+    assert api._session_h5_files == [str(saved)]  # what was recorded is saved and still converted
+    setattr(api._data_recorder, flag, False)
+    api.start_recording()
+    assert api.stop_recording() is True
+
+
+def test_session_properties_health_and_shutdown_format_options():
+    api = _recording_api()
+    api._session_h5_files = ["/rec/a.h5", "/rec/b.h5"]
+    api._data_recorder.recording_sample_count = 42
+    api._data_recorder.buffer_full = False
+    api._data_recorder.loop_failed = False
+    api._data_recorder.write_error = None
+    api._data_recorder.stop_problem = ""
+
+    assert api.is_recording is False
+    assert api.session_files == ["/rec/a.h5", "/rec/b.h5"]
+    assert api.last_saved_file == "/rec/b.h5"
+    health = api.recording_health()
+    assert health["sample_count"] == 42 and health["buffer_full"] is False
+
+    # shutdown(convert=False) closes without converting
+    converted = []
+    closed = []
+    api.convert_recording_to_dataset = lambda fmt="robomimic": converted.append(fmt) or True
+    api._rclpy_initialized = False
+    api._topic_subscribers = SimpleNamespace(close=lambda: closed.append(1))
+    assert api.shutdown(convert=False) is True
+    assert converted == [] and closed == [1]
+
+    # shutdown(convert=True, output_format="lerobot") passes explicit format
+    assert api.shutdown(convert=True, output_format="lerobot") is True
+    assert converted == ["lerobot"]

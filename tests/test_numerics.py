@@ -127,3 +127,16 @@ def test_rpy_delta_action_wraps_at_pi():
     out = _action_part(q, "ee", raw, ["ee"])
     assert out.shape == (2, 3)
     assert abs(out[0, 2] - (2 * np.pi - 6.26)) < 1e-6 and out[1].tolist() == [0.0, 0.0, 0.0]
+
+
+def test_delta_of_a_euler_spec_wraps_at_pi_without_rpy_format():
+    """tf.euler.yaw is an angle too: crossing +-pi must not read as a -6.26 rad turn."""
+    from relay_d.acquisition.qt_app.ui.postprocess.yaml_driven_converter import _action_part
+
+    data = np.array([[0.5, 3.13], [0.6, -3.13]])  # x, yaw
+    raw = {"ee": ["tf_eef.translation.x", "tf_eef.euler.yaw"]}  # plain list: rotation_format quat (the default)
+    out = _action_part(data, "ee", raw, ["ee"])
+    assert out[0, 0] == pytest.approx(0.1)  # a position is not wrapped
+    assert out[0, 1] == pytest.approx(2 * np.pi - 6.26)  # was -6.26
+    raw = {"ee": ["tf_eef.translation.x", "sin(tf_eef.euler.yaw)"]}  # sin() is not an angle any more
+    assert _action_part(data, "ee", raw, ["ee"])[0, 1] == pytest.approx(-6.26)

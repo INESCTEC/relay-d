@@ -159,24 +159,34 @@ class StreamBuilder:
             f"See the 'output.streams' comment block in config_template.yaml."
         )
 
-    def _input(self, stream_name, input_name, all_data):
+    def _input(self, stream_name, input_name, all_data, prepared_cache=None):
         """The message of ``input_name`` ready for the getters, or None (no data / unsupported type)."""
+        if prepared_cache is not None and input_name in prepared_cache:
+            return prepared_cache[input_name]
         msg = all_data.get(input_name)
         if msg is None:
-            return None
-        if isinstance(msg, _UNSUPPORTED_STREAM_MSG_TYPES):
+            result = None
+        elif isinstance(msg, _UNSUPPORTED_STREAM_MSG_TYPES):
             self._warn_unsupported_type(stream_name, input_name, msg)
-            return None
-        if input_name in self._tf_input_names:
-            return enriched_tf(msg)  # euler.* / rot6d.* / rot_matrix.*, as obs_builder sees TF
-        return self._filter_joints(input_name, msg)
+            result = None
+        elif input_name in self._tf_input_names:
+            result = enriched_tf(msg)  # euler.* / rot6d.* / rot_matrix.*, as obs_builder sees TF
+        else:
+            result = self._filter_joints(input_name, msg)
+        if prepared_cache is not None and not isinstance(msg, _UNSUPPORTED_STREAM_MSG_TYPES):
+            prepared_cache[input_name] = result
+        return result
 
     def evaluate(self, all_data: dict):
-        # Every row first, appended after: an error half way must not leave earlier streams one row ahead for good
+        # Every row first, appended after: an error half way must not leave earlier streams one row ahead for good.
+        # Cache prepared TF/joint messages per tick so multi-spec streams compute enriched_tf / _filter_joints once.
+        prepared_cache = {}
         rows = {}
         for stream_name, extractors in self._stream_extractors.items():
             try:
-                rows[stream_name] = evaluate_entries(extractors, lambda n, s=stream_name: self._input(s, n, all_data))
+                rows[stream_name] = evaluate_entries(
+                    extractors, lambda n, s=stream_name: self._input(s, n, all_data, prepared_cache)
+                )
             except (AttributeError, TypeError, IndexError, ValueError, ZeroDivisionError):  # e.g. a short joint array: hold the last row
                 rows[stream_name] = None
         for stream_name, row in rows.items():

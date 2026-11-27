@@ -14,7 +14,17 @@ import json
 from threading import Lock, Thread
 from collections import defaultdict
 from datetime import datetime
+from .h5_stream_writer import StreamingH5Writer, is_streamable_sample
 from .message_encoding import encode_message
+
+def _stamp_key(msg):
+    """(sec, nanosec) of a message's header stamp, None without one or when it is zero (an all-static TF chain, a
+    publisher that leaves it unset): such inputs are only compared by identity."""
+    stamp = getattr(getattr(msg, "header", None), "stamp", None)
+    if stamp is None or not (stamp.sec or stamp.nanosec):
+        return None
+    return stamp.sec, stamp.nanosec
+
 
 def _sample_nbytes(sample: dict) -> int:
     """RAM held by one recorded sample: every array in it (image `data`, point cloud `points`, ...)."""
@@ -51,18 +61,24 @@ class DataRecorder(Node):
         self.max_buffer_bytes = int(user_settings.get("rec_default_max_buffer_mb")) * 1024**2
         self._sync_tolerance = None
         self._sync_mode = "soft"
-        # shortcut: samples live in RAM until Stop, so a crash loses the demo being recorded; upgrade to a journal or
-        # chunked HDF5 writes if demos get long enough for that to hurt. Past this many bytes of frames the loop stops
-        # sampling (Stop still saves what is buffered) instead of running the PC out of memory.
+        # Heavy array frames (images, organized point clouds) stream directly to <demo>.h5.partial on a
+        # background thread while max_buffer_bytes bounds the in-flight queue RAM (and lightweight scalars).
         self._buffered_bytes = 0
+        self._in_memory_bytes = 0
         self._unsaved = False  # a save failed and the samples are still only in memory
         self.buffer_full = False  # the loop stopped sampling because max_buffer_bytes was reached
         self.loop_failed = False  # the loop stopped sampling because of repeated errors
+        self.write_error = None  # background HDF5 streaming write error message, if any
+        self.stop_problem = ""  # why the last stop_recording() saved nothing although nothing failed ("" otherwise)
+        self._stream_writer = None
+        self._streamed_containers = set()
+        self._leading_nones = defaultdict(int)
+        self._decoded_cache = {}  # container_id -> (raw_msg_obj, processed_data) to skip re-decoding held frames
 
         self.output_directory = None
         self.recorded_data_dir = None
         self.h5_file = None
-        self.h5_file_path = None
+        self.h5_file_path = None  # the demo's .h5; written as <it>.partial until saved (a crash must not leave a "demo")
 
         self.timestamps = []
         self.timestamp_spreads = []
@@ -71,7 +87,7 @@ class DataRecorder(Node):
         self._fill_gaps_containers = set()
         self._fill_count_summary = {}
         self._held_counts = defaultdict(int)  # per input: ticks recorded without a fresh sample
-        self._last_msgs = {}  # per input: (message of the last tick, ticks it has been repeated)
+        self._last_msgs = {}  # per input: (message of the last tick, its stamp key, ticks it has been repeated)
         self._strict_drops = 0  # ticks skipped by sync_mode: strict
         self._partial_files = []  # half-written demos set aside by a failed save
         self._modalities = {}
@@ -154,10 +170,15 @@ class DataRecorder(Node):
                 self.recorded_data.clear()
                 self._held_counts.clear()
                 self._last_msgs = {}
+                self._decoded_cache = {}
+                self._leading_nones = defaultdict(int)
+                self._streamed_containers = set()
                 self._strict_drops = 0
                 self._buffered_bytes = 0
+                self._in_memory_bytes = 0
                 self.buffer_full = False
                 self.loop_failed = False
+                self.write_error = None
                 self.timestamps.clear()
                 self.timestamp_spreads = []
                 self._last_valid_raw = {}
@@ -171,6 +192,9 @@ class DataRecorder(Node):
                 logger.info("Flushed stale data before recording start")
 
                 self._create_h5_file(demo_name)
+                self._stream_writer = StreamingH5Writer(
+                    self.h5_file, demo_name, max_queue_bytes=self.max_buffer_bytes
+                )
 
                 self.is_recording = True
                 self.stop_recording_flag = False
@@ -184,6 +208,18 @@ class DataRecorder(Node):
                 return True
 
         except Exception as e:
+            writer_alive = False
+            if self._stream_writer is not None:
+                try:
+                    self._stream_writer.finish(timeout=5.0)
+                    writer_alive = self._stream_writer.is_alive
+                except Exception:
+                    pass
+                self._stream_writer = None
+            if not writer_alive:
+                self._discard_h5_file()
+            else:
+                self.h5_file = None
             logger.error(f"Failed to start recording: {e}")
             return False
 
@@ -233,20 +269,14 @@ class DataRecorder(Node):
                 try:
                     # No spin_once here: TopicSubscribers' own spin thread drains the callbacks, and spinning the
                     # node on the global executor would take it out of that thread's executor.
-                    # Refresh all TF transforms before snapshotting data so that
-                    # every input (topics and TF alike) reflects the same moment.
-                    topic_subscribers.update_tf_lookups()
-
-                    # Atomic snapshot of data AND timestamps — both dicts are read
-                    # under a single lock so topic callbacks cannot update one after
-                    # the other has been read, which would inflate the apparent spread.
+                    # Atomic snapshot of topic data AND timestamps under a single lock.
                     all_data, snap_timestamps = (
                         topic_subscribers.get_content_and_timestamps()
                     )
 
-                    # Re-look up TF containers at the header.stamp of the most recently-stamped
-                    # topic message. This ensures TF and topic data share the same robot-clock
-                    # timestamp without any additional subscriptions.
+                    # Look up TF containers directly at the header.stamp of the most recently-stamped
+                    # topic message so TF and topics share the same robot-clock timestamp in one lookup
+                    # (falling back to latest TF only if no stamped topic exists or aligned lookup misses).
                     ref_ros_time = None
                     ref_nsec = 0
                     for cid, msg in all_data.items():
@@ -262,13 +292,25 @@ class DataRecorder(Node):
                                 ref_ros_time = rclpy.time.Time(
                                     seconds=s.sec, nanoseconds=s.nanosec
                                 )
-                    if ref_ros_time is not None and topic_subscribers.tf_lookup_containers:
-                        for tf_cid in list(topic_subscribers.tf_lookup_containers.keys()):
-                            tf_msg = topic_subscribers.lookup_tf_at_time(
-                                tf_cid, ref_ros_time, timeout_sec=0.0
-                            )
-                            if tf_msg is not None:
-                                all_data[tf_cid] = tf_msg
+                    if topic_subscribers.tf_lookup_containers:
+                        missed_tf = []
+                        if ref_ros_time is not None:
+                            for tf_cid in list(topic_subscribers.tf_lookup_containers.keys()):
+                                tf_msg = topic_subscribers.lookup_tf_at_time(
+                                    tf_cid, ref_ros_time, timeout_sec=0.0
+                                )
+                                if tf_msg is not None:
+                                    all_data[tf_cid] = tf_msg
+                                else:
+                                    missed_tf.append(tf_cid)
+                        else:
+                            missed_tf = list(topic_subscribers.tf_lookup_containers.keys())
+                        if missed_tf:
+                            topic_subscribers.update_tf_lookups()
+                            for tf_cid in missed_tf:
+                                fallback = topic_subscribers.get_content(tf_cid)
+                                if fallback is not None:
+                                    all_data[tf_cid] = fallback
 
                     # Refresh snapshot timestamps for TF containers to reflect the
                     # time-aligned data now in all_data. If lookup_tf_at_time succeeded,
@@ -285,10 +327,10 @@ class DataRecorder(Node):
                     # strict mode skips the sample entirely.
                     spread = 0.0
                     if self._sync_tolerance is not None:
-                        sync_cids = [
+                        sync_cids = [  # a stamp of 0 is unset (a publisher that does not fill it), not a time
                             cid for cid in all_data
                             if cid not in self._fill_gaps_containers
-                            and snap_timestamps.get(cid) is not None
+                            and snap_timestamps.get(cid)
                         ]
                         if len(sync_cids) >= 2:
                             ts_vals = [snap_timestamps[cid] for cid in sync_cids]
@@ -321,13 +363,24 @@ class DataRecorder(Node):
                     # Encode the whole tick first, append it only once all of it worked: a tick that
                     # fails half way would leave some inputs one sample behind the timestamps for good.
                     tick = {}
-                    for container_id in self.recorded_data.keys() | self.topic_subscribers.subscribers.keys():
+                    all_cids = (
+                        self.recorded_data.keys()
+                        | self._streamed_containers
+                        | self.topic_subscribers.subscribers.keys()
+                    )
+                    for container_id in all_cids:
                         msg_data = all_data.get(container_id)
                         processed_data = None
                         if msg_data is not None:
-                            processed_data = self._process_message_for_recording(
-                                self._stream_builder.apply_joint_filter(container_id, msg_data), container_id
-                            )
+                            cached = self._decoded_cache.get(container_id)
+                            if cached is not None and cached[0] is msg_data:
+                                processed_data = cached[1]
+                            else:
+                                processed_data = self._process_message_for_recording(
+                                    self._stream_builder.apply_joint_filter(container_id, msg_data), container_id
+                                )
+                                if processed_data is not None:
+                                    self._decoded_cache[container_id] = (msg_data, processed_data)
                         tick[container_id] = (msg_data, processed_data)
 
                     # Streams share the same snapshot as all containers.
@@ -338,19 +391,42 @@ class DataRecorder(Node):
                     self.timestamps.append(timestamp_nsec)
                     data_processed = 0
                     for container_id, (msg_data, processed_data) in tick.items():
-                        last_msg, repeats = self._last_msgs.get(container_id, (None, 0))
-                        # identity, not equality: the subscriber stores a new object per message received
-                        repeats = repeats + 1 if msg_data is not None and msg_data is last_msg else 0
-                        self._last_msgs[container_id] = (msg_data, repeats)
+                        last_msg, last_stamp, repeats = self._last_msgs.get(container_id, (None, None, 0))
+                        # Same object (the subscriber stores a new one per message received), or same non-zero
+                        # header stamp: a TF lookup returns a new object every tick even when its source has stopped.
+                        stamp = _stamp_key(msg_data)
+                        same = msg_data is last_msg or (stamp is not None and stamp == last_stamp)
+                        repeats = repeats + 1 if msg_data is not None and same else 0
+                        self._last_msgs[container_id] = (msg_data, stamp, repeats)
                         if processed_data:
                             self._last_valid_raw[container_id] = processed_data
-                            self._buffered_bytes += _sample_nbytes(processed_data)
                             data_processed += 1
                         if not processed_data or repeats > max_repeats:
                             self._held_counts[container_id] += 1  # held, frozen (or None until the first sample)
-                        self.recorded_data[container_id].append(
-                            processed_data or self._last_valid_raw.get(container_id)
-                        )
+
+                        sample = processed_data or self._last_valid_raw.get(container_id)
+                        if self._stream_writer is not None and (
+                            container_id in self._streamed_containers or is_streamable_sample(sample)
+                        ):
+                            if sample is None:
+                                self._leading_nones[container_id] += 1
+                            else:
+                                leading = self._leading_nones.pop(container_id, 0)
+                                self._streamed_containers.add(container_id)
+                                self._stream_writer.enqueue(container_id, sample, repeat=leading + 1)
+                        elif (
+                            self._stream_writer is not None
+                            and sample is None
+                            and container_id not in self.recorded_data
+                        ):
+                            self._leading_nones[container_id] += 1
+                        else:
+                            leading = self._leading_nones.pop(container_id, 0)
+                            if leading:
+                                self.recorded_data[container_id].extend([None] * leading)
+                            if processed_data:
+                                self._in_memory_bytes += _sample_nbytes(processed_data)
+                            self.recorded_data[container_id].append(sample)
 
                     self.recording_sample_count += 1
                     consecutive_errors = 0
@@ -361,6 +437,17 @@ class DataRecorder(Node):
                             f"{data_processed} with actual data"
                         )
 
+                    if self._stream_writer is not None and self._stream_writer.error is not None:
+                        self.write_error = str(self._stream_writer.error)
+                        logger.error(
+                            f"Disk write error during recording ({self.write_error}): "
+                            f"sampling stopped at {self.recording_sample_count} samples."
+                        )
+                        break
+
+                    self._buffered_bytes = self._in_memory_bytes + (
+                        self._stream_writer.queued_bytes if self._stream_writer is not None else 0
+                    )
                     if self._buffered_bytes > self.max_buffer_bytes:
                         self.buffer_full = True
                         logger.error(
@@ -424,11 +511,36 @@ class DataRecorder(Node):
                     if self.recording_thread.is_alive():
                         logger.error("Recording loop did not stop within 30 s; saving what is buffered")
 
+                stream_ok = True
+                writer_still_alive = False
+                streamed_counts = {}
+                if self._stream_writer is not None:
+                    stream_ok, streamed_cids, stream_err = self._stream_writer.finish()
+                    writer_still_alive = self._stream_writer.is_alive
+                    streamed_counts = {
+                        cid: self._stream_writer.frame_count(cid) for cid in streamed_cids
+                    }
+                    self._streamed_containers = streamed_cids
+                    if not stream_ok and stream_err is not None:
+                        self.write_error = str(stream_err)
+                    self._stream_writer = None
+
+                # Flush any containers that received only None samples into recorded_data so they are logged identically.
+                for cid, count in list(self._leading_nones.items()):
+                    if count > 0 and cid not in self._streamed_containers:
+                        self.recorded_data[cid].extend([None] * count)
+                self._leading_nones.clear()
+
                 expected = len(self.timestamps)
                 for cid, samples in list(self.recorded_data.items()):
                     if len(samples) != expected:
                         logger.error(
                             f"Sample count mismatch: '{cid}' has {len(samples)} samples, expected {expected}."
+                        )
+                for cid, count in streamed_counts.items():
+                    if count != expected:
+                        logger.error(
+                            f"Sample count mismatch: '{cid}' has {count} streamed samples, expected {expected}."
                         )
 
                 self.recording_metadata["end_time"] = time.time()
@@ -444,8 +556,31 @@ class DataRecorder(Node):
                         f"({len(self.timestamps)} kept): inputs were more than {self._sync_tolerance}s apart."
                     )
 
-                self._unsaved = True  # until the file is saved AND closed: a failed close must not lose the demo at the next Start
-                saved = self._save_recorded_data()
+                self.stop_problem = ""
+                if not self.timestamps:  # nothing to save, nothing to retry: an empty demo must not look recorded
+                    self.stop_problem = (
+                        f"No sample was recorded: sync_mode strict dropped all {self._strict_drops} ticks "
+                        f"(inputs more than {self._sync_tolerance}s apart)." if self._strict_drops else
+                        "No sample was recorded (no input had data).")
+                    logger.error(f"{self.stop_problem} Nothing saved for {self.h5_file_path}.")
+                    self._discard_h5_file()
+                    return False
+
+                has_streamed = bool(self._streamed_containers)
+                # Only keep _unsaved=True for retry_save() when every container's samples still live in memory.
+                self._unsaved = not has_streamed
+                if writer_still_alive:
+                    # Never write to or close self.h5_file while the background writer thread is still
+                    # inside libhdf5 — concurrent HDF5 handle access can segfault.
+                    saved = False
+                    self.h5_file = None
+                    self.stop_problem = (
+                        f"Disk write stalled while streaming frames: {self.write_error or 'writer thread still active'}"
+                    )
+                else:
+                    saved = stream_ok and self._save_recorded_data()
+                    if not stream_ok and self.write_error:
+                        self.stop_problem = f"Disk write failed while streaming frames: {self.write_error}"
 
                 if self._fill_count_summary:
                     total_filled = sum(self._fill_count_summary.values())
@@ -467,8 +602,19 @@ class DataRecorder(Node):
                     finally:
                         self.h5_file = None
 
+                if saved:
+                    try:
+                        self._finish_h5_file()
+                    except OSError as e:
+                        logger.error(f"Could not rename {self._partial_path()} to {self.h5_file_path}: {e}")
+                        saved = False
                 if not saved:
-                    logger.error(f"Recording NOT saved to {self.h5_file_path}; data is still in memory")
+                    if has_streamed and not self.stop_problem:
+                        self.stop_problem = f"Could not finish saving {self.h5_file_path} (see the log)."
+                    logger.error(
+                        f"Recording NOT saved to {self.h5_file_path}"
+                        + ("; partial file kept as .partial" if has_streamed else "; data is still in memory")
+                    )
                     self._set_aside_partial()
                     return False
                 self._unsaved = False
@@ -492,6 +638,8 @@ class DataRecorder(Node):
             self._create_h5_file(self.recording_metadata["demo_name"], mode="w")  # replaces its own partial file
             saved = self._save_recorded_data()
             self.h5_file.close()  # saved only once closed
+            if saved:
+                self._finish_h5_file()
         except Exception as e:
             logger.error(f"Retry save failed: {e}")
             saved = False
@@ -514,10 +662,31 @@ class DataRecorder(Node):
         self._partial_files = []
         return True
 
+    def _partial_path(self):
+        return self.h5_file_path + ".partial"
+
+    def _discard_h5_file(self):
+        """Close and delete the demo's file (a demo with nothing in it)."""
+        try:
+            if self.h5_file:
+                self.h5_file.close()
+        except Exception as e:
+            logger.error(f"Could not close {self._partial_path()}: {e}")
+        self.h5_file = None
+        if self.h5_file_path and os.path.exists(self._partial_path()):
+            os.remove(self._partial_path())
+
+    def _finish_h5_file(self):
+        """The demo is saved and closed: its .partial becomes the .h5 that Review and the converters list."""
+        if self.h5_file_path and os.path.exists(self._partial_path()):
+            os.replace(self._partial_path(), self.h5_file_path)
+
     def _set_aside_partial(self):
-        """Rename a half-written demo to ``<name>.h5.partial``: as a .h5 the Review page and the converters would
+        """Keep a half-written demo as ``<name>.h5.partial``: as a .h5 the Review page and the converters would
         take it for a demo. Removed once a retry saves the whole demo; kept (for inspection) after "Close anyway"."""
-        if self.h5_file_path and os.path.exists(self.h5_file_path):
+        if self.h5_file_path and os.path.exists(self._partial_path()):
+            self._partial_files.append(self._partial_path())
+        elif self.h5_file_path and os.path.exists(self.h5_file_path):
             try:
                 os.replace(self.h5_file_path, self.h5_file_path + ".partial")
                 self._partial_files.append(self.h5_file_path + ".partial")
@@ -551,9 +720,12 @@ class DataRecorder(Node):
 
             self.recorded_data_dir = output_dir
             self.h5_file_path = os.path.join(str(output_dir), f"{demo_name}.h5")
-            # "w-": never overwrite a demo already there
-            self.h5_file = h5py.File(self.h5_file_path, mode, libver="latest")
-            logger.info(f"Created H5 file: {self.h5_file_path}")
+            if mode == "w-" and os.path.exists(self.h5_file_path):  # never overwrite a demo already there
+                raise FileExistsError(f"{self.h5_file_path} already exists")
+            # Written as .partial and renamed once saved and closed (_finish_h5_file): until then Review and the
+            # converters do not list it, so a crash or kill mid-demo leaves no empty file that looks like a demo.
+            self.h5_file = h5py.File(self._partial_path(), mode, libver="latest")
+            logger.info(f"Created H5 file: {self._partial_path()}")
         except Exception as e:
             logger.error(f"Failed to create H5 file: {e}")
             raise
@@ -596,9 +768,21 @@ class DataRecorder(Node):
                 return False
 
             demo_name = self.recording_metadata["demo_name"]
-            demo_group = self.h5_file.create_group(f"data/{demo_name}")
+            demo_group = self.h5_file.require_group(f"data/{demo_name}")
 
             self._fill_count_summary = {}
+
+            for container_id in sorted(self._streamed_containers):
+                fill_count = self._held_counts.get(container_id, 0)
+                total = len(self.timestamps)
+                non_null_raw = total - fill_count
+                if fill_count > 0:
+                    self._fill_count_summary[container_id] = fill_count
+                fill_suffix = f", {fill_count} gap-filled by hold" if fill_count > 0 else ""
+                logger.info(
+                    f"{container_id} — {total} samples streamed "
+                    f"({non_null_raw} real{fill_suffix})"
+                )
 
             if self.timestamps:
                 demo_group.create_dataset("timestamps", data=np.array(self.timestamps))
@@ -619,7 +803,7 @@ class DataRecorder(Node):
                     logger.info(f"Saved stream '{stream_name}': shape {arr.shape}")
 
             for container_id, data_list in list(self.recorded_data.items()):
-                if not data_list:
+                if not data_list or container_id in self._streamed_containers:
                     continue
 
                 # The loop already held the last sample over gaps; held ticks are not real samples.

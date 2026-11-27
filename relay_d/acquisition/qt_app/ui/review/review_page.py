@@ -475,17 +475,6 @@ class ReviewPage:
                 widget.setParent(None)
                 widget.deleteLater()
 
-    def _gripper_state_keys(self, demo_group):
-        if "gripper_states" not in demo_group:
-            return []
-        gripper_group = demo_group["gripper_states"]
-        state_keys = [k for k in gripper_group.keys() if k.endswith("_states")]
-        if not state_keys:
-            state_keys = [
-                k for k in gripper_group.keys() if not k.endswith("_timestamps")
-            ]
-        return state_keys
-
     def _image_inputs(self, demo_group):
         """(input name, dataset, kind) of every camera input of the demo, raw or compressed."""
         out = []
@@ -521,7 +510,7 @@ class ReviewPage:
         out = []
 
         def visit(name, obj):
-            if (not isinstance(obj, h5py.Dataset) or name.split("/")[0] in ("streams", "gripper_states")
+            if (not isinstance(obj, h5py.Dataset) or name.split("/")[0] == "streams"
                     or name.rsplit("/", 1)[-1] in ("images", "compressed_data")):
                 return
             if self._is_text(obj):
@@ -540,8 +529,6 @@ class ReviewPage:
 
     def _build_channel_matrix(self, demo_group):
         channels = []
-        if self._gripper_state_keys(demo_group):
-            channels.append(("gripper", None, "Gripper"))
         n_cameras = len(self._image_inputs(demo_group))
         if n_cameras:
             channels.append(("image", None, f"Images\n({n_cameras} camera{'s' if n_cameras > 1 else ''})"))
@@ -591,9 +578,7 @@ class ReviewPage:
         if demo_group is None:
             return
 
-        if kind == "gripper":
-            self._render_gripper_plot(demo_group)
-        elif kind == "stream":
+        if kind == "stream":
             self._render_stream_plot(demo_group, name)
         elif kind == "dataset":
             self._render_dataset_plot(demo_group, name)
@@ -671,21 +656,6 @@ class ReviewPage:
                 plot.plot(data[:, i], pen=pg.intColor(i, hues=max(n_dims, 1)), name=labels[i])
         self._add_playback_cursor(plot)
         (self.layout_display_graph if into is None else into).addWidget(plot)
-
-    def _render_gripper_plot(self, demo_group):
-        state_keys = self._gripper_state_keys(demo_group)
-        if not state_keys:
-            self.layout_display_graph.addWidget(QLabel("No gripper state data found"))
-            return
-
-        gripper_group = demo_group["gripper_states"]
-        plot = pg.PlotWidget(title="Gripper State")
-        plot.addLegend()
-        for i, key in enumerate(state_keys):
-            values = gripper_group[key][:]
-            plot.plot(values, pen=pg.intColor(i, hues=max(len(state_keys), 1)), name=key)
-        self._add_playback_cursor(plot)
-        self.layout_display_graph.addWidget(plot)
 
     # ------------------------------------------------------------------
     # Image scrubbing

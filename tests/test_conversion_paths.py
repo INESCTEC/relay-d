@@ -70,7 +70,7 @@ def test_acquisition_config_is_dumped_when_the_parser_was_edited_after_loading(w
 # --- B2: AppAPI converts like the GUI
 def _api(cfg, rec_dir, options=None):
     pytest.importorskip("rclpy")
-    from relay_d.acquisition.api.api import AppAPI
+    from relay_d.acquisition.api import AppAPI
 
     api = AppAPI.__new__(AppAPI)  # no ROS: only the conversion part
     api._load_conversion_config(str(cfg), options)
@@ -83,7 +83,7 @@ def _api(cfg, rec_dir, options=None):
 def test_api_writes_a_new_dataset_folder_with_the_dispatcher_files(workspace, fmt, monkeypatch):
     tmp, cfg, rec_dir = workspace
     api = _api(cfg, rec_dir)
-    from relay_d.acquisition.api import api as api_mod
+    from relay_d.acquisition import api as api_mod
 
     now = datetime(2026, 11, 3, 11, 0, 0)
     monkeypatch.setattr(api_mod, "datetime", SimpleNamespace(now=lambda: now))
@@ -103,7 +103,7 @@ def test_api_refuses_a_bad_options_file(workspace):
 
 def test_api_shutdown_converts_to_the_default_format_setting(settings_file):
     pytest.importorskip("rclpy")
-    from relay_d.acquisition.api.api import AppAPI
+    from relay_d.acquisition.api import AppAPI
     from relay_d.utils import user_settings
 
     user_settings.save({**user_settings.values(), "postprocess_default_format": "lerobot"})
@@ -121,19 +121,13 @@ def test_api_shutdown_converts_to_the_default_format_setting(settings_file):
 @pytest.fixture
 def page(monkeypatch, qapp):
     pytest.importorskip("PyQt5")
-    from PyQt5.QtWidgets import QMainWindow
-    import relay_d.acquisition.qt_app as qt_app
-
-    monkeypatch.syspath_prepend(os.path.dirname(qt_app.__file__))
+    from helpers import load_main_window_ui
     from relay_d.acquisition.qt_app.ui.config.yaml_parser import YamlParser
-    from relay_d.acquisition.qt_app.ui.containers.mainWindow_ui import Ui_MainWindow
     from relay_d.acquisition.qt_app.ui.postprocess import postprocess_page as pp
 
     monkeypatch.setattr(pp.CustomMessageBox, "warning", lambda *a, **k: None)
-    window = QMainWindow()
-    ui = Ui_MainWindow()
-    ui.setupUi(window)
-    p = pp.PostProcessPage(ui, YamlParser())
+    window = load_main_window_ui()
+    p = pp.PostProcessPage(window, YamlParser())
     p._window = window
     return p
 
@@ -279,3 +273,25 @@ def test_a_file_listed_twice_is_converted_once(tmp_path):
     conv = _converter()
     assert conv.convert_multiple_files("robomimic", [str(rec), str(rec)], str(out))
     assert conv.converted_demos == len(LENGTHS)  # was 2x: every demo duplicated in the dataset
+
+
+def test_a_second_conversion_into_the_same_folder_keeps_an_edited_action_config(workspace):
+    tmp, cfg, rec_dir = workspace
+    run = lambda name: cli_main(["--config", str(cfg), "--format", "robomimic",  # noqa: E731
+                                 "--input", str(rec_dir), "--output", str(tmp / "out" / name)])
+    assert run("ds1.h5") == 0
+    action_cfg = tmp / "out" / "action_dispatcher" / "action_config.yaml"
+    action_cfg.write_text("# tuned for our robot\n")
+    assert run("ds2.h5") == 0
+    assert action_cfg.read_text() == "# tuned for our robot\n"  # was the template again
+
+
+def test_converting_into_the_config_folder_with_its_options_file_writes_every_file(workspace, capsys):
+    tmp, cfg, rec_dir = workspace
+    (cfg.parent / "postprocess_config.yaml").write_text(yaml.safe_dump({
+        "postprocess": {"robomimic": {"splits": {"train_frac": 1.0, "val_frac": 0.0}}}
+    }))
+    assert cli_main(["--config", str(cfg), "--format", "robomimic", "--input", str(rec_dir),
+                     "--output", str(cfg.parent / "ds.h5")]) == 0
+    assert (cfg.parent / "action_dispatcher" / "obs_config.yaml").exists()  # was skipped: SameFileError
+    assert "warning" not in capsys.readouterr().err

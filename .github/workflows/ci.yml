@@ -96,7 +96,7 @@ jobs:
 
       # An undefined name only crashes when that code path runs, and the ROS / Qt pages are not run in CI.
       - name: Undefined names (fails the build)
-        run: ruff check --select F821 --exclude relay_d/acquisition/qt_app/resources_rc.py .
+        run: ruff check --select F821 .
 
       - name: Run ruff (report-only, does not fail the build)
         run: ruff check --exit-zero .

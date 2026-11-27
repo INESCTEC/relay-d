@@ -14,8 +14,10 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from relay_d.acquisition.qt_app.ui.config.builder.draft import spec_inputs
+from relay_d.utils.numerics import stream_entry
 
 ERROR, WARNING = "error", "warning"
+_QUAT_SPEC = re.compile(r"\.(rotation|orientation)\.[xyzw]$")  # one quaternion component
 _MODALITIES = ("rgb", "depth", "scan")
 
 
@@ -116,6 +118,10 @@ def check_config(data: Dict[str, Any]) -> List[Problem]:
     for name in config.get("delta_actions") or []:
         if name not in actions:
             add(ERROR, f"delta_actions: '{name}' is not listed in actions_to_extract")
+        specs, rot_fmt = stream_entry(streams.get(name) or [])
+        if rot_fmt != "rpy" and any(_QUAT_SPEC.search(str(spec).strip()) for spec in specs):
+            add(WARNING, f"delta_actions: '{name}' takes the delta of quaternion components, which is no rotation "
+                         f"(and q and -q are the same one): set rotation_format: rpy on that stream")
     return problems
 
 

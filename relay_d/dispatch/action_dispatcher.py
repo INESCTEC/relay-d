@@ -16,8 +16,17 @@ is still built and checked, then logged ("[DRY RUN] ...") instead of sent.
 
 send_stop() (inference stops) publishes each topic entry's `stop:` values and
 cancels every goal it sent that is still active.
+
+`max_step` (with `joint_names`) limits each command to the robot's measured position (JointState on `state_topic`)
++- max_step, like LeRobot's max_relative_target: no command can jump further than that in one tick, whatever `limits`
+allows. Without a fresh measured position nothing is sent.
+
+`trajectory: true` entries publish trajectory_msgs/JointTrajectory (to a ros2_control joint_trajectory_controller,
+which interpolates at its own rate, e.g. over RTDE or FRI): the policy's whole chunk when it has one
+(dispatch_trajectory), else one point per tick. Their stop holds the measured position.
 """
 
+from contextlib import nullcontext
 import re
 import threading
 import time
@@ -29,7 +38,10 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from typing import Any, Dict, Optional
 
-from rosidl_runtime_py.utilities import get_message
+from rosidl_runtime_py.utilities import get_action as _rosidl_get_action, get_message
+from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
 from relay_d.utils.config_loader import load_yaml_config
 
@@ -48,19 +60,14 @@ _REMOVED_TRANSFORMS = {
 }
 
 def get_action(action_type_str: str):
-    """
-    Dynamically load a ROS2 action class from a string like
-    'move_arm_skill_msgs/action/MoveArmSkill'
-    """
+    """Dynamically load a ROS2 action class from a string like 'move_arm_skill_msgs/action/MoveArmSkill'."""
     parts = action_type_str.split("/")
     if len(parts) != 3 or parts[1] != "action":
         raise ValueError(
             f"Invalid action_type format: '{action_type_str}'. "
             f"Expected '<pkg>/action/<Name>'"
         )
-    pkg, _, name = parts
-    module = __import__(f"{pkg}.action", fromlist=[name])
-    return getattr(module, name)
+    return _rosidl_get_action(action_type_str)
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -167,7 +174,30 @@ def _check_success(msg: Any, fb_cfg: dict, default_field: str = "reached") -> bo
         return False
 
 
-def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node) -> bool:
+def _compile_mapping(mapping: dict):
+    """Pre-parse dot/index field paths once at startup so _fill_msg() never runs regexes per tick."""
+    compiled = []
+    for field_path, slice_idx in mapping.items():
+        parts = field_path.split(".")
+        parent_steps = tuple(_parse_part(p) for p in parts[:-1])
+        last_name, last_indices = _parse_part(parts[-1])
+        compiled.append((field_path, slice_idx, isinstance(slice_idx, list), parent_steps, last_name, tuple(last_indices)))
+    return compiled
+
+
+def _compile_limits(limits: list, width: int):
+    """Precompute vectorized (lo, hi) float32 bounds (-inf/+inf for null entries)."""
+    lo = np.full(width, -np.inf, dtype=np.float32)
+    hi = np.full(width, np.inf, dtype=np.float32)
+    for i in range(width):
+        lim = limits[min(i, len(limits) - 1)]
+        if lim is not None:
+            lo[i] = float(lim["lower_lim"])
+            hi[i] = float(lim["upper_lim"])
+    return lo, hi
+
+
+def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node, compiled_mapping=None) -> bool:
     """Fill header (if present) and mapped fields into a ROS message.
 
     Returns False if any mapped field could not be set: the message would carry default
@@ -179,6 +209,37 @@ def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node) -> bool
             msg.header.frame_id = cfg["frame_id"]
 
     ok = True
+    if compiled_mapping is not None:
+        for field_path, slice_idx, is_list, parent_steps, last_name, last_indices in compiled_mapping:
+            try:
+                obj = msg
+                for p_name, p_indices in parent_steps:
+                    obj = getattr(obj, p_name)
+                    for idx in p_indices:
+                        obj = obj[idx]
+                if is_list:
+                    vals = [float(v) for v in slice_values[slice_idx]]
+                    if last_indices:
+                        target = getattr(obj, last_name)
+                        for idx in last_indices[:-1]:
+                            target = target[idx]
+                        target[last_indices[-1]] = vals
+                    else:
+                        setattr(obj, last_name, vals)
+                else:
+                    val = slice_values[slice_idx]
+                    if last_indices:
+                        target = getattr(obj, last_name)
+                        for idx in last_indices[:-1]:
+                            target = target[idx]
+                        target[last_indices[-1]] = _coerce(target[last_indices[-1]], val)
+                    else:
+                        setattr(obj, last_name, _coerce(getattr(obj, last_name), val))
+            except Exception as e:
+                ok = False
+                logger.warning(f"[ActionDispatcher] Failed to set {field_path}: {e}")
+        return ok
+
     for field_path, slice_idx in cfg["mapping"].items():
         try:
             if isinstance(slice_idx, list):
@@ -198,6 +259,7 @@ def _fill_msg(msg: Any, cfg: dict, slice_values: np.ndarray, node: Node) -> bool
 # ---------------------------------------------------------------------------
 
 class ActionDispatcher:
+    max_state_age: Optional[float] = None  # set by InferenceSession from --max-obs-age; None -> infer_max_obs_age_s
 
     def __init__(self, node: Node, action_config_path: str, dry_run: bool = False):
         self._node = node
@@ -212,15 +274,22 @@ class ActionDispatcher:
         self._action_clients: Dict[str, ActionClient] = {}
         self._goal_classes: Dict[str, Any] = {}
         self._msg_classes: Dict[str, Any] = {}
+        self._compiled_limits: Dict[str, Any] = {}
+        self._compiled_mappings: Dict[str, Any] = {}
         self._last_sent: Dict[str, str] = {}
         self._stopped = True  # nothing commanded yet, so there is nothing to stop (see send_stop)
         self._goals = []  # (name, accepted goal handle; None in a dry run) since the last stop: send_stop cancels them
-        self._goals_lock = threading.Lock()  # goals are accepted on the executor thread
+        self._goals_lock = threading.Lock()  # protects _stopped, _goals, _last_sent across executor + control threads
         self._not_ready_warned = set()  # action entries whose server was not ready (warned once)
+        self.period = 0.05  # seconds between ticks (set by InferenceSession.run): a trajectory's time step
+        self._joint_states: Dict[str, Any] = {}  # state_topic -> ({joint name: position}, monotonic arrival time)
+        self._state_lock = threading.Lock()  # joint states arrive on the executor thread
+        self._clip_logged: Dict[str, float] = {}  # entry -> last time a max_step clip was logged
 
         # feedback: -- opt-in ack-wait for topic entries (see _wait_for_ack)
         self._ack_latest: Dict[str, Any] = {}
         self._ack_events: Dict[str, threading.Event] = {}
+        self._ack_lock = threading.Lock()
 
         for name, cfg in self._action_configs.items():
             for key, why in _REMOVED_KEYS.items():
@@ -236,13 +305,26 @@ class ActionDispatcher:
             if "limits" in cfg and len(cfg["limits"]) not in (1, len(cfg["indices"])):
                 raise ValueError(f"[ActionDispatcher] '{name}': 'limits' needs 1 entry or one per index "
                                  f"({len(cfg['indices'])}), got {len(cfg['limits'])}.")
-            for lim in cfg.get("limits") or []:  # a swapped pair would clamp every value to upper_lim
+            for lim in cfg.get("limits") or []:  # a swapped or non-finite pair would corrupt every output
                 if lim is not None and (not isinstance(lim, dict) or lim.get("lower_lim") is None
                                         or lim.get("upper_lim") is None
+                                        or not np.isfinite(float(lim["lower_lim"]))
+                                        or not np.isfinite(float(lim["upper_lim"]))
                                         or float(lim["lower_lim"]) > float(lim["upper_lim"])):
                     raise ValueError(f"[ActionDispatcher] '{name}': each 'limits' entry needs "
                                      f"lower_lim <= upper_lim, got {lim!r}.")
-            if cfg.get("action", False):
+            if "limits" in cfg:
+                self._compiled_limits[name] = _compile_limits(cfg["limits"], len(cfg["indices"]))
+            if "mapping" in cfg and not cfg.get("trajectory"):
+                self._compiled_mappings[name] = _compile_mapping(cfg["mapping"])
+            if "joint_names" in cfg or "max_step" in cfg or cfg.get("trajectory"):
+                self._check_joint_entry(name, cfg)
+            if cfg.get("trajectory"):
+                self._msg_classes[name] = JointTrajectory
+                if not dry_run:
+                    self._publishers[name] = node.create_publisher(JointTrajectory, cfg["topic"], 10)
+                logger.info(f"[ActionDispatcher] '{name}' -> TRAJECTORY {cfg['topic']} ({len(cfg['joint_names'])} joints)")
+            elif cfg.get("action", False):
                 if "action_type" not in cfg:
                     raise ValueError(
                         f"[ActionDispatcher] '{name}' has action: true "
@@ -314,12 +396,29 @@ class ActionDispatcher:
         for name, cfg in self._action_configs.items():
             if "stop" in cfg:
                 self._check_stop(name, cfg)
+            elif not cfg.get("action", False) and not cfg.get("trajectory"):  # goals are cancelled, trajectories hold
+                logger.warning(f"[ActionDispatcher] '{name}' has no 'stop:': when inference stops, its last command "
+                               f"stays active on the robot.")
+            if cfg.get("action", False) and "feedback" not in cfg:
+                logger.warning(f"[ActionDispatcher] '{name}' sends a new goal every tick, each one preempting the last "
+                               f"(a joint_trajectory_controller crashed under that at 20 Hz): for continuous control use a "
+                               f"trajectory: true entry; keep actions for discrete moves (with feedback).")
+            if "limits" not in cfg and "max_step" not in cfg:
+                logger.warning(f"[ActionDispatcher] '{name}' has no 'limits': the model's outputs are sent unclamped.")
+
+        state_topics = {cfg.get("state_topic", "/joint_states") for cfg in self._action_configs.values()
+                        if "max_step" in cfg or cfg.get("trajectory")}
+        for topic in sorted(state_topics):
+            if node is not None:  # read-only, also in a dry run (the commands are computed from it)
+                node.create_subscription(JointState, topic, lambda msg, t=topic: self._on_joint_state(msg, t), 10)
 
     # -------------------------------------------------------------------------
     # Public
     # -------------------------------------------------------------------------
 
-    def dispatch(self, action: np.ndarray) -> None:
+    def dispatch(self, action: np.ndarray, trajectories: bool = True) -> None:
+        """Send one action to every entry. ``trajectories=False``: skip the trajectory entries (their chunk was sent
+        with dispatch_trajectory)."""
         if not np.isfinite(action).all():
             logger.error(f"[ActionDispatcher] Non-finite action, not dispatching: {action}")
             self.send_stop()
@@ -327,13 +426,27 @@ class ActionDispatcher:
 
         # Phase 1: compute every output. If one config entry is broken (bad slice, unknown transform)
         # this raises before anything was sent, instead of moving the arm and skipping the gripper.
+        compiled_limits = getattr(self, "_compiled_limits", None)
         outputs = []
         for name, cfg in self._action_configs.items():
+            if cfg.get("trajectory") and not trajectories:
+                continue
             slice_values = action[cfg["indices"]]
 
             # 1. Safety clamp to [lower_lim, upper_lim], in real units
             if "limits" in cfg:
-                slice_values = self._apply_limits(slice_values, cfg["limits"])
+                if compiled_limits is not None and name in compiled_limits:
+                    lo, hi = compiled_limits[name]
+                    slice_values = np.clip(slice_values.astype(np.float32, copy=False), lo, hi)
+                else:
+                    slice_values = self._apply_limits(slice_values, cfg["limits"])
+            # 1b. No jump beyond max_step from the measured position
+            if "max_step" in cfg:
+                limited = self._step_limited(name, cfg, slice_values[np.newaxis])
+                if limited is None:
+                    self.send_stop()
+                    return
+                slice_values = limited[0]
 
             # 2. Optional further transform (threshold, euler_to_quat)
             if "transform" in cfg:
@@ -347,18 +460,22 @@ class ActionDispatcher:
             outputs.append((name, cfg, transformed))
 
         # Phase 2: send.
-        self._stopped = False
+        with self._goals_lock:
+            self._stopped = False
         for name, cfg, transformed in outputs:
+            if cfg.get("trajectory"):  # no chunk from the policy: one point, reached by the next tick
+                self._publish_trajectory(name, cfg, transformed[np.newaxis])
             # ROS2 action client path
-            if cfg.get("action", False):
+            elif cfg.get("action", False):
                 key = str(transformed)
-                if self._last_sent.get(name) == key:
-                    continue
-                # Remember it before sending: a rejection (on the executor thread) may arrive before
-                # _dispatch_action returns, and its pop must win so the goal is retried.
-                self._last_sent[name] = key
+                with self._goals_lock:
+                    if self._last_sent.get(name) == key:
+                        continue
+                    # Remember it before sending: a rejection (on the executor thread) may arrive before
+                    # _dispatch_action returns, and its pop must win so the goal is retried.
+                    self._last_sent[name] = key
                 if not self._dispatch_action(name, cfg, transformed):
-                    self._last_sent.pop(name, None)
+                    self._forget_sent(name, key)
 
             # Publisher path: sent every tick (controllers with a watchdog need a stream).
             # A message that cannot be filled (e.g. -1 into a uint8 field) must not leave the other
@@ -373,15 +490,18 @@ class ActionDispatcher:
 
         Nothing happens again until the next dispatch(). Never raises: every entry is tried, failures are logged.
         """
-        if self._stopped:
-            return
         with self._goals_lock:
+            if self._stopped:
+                return
             self._stopped = True
             goals, self._goals = self._goals, []
             self._last_sent.clear()  # the cancelled goals must be sent again when inference resumes
         for name, goal_handle in goals:
             self._cancel_goal(name, goal_handle)
         for name, cfg in self._action_configs.items():
+            if cfg.get("trajectory"):
+                self._hold(name, cfg)
+                continue
             if "stop" not in cfg:
                 continue
             try:
@@ -396,9 +516,152 @@ class ActionDispatcher:
             except Exception as e:
                 logger.error(f"[ActionDispatcher] '{name}': stop could not be sent: {e}")
 
+    @property
+    def has_trajectories(self) -> bool:
+        return any(cfg.get("trajectory") for cfg in self._action_configs.values())
+
+    def dispatch_trajectory(self, chunk: np.ndarray) -> None:
+        """Send a chunk of actions (n steps x action size) to the trajectory entries: one JointTrajectory each, its
+        points ``period`` apart, starting now. Every point is clamped to ``limits`` and to +- max_step from the
+        previous one (the first from the measured position)."""
+        chunk = np.atleast_2d(np.asarray(chunk, dtype=np.float64))
+        if not np.isfinite(chunk).all():
+            logger.error("[ActionDispatcher] Non-finite action chunk, not dispatching.")
+            self.send_stop()
+            return
+        compiled_limits = getattr(self, "_compiled_limits", None)
+        outputs = []
+        for name, cfg in self._action_configs.items():
+            if not cfg.get("trajectory"):
+                continue
+            rows = chunk[:, cfg["indices"]]
+            if "limits" in cfg:
+                if compiled_limits is not None and name in compiled_limits:
+                    lo, hi = compiled_limits[name]
+                    rows = np.clip(rows.astype(np.float32, copy=False), lo, hi)
+                else:
+                    rows = np.stack([self._apply_limits(r, cfg["limits"]) for r in rows])
+            if "max_step" in cfg:
+                rows = self._step_limited(name, cfg, rows)
+                if rows is None:
+                    self.send_stop()
+                    return
+            outputs.append((name, cfg, rows))
+        with self._goals_lock:
+            self._stopped = False
+        for name, cfg, rows in outputs:
+            self._publish_trajectory(name, cfg, rows)
+
     # -------------------------------------------------------------------------
     # Private
     # -------------------------------------------------------------------------
+
+    def _check_joint_entry(self, name: str, cfg: dict) -> None:
+        """``joint_names`` / ``max_step`` / ``trajectory`` must fit the entry: a wrong one would limit or drive the
+        wrong joint."""
+        names = cfg.get("joint_names")
+        if not isinstance(names, list) or len(names) != len(cfg["indices"]):
+            raise ValueError(f"[ActionDispatcher] '{name}': 'joint_names' needs one joint name per index "
+                             f"({len(cfg['indices'])}) with max_step or trajectory, got {names!r}.")
+        if cfg.get("trajectory"):
+            extra = [k for k in ("action", "mapping", "goal_init", "transform", "feedback", "stop") if cfg.get(k)]
+            if extra or cfg.get("msg_type", "trajectory_msgs/msg/JointTrajectory") != "trajectory_msgs/msg/JointTrajectory":
+                raise ValueError(f"[ActionDispatcher] '{name}': a trajectory entry publishes JointTrajectory positions "
+                                 f"itself (its stop holds the measured position); remove {extra or ['msg_type']}.")
+            if any(not isinstance(n, str) for n in names):
+                raise ValueError(f"[ActionDispatcher] '{name}': every 'joint_names' entry of a trajectory is a joint name.")
+        if "max_step" in cfg:
+            steps = cfg["max_step"] if isinstance(cfg["max_step"], list) else [cfg["max_step"]]
+            if len(steps) not in (1, len(cfg["indices"])) or not all(
+                    isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v) and v > 0 for v in steps):
+                raise ValueError(f"[ActionDispatcher] '{name}': 'max_step' needs 1 positive number or one per index "
+                                 f"({len(cfg['indices'])}), got {cfg['max_step']!r}.")
+
+    def _on_joint_state(self, msg: Any, topic: str) -> None:
+        with self._state_lock:
+            positions = dict(self._joint_states.get(topic, ({}, 0.0))[0])  # drivers may split joints over messages
+            positions.update(zip(msg.name, msg.position))
+            self._joint_states[topic] = (positions, time.monotonic())
+
+    def _measured(self, name: str, cfg: dict) -> Optional[np.ndarray]:
+        """The entry's measured joint positions (NaN for a null joint name), or None if they are missing or older than
+        the stale-input limit (infer_max_obs_age_s): commands must not be limited against an old position."""
+        topic = cfg.get("state_topic", "/joint_states")
+        with self._state_lock:
+            positions, stamp = self._joint_states.get(topic, ({}, 0.0))
+        max_age = (
+            float(self.max_state_age)
+            if self.max_state_age is not None
+            else float(user_settings.get("infer_max_obs_age_s") or 1.0)
+        )
+        missing = [j for j in cfg["joint_names"] if j is not None and j not in positions]
+        if not positions or missing or time.monotonic() - stamp > max_age:
+            why = f"no {missing} in" if positions and missing else "no fresh"
+            logger.error(f"[ActionDispatcher] '{name}': {why} {topic} (max_step / hold need the measured position): "
+                         f"not sending.")
+            return None
+        return np.array([np.nan if j is None else positions[j] for j in cfg["joint_names"]], dtype=np.float64)
+
+    def _step_limited(self, name: str, cfg: dict, rows: np.ndarray) -> Optional[np.ndarray]:
+        """``rows`` (n x joints) with each row within +- max_step of the previous one, the first of the measured
+        position; None (send nothing) without a fresh measured position."""
+        prev = self._measured(name, cfg)
+        if prev is None:
+            return None
+        step = np.broadcast_to(np.asarray(cfg["max_step"], dtype=np.float64), prev.shape)
+        out = np.array(rows, dtype=np.float64)
+        for i in range(len(out)):
+            free = np.isnan(prev)  # a null joint name: not limited
+            out[i] = np.where(free, out[i], np.clip(out[i], prev - step, prev + step))
+            prev = np.where(free, np.nan, out[i])
+        asked = float(np.max(np.abs(rows - out))) if len(out) else 0.0
+        if asked > 1e-6 and time.monotonic() - self._clip_logged.get(name, 0.0) > 1.0:
+            self._clip_logged[name] = time.monotonic()
+            logger.warning(f"[ActionDispatcher] '{name}': command cut by max_step {cfg['max_step']} "
+                           f"(the model asked {asked:.3f} further).")
+        return out
+
+    def _trajectory_message(self, cfg: dict, rows: np.ndarray) -> Any:
+        msg = JointTrajectory()  # header.stamp 0: start now, replacing the trajectory being executed
+        msg.joint_names = list(cfg["joint_names"])
+        period_ns = float(self.period) * 1e9
+        for k, row in enumerate(rows):
+            point = JointTrajectoryPoint()
+            point.positions = [float(v) for v in row]
+            sec, nanosec = divmod(int(round((k + 1) * period_ns)), 1_000_000_000)
+            point.time_from_start.sec = sec
+            point.time_from_start.nanosec = nanosec
+            msg.points.append(point)
+        return msg
+
+    def _publish_trajectory(self, name: str, cfg: dict, rows: np.ndarray) -> None:
+        msg = self._trajectory_message(cfg, rows)
+        if self._dry_run:
+            logger.info(f"[DRY RUN] '{name}' -> trajectory of {len(rows)} point(s), first {np.round(rows[0], 4).tolist()}, "
+                        f"last {np.round(rows[-1], 4).tolist()} over {len(rows) * self.period:.2f} s")
+            return
+        self._publishers[name].publish(msg)
+
+    def _hold(self, name: str, cfg: dict) -> None:
+        """A trajectory entry's stop: one point at the measured position (the controller holds it); without a fresh
+        measured position an empty trajectory, which a joint_trajectory_controller takes as stop the current one.
+        Never raises."""
+        try:
+            present = self._measured(name, cfg)
+            if present is None:
+                msg = JointTrajectory()
+                msg.joint_names = list(cfg["joint_names"])
+            else:
+                msg = self._trajectory_message(cfg, present[np.newaxis])
+            if self._dry_run:
+                logger.warning(f"[DRY RUN] '{name}' stop: hold {None if present is None else present.tolist()}")
+                return
+            self._publishers[name].publish(msg)
+            logger.warning(f"[ActionDispatcher] '{name}': stop, holding "
+                           f"{'the measured position' if present is not None else '(empty trajectory)'}")
+        except Exception as e:
+            logger.error(f"[ActionDispatcher] '{name}': stop could not be sent: {e}")
+
 
     def _track_goal(self, name: str, goal_handle: Any) -> None:
         """Remember a sent goal for send_stop; one accepted after the stop is cancelled at once."""
@@ -421,12 +684,16 @@ class ActionDispatcher:
         except Exception as e:
             logger.error(f"[ActionDispatcher] '{name}': goal could not be cancelled: {e}")
 
+    def _compiled_mapping_for(self, name: str):
+        cm = getattr(self, "_compiled_mappings", None)
+        return cm.get(name) if cm is not None else None
+
     def _stop_message(self, name: str, cfg: dict, values: np.ndarray) -> Any:
         """The topic message carrying ``stop:`` values (no limits, no transform), or None if the mapping does not fit."""
         msg = self._msg_classes[name]()
         if "goal_init" in cfg:
             self._init_goal(msg, cfg["goal_init"], name)
-        return msg if _fill_msg(msg, cfg, values, self._node) else None
+        return msg if _fill_msg(msg, cfg, values, self._node, self._compiled_mapping_for(name)) else None
 
     def _check_stop(self, name: str, cfg: dict) -> None:
         """A broken ``stop:`` must stop startup: it is only needed at the moment something already went wrong."""
@@ -458,7 +725,9 @@ class ActionDispatcher:
         msg = self._msg_classes[name]()
         if "goal_init" in cfg:
             self._init_goal(msg, cfg["goal_init"], name)
-        if not _fill_msg(msg, cfg, slice_values, self._node):
+        compiled = self._compiled_mapping_for(name)
+        filled = _fill_msg(msg, cfg, slice_values, self._node, compiled) if compiled is not None else _fill_msg(msg, cfg, slice_values, self._node)
+        if not filled:
             logger.error(f"[ActionDispatcher] '{name}' not published: a mapped field could not be set.")
             return False
         if self._dry_run:  # nothing published, so no ack to wait for
@@ -476,8 +745,10 @@ class ActionDispatcher:
         return True
 
     def _on_ack(self, msg: Any, name: str) -> None:
-        self._ack_latest[name] = msg
-        self._ack_events[name].set()
+        lock = getattr(self, "_ack_lock", None)
+        with (lock if lock is not None else nullcontext()):
+            self._ack_latest[name] = msg
+            self._ack_events[name].set()
 
     def _wait_for_ack(self, name: str, fb_cfg: dict, sent_stamp: Any) -> None:
         """
@@ -500,12 +771,14 @@ class ActionDispatcher:
         correlation_field = fb_cfg.get("correlation_field", "command_stamp")
         deadline = time.monotonic() + timeout
         ev = self._ack_events[name]
+        lock = getattr(self, "_ack_lock", None)
 
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
             if ev.wait(timeout=min(0.05, remaining)):
-                ev.clear()  # before reading: an ack landing in between sets it again instead of being lost
-                ack = self._ack_latest.get(name)
+                with (lock if lock is not None else nullcontext()):
+                    ev.clear()  # before reading: an ack landing in between sets it again instead of being lost
+                    ack = self._ack_latest.get(name)
                 if ack is None:
                     continue
                 if correlation_field and sent_stamp is not None:  # no header: nothing to correlate on
@@ -555,7 +828,9 @@ class ActionDispatcher:
             self._init_goal(goal, cfg["goal_init"], name)
 
         # 2. Fill model output values into mapped fields
-        if not _fill_msg(goal, cfg, slice_values, self._node):
+        compiled = self._compiled_mapping_for(name)
+        filled = _fill_msg(goal, cfg, slice_values, self._node, compiled) if compiled is not None else _fill_msg(goal, cfg, slice_values, self._node)
+        if not filled:
             logger.error(f"[ActionDispatcher] '{name}' goal not sent: a mapped field could not be set.")
             return False
         if self._dry_run:  # no goal sent, so no result or feedback to wait for
@@ -570,7 +845,8 @@ class ActionDispatcher:
         fb_cfg = cfg.get("feedback")
         if fb_cfg is None:
             future = client.send_goal_async(goal)
-            key = self._last_sent.get(name)  # this goal's: a late rejection must not forget a newer one
+            with self._goals_lock:
+                key = self._last_sent.get(name)  # this goal's: a late rejection must not forget a newer one
             future.add_done_callback(
                 lambda f, n=name, k=key: self._goal_response_callback(f, n, k)
             )
@@ -604,30 +880,44 @@ class ActionDispatcher:
         source = fb_cfg.get("source", "result")
         ev = threading.Event()
         holder: Dict[str, Any] = {}
-        key = self._last_sent.get(name)  # this goal's: a rejection after a timeout must not forget a newer one
+        with self._goals_lock:
+            key = self._last_sent.get(name)  # this goal's: a rejection after a timeout must not forget a newer one
 
         def _on_feedback(feedback_msg):
-            if source == "feedback" and _check_success(feedback_msg.feedback, fb_cfg):
-                holder["msg"] = feedback_msg.feedback
+            try:
+                if source == "feedback" and _check_success(feedback_msg.feedback, fb_cfg):
+                    holder["msg"] = feedback_msg.feedback
+                    ev.set()
+            except Exception as e:
+                holder["error"] = e
                 ev.set()
 
         def _on_goal_response(f):
-            goal_handle = f.result()
-            if not goal_handle.accepted:
-                logger.warning(f"[ActionDispatcher] Goal rejected by '{name}'")
-                self._forget_sent(name, key)  # not sent after all: retry it next tick
-                holder["rejected"] = True
-                ev.set()
-                return
-            self._track_goal(name, goal_handle)
-            if source == "result":
-                result_future = goal_handle.get_result_async()
-
-                def _on_result(rf):
-                    holder["msg"] = rf.result().result  # GetResult.Response.result
+            try:
+                goal_handle = f.result()
+                if not goal_handle.accepted:
+                    logger.warning(f"[ActionDispatcher] Goal rejected by '{name}'")
+                    self._forget_sent(name, key)  # not sent after all: retry it next tick
+                    holder["rejected"] = True
                     ev.set()
+                    return
+                self._track_goal(name, goal_handle)
+                if source == "result":
+                    result_future = goal_handle.get_result_async()
 
-                result_future.add_done_callback(_on_result)
+                    def _on_result(rf):
+                        try:
+                            holder["msg"] = rf.result().result  # GetResult.Response.result
+                        except Exception as e:
+                            holder["error"] = e
+                        finally:
+                            ev.set()
+
+                    result_future.add_done_callback(_on_result)
+            except Exception as e:
+                self._forget_sent(name, key)
+                holder["error"] = e
+                ev.set()
 
         future = client.send_goal_async(
             goal, feedback_callback=_on_feedback if source == "feedback" else None,
@@ -637,6 +927,9 @@ class ActionDispatcher:
         timeout = fb_cfg.get("timeout", 10.0)
         if not ev.wait(timeout=timeout):
             self._handle_timeout(name, fb_cfg, timeout)
+            return
+        if "error" in holder:
+            logger.warning(f"[ActionDispatcher] '{name}' action future failed: {holder['error']}")
             return
         if holder.get("rejected"):
             return
@@ -684,6 +977,14 @@ class ActionDispatcher:
                         array.append(ARRAY_TYPES[first_name]())
                     continue
 
+                # "trajectory.points: 1" — pre-allocate a nested array (control_msgs/FollowJointTrajectory)
+                if len(parts) > 1 and type(value) is int:
+                    parent, last, last_indices = _walk(goal, field_path)
+                    if not last_indices and last in ARRAY_TYPES and isinstance(getattr(parent, last), list):
+                        for _ in range(value):
+                            getattr(parent, last).append(ARRAY_TYPES[last]())
+                        continue
+
                 _assign(goal, field_path, lambda _current, v=value: v)  # all other cases: set the value at the path
 
             except Exception as e:
@@ -722,7 +1023,12 @@ class ActionDispatcher:
             raise ValueError(f"[ActionDispatcher] Unknown transform type: '{t}'")
 
     def _goal_response_callback(self, future: Any, name: str, key: Optional[str] = None) -> None:
-        goal_handle = future.result()
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            logger.warning(f"[ActionDispatcher] Goal response failed for '{name}': {e}")
+            self._forget_sent(name, key)
+            return
         if not goal_handle.accepted:
             logger.warning(
                 f"[ActionDispatcher] Goal rejected by '{name}'"
@@ -733,5 +1039,6 @@ class ActionDispatcher:
 
     def _forget_sent(self, name: str, key: Optional[str]) -> None:
         """Let a rejected goal be sent again, unless a newer goal (another key) was sent meanwhile."""
-        if key is None or self._last_sent.get(name) == key:
-            self._last_sent.pop(name, None)
+        with self._goals_lock:
+            if key is None or self._last_sent.get(name) == key:
+                self._last_sent.pop(name, None)

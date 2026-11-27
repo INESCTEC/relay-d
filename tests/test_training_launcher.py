@@ -359,3 +359,17 @@ def test_ctrl_c_keeps_the_trainings_last_output_in_the_log(folder, tmp_path):
     os.killpg(os.getpgid(pid), signal.SIGINT)
     assert wait_until(lambda: not runs._alive(run_dir, pid), seconds=5)
     assert "saved-final-checkpoint" in (run_dir / "train.log").read_text()
+
+
+def test_a_run_that_survives_stop_is_not_marked_stopped(folder, tmp_path, monkeypatch):
+    """A process that outlives SIGTERM and SIGKILL (e.g. stuck in the kernel) must not read as stopped."""
+    run_dir = folder / "training_runs" / "stuck"
+    run_dir.mkdir(parents=True)
+    (run_dir / "pid").write_text(f"{os.getpid()}\n")
+    monkeypatch.setattr(runs, "_alive", lambda d, pid: True)  # survives every signal
+    monkeypatch.setattr(runs.os, "getpgid", lambda pid: -1)
+    monkeypatch.setattr(runs.os, "killpg", lambda pgid, sig: None)
+    monkeypatch.setattr(runs.os, "kill", lambda pid, sig: None)
+    assert runs.stop(run_dir, grace=0.2) is False
+    assert not (run_dir / "exit_code").exists()  # was "143": the run table showed "stopped" for a live run
+    assert runs.read_run(run_dir).status == runs.RUNNING

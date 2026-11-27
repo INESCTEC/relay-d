@@ -64,6 +64,9 @@ relay-d-train = "relay_d.training.train_cli:main"
 testpaths = ["tests"]
 # A sourced ROS 2 registers its own pytest plugins, which break collection of this suite.
 addopts = "-p no:launch_testing -p no:launch_testing_ros_pytest_entrypoint -p no:launch_ros"
+markers = [
+    "sim: end-to-end simulation pipeline test requiring relayd-sim, ROS 2, and GPU (opt-in via RELAYD_SIM_E2E=1)",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -71,9 +74,9 @@ include = ["relay_d*"]
 
 [tool.setuptools.package-data]
 "relay_d.dispatch" = ["config_templates/*.yaml"]
+"relay_d.training" = ["templates/*.json"]
 "relay_d.acquisition.qt_app.ui.config" = ["templates/*.yaml"]
-"relay_d.acquisition.qt_app" = ["resources/**/*", "resources.qrc"]
+"relay_d.acquisition.qt_app" = ["resources/**/*"]
 "relay_d.acquisition.qt_app.ui.containers" = ["*.ui"]
-"relay_d.acquisition.qt_app.ui.postprocess.postprocess_configs" = ["*.json"]
 "relay_d.acquisition.qt_app.ui.review" = ["*.rviz"]
-"relay_d.acquisition.qt_app.ui.styles" = ["*.qss"]
+"relay_d.acquisition.qt_app.ui.styles" = ["*.qss", "icons/*.svg"]

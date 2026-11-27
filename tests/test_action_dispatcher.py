@@ -493,3 +493,162 @@ def test_euler_to_quat_round_trips_and_lands_at_euler_start(d):
     out = d._apply_transform(np.array([9.0, 0.3, -0.2, 1.1, 7.0], dtype=np.float32), {"type": "euler_to_quat", "euler_start": 1})
     assert out[0] == 9.0 and out[-1] == 7.0 and len(out) == 6
     np.testing.assert_allclose(out[1:5], _euler_to_quat(0.3, -0.2, 1.1), rtol=1e-6)
+
+
+def test_an_output_without_stop_or_limits_is_warned_about_at_startup(tmp_path, monkeypatch):
+    import relay_d.dispatch.action_dispatcher as ad
+
+    logged = []
+    monkeypatch.setattr(ad.logger, "warning", logged.append)
+    _load(tmp_path, {"grip": _GRIP}, dry_run=True)
+    assert any("'grip'" in m and "stop" in m for m in logged)  # was silent: its last command stays active
+    assert any("'grip'" in m and "limits" in m for m in logged)  # was silent: the model output goes out unclamped
+    logged.clear()
+    _load(tmp_path, {"grip": {**_GRIP, "stop": [0.0], "limits": [{"lower_lim": 0.0, "upper_lim": 1.0}]}}, dry_run=True)
+    assert not [m for m in logged if "'grip'" in m]
+
+
+def test_the_shipped_action_template_stops_the_arm():
+    from importlib import resources
+
+    import yaml
+
+    text = resources.files("relay_d.dispatch").joinpath("config_templates/action_config_template.yaml").read_text()
+    arm = yaml.safe_load(text)["actions"]["move_arm_joint"]
+    assert arm["stop"] == [0] * len(arm["indices"])  # zero deltas: the arm holds where it is
+
+
+# --- max_step (relative to the robot's measured position) and trajectory outputs
+def _state_node(sent, subs):
+    """A node whose publishers append to ``sent`` and whose subscriptions are kept in ``subs`` (topic -> callback)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(create_publisher=lambda cls, topic, qos: SimpleNamespace(publish=sent.append),
+                           create_subscription=lambda cls, topic, cb, qos: subs.setdefault(topic, cb))
+
+
+def _js(names, positions):
+    from sensor_msgs.msg import JointState
+
+    m = JointState()
+    m.name, m.position = list(names), [float(p) for p in positions]
+    return m
+
+
+_CMD = {"indices": [0, 1], "topic": "/cmd", "msg_type": "std_msgs/msg/Float64MultiArray", "mapping": {"data": [0, 1]},
+        "joint_names": ["a", "b"]}
+_TRAJ = {"indices": [0, 1], "trajectory": True, "topic": "/arm/joint_trajectory", "joint_names": ["a", "b"]}
+
+
+@pytest.mark.parametrize("max_step, expected", [(0.1, [0.1, 1.02]), ([0.1, 0.5], [0.1, 1.02]), ([0.6, 0.01], [0.5, 1.01])])
+def test_max_step_limits_each_command_around_the_measured_position(tmp_path, max_step, expected):
+    sent, subs = [], {}
+    d = _load(tmp_path, {"cmd": {**_CMD, "max_step": max_step}}, _state_node(sent, subs))
+    subs["/joint_states"](_js(["b", "a", "other"], [1.0, 0.0, 9.0]))  # by name, not by order
+    d.dispatch(np.array([0.5, 1.02]))
+    assert list(sent[-1].data) == pytest.approx(expected)  # was [0.5, 1.02]: a 0.5 rad jump went out
+
+
+def test_max_step_sends_nothing_without_a_fresh_measured_position(tmp_path):
+    sent, subs = [], {}
+    d = _load(tmp_path, {"cmd": {**_CMD, "max_step": 0.1, "stop": [0.0, 0.0]}}, _state_node(sent, subs))
+    d.dispatch(np.array([0.5, 1.0]))
+    assert [list(m.data) for m in sent] == []  # no state yet: nothing to limit against
+    subs["/joint_states"](_js(["a", "b"], [0.0, 1.0]))
+    d._joint_states["/joint_states"] = (d._joint_states["/joint_states"][0], 0.0)  # received long ago
+    d.dispatch(np.array([0.05, 1.0]))
+    assert [list(m.data) for m in sent] == []
+
+
+def test_a_null_joint_name_is_not_step_limited(tmp_path):
+    sent, subs = [], {}
+    d = _load(tmp_path, {"cmd": {**_CMD, "joint_names": ["a", None], "max_step": 0.1}}, _state_node(sent, subs))
+    subs["/joint_states"](_js(["a"], [0.0]))
+    d.dispatch(np.array([0.5, -1.0]))  # e.g. a gripper command that is no joint
+    assert list(sent[-1].data) == pytest.approx([0.1, -1.0])
+
+
+def test_a_trajectory_output_sends_the_chunk_step_limited_point_by_point(tmp_path):
+    sent, subs = [], {}
+    d = _load(tmp_path, {"arm": {**_TRAJ, "max_step": 0.1}}, _state_node(sent, subs))
+    d.period = 0.05
+    subs["/joint_states"](_js(["a", "b"], [0.0, 0.0]))
+    d.dispatch_trajectory(np.array([[0.05, 0.0], [0.5, 0.0], [0.6, -0.02]]))
+    msg = sent[-1]
+    assert list(msg.joint_names) == ["a", "b"]
+    assert [list(p.positions) for p in msg.points] == [pytest.approx(v) for v in ([0.05, 0.0], [0.15, 0.0], [0.25, -0.02])]
+    assert [p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in msg.points] == pytest.approx([0.05, 0.1, 0.15])
+    assert (msg.header.stamp.sec, msg.header.stamp.nanosec) == (0, 0)  # start now, replacing the previous one
+    d.dispatch(np.array([0.3, 0.0]))  # a policy without chunks: one point per tick
+    assert len(sent[-1].points) == 1 and list(sent[-1].points[0].positions) == pytest.approx([0.1, 0.0])
+
+
+def test_stop_on_a_trajectory_output_holds_the_measured_position(tmp_path):
+    sent, subs = [], {}
+    d = _load(tmp_path, {"arm": _TRAJ}, _state_node(sent, subs))
+    subs["/joint_states"](_js(["a", "b"], [0.3, -0.2]))
+    d.dispatch(np.array([0.3, -0.2]))
+    d.send_stop()
+    assert len(sent[-1].points) == 1 and list(sent[-1].points[0].positions) == pytest.approx([0.3, -0.2])
+
+
+@pytest.mark.parametrize("entry, match", [
+    ({**_TRAJ, "joint_names": None}, "joint_names"),
+    ({**_TRAJ, "joint_names": ["a"]}, "joint_names"),
+    ({**_TRAJ, "action": True, "action_type": "x/action/Y"}, "trajectory"),
+    ({**_TRAJ, "mapping": {"x": 0}}, "trajectory"),
+    ({**_CMD, "joint_names": None, "max_step": 0.1}, "joint_names"),
+    ({**_CMD, "max_step": -0.1}, "max_step"),
+    ({**_CMD, "max_step": [0.1, 0.1, 0.1]}, "max_step"),
+])
+def test_a_broken_trajectory_or_max_step_entry_is_refused_at_startup(tmp_path, entry, match):
+    with pytest.raises(ValueError, match=match):
+        _load(tmp_path, {"e": entry}, _state_node([], {}))
+
+
+def test_max_step_counts_as_a_limit_for_the_startup_warning(tmp_path, monkeypatch):
+    import relay_d.dispatch.action_dispatcher as ad
+
+    logged = []
+    monkeypatch.setattr(ad.logger, "warning", logged.append)
+    _load(tmp_path, {"arm": {**_TRAJ, "max_step": 0.1}}, _state_node([], {}))
+    assert not any("limits" in m for m in logged)
+
+
+def test_a_follow_joint_trajectory_goal_can_be_configured(tmp_path):
+    """control_msgs/FollowJointTrajectory, the standard arm action (joint_trajectory_controller, ur_robot_driver):
+    its points array is nested (trajectory.points), not at the top of the goal."""
+    pytest.importorskip("control_msgs")
+    names = [f"j{i}" for i in range(1, 4)]
+    entry = {"indices": [0, 1, 2], "action": True, "action_type": "control_msgs/action/FollowJointTrajectory",
+             "topic": "/arm/follow_joint_trajectory",
+             "goal_init": {"trajectory.joint_names": names, "trajectory.points": 1,
+                           "trajectory.points[0].time_from_start.nanosec": 50_000_000},
+             "mapping": {"trajectory.points[0].positions": [0, 1, 2]}}
+    d = _load(tmp_path, {"arm": entry}, dry_run=True)  # was: goal_init failed ('int' object is not subscriptable)
+    goal = d._goal_classes["arm"]()
+    d._init_goal(goal, entry["goal_init"], "arm")
+    from relay_d.dispatch.action_dispatcher import _fill_msg
+    assert _fill_msg(goal, entry, np.array([0.1, 0.2, 0.3]), None)
+    assert list(goal.trajectory.joint_names) == names and len(goal.trajectory.points) == 1
+    assert list(goal.trajectory.points[0].positions) == pytest.approx([0.1, 0.2, 0.3])
+    assert goal.trajectory.points[0].time_from_start.nanosec == 50_000_000
+
+
+def test_an_action_streamed_every_tick_is_warned_about(tmp_path, monkeypatch):
+    """Without feedback an action entry sends a new goal each tick, preempting the last: a joint_trajectory_controller
+    crashed under that at 20 Hz. Continuous control belongs on a trajectory entry."""
+    pytest.importorskip("control_msgs")
+    import relay_d.dispatch.action_dispatcher as ad
+
+    logged = []
+    monkeypatch.setattr(ad.logger, "warning", logged.append)
+    entry = {"indices": [0], "action": True, "action_type": "control_msgs/action/FollowJointTrajectory",
+             "topic": "/arm/follow_joint_trajectory", "limits": [{"lower_lim": -1.0, "upper_lim": 1.0}],
+             "goal_init": {"trajectory.joint_names": ["j1"], "trajectory.points": 1},
+             "mapping": {"trajectory.points[0].positions": [0]}}
+    _load(tmp_path, {"arm": entry}, dry_run=True)
+    assert any("'arm'" in m and "trajectory: true" in m for m in logged)  # was silent
+    logged.clear()
+    _load(tmp_path, {"arm": {**entry, "feedback": {"success_field": "error_code", "success_value": 0}}}, dry_run=True)
+    assert not any("trajectory: true" in m for m in logged)  # waits for each goal: no preemption storm

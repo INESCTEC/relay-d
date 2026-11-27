@@ -12,8 +12,8 @@ from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from relay_d.acquisition.qt_app.ui.run import run_page as rp  # noqa: E402
 
-# Prints until SIGINT, then exits 0 like the node's Ctrl+C path.
-STAND_IN = ("import time\ntry:\n    while True:\n        print('tick', flush=True)\n        time.sleep(0.05)\n"
+# Prints until SIGTERM (the STOP button) or SIGINT, then exits 0 like the node's safe-stop path.
+STAND_IN = ("import signal, time\nsignal.signal(signal.SIGTERM, signal.default_int_handler)\ntry:\n    while True:\n        print('tick', flush=True)\n        time.sleep(0.05)\n"
             "except KeyboardInterrupt:\n    print('safe stop sent', flush=True)\n")
 
 
@@ -47,6 +47,7 @@ def test_args_dry_run_and_hz():
     assert args[args.index("--obs-config") + 1] == "/d/obs_config.yaml"
     args = rp.build_args("/c.pth", "/d", "cuda", " 30 ", False)
     assert "--dry-run" not in args and args[args.index("--hz") + 1] == "30"
+    assert "--exit-with-parent" in args  # the node stops the robot and exits if the GUI dies
 
 
 def test_start_needs_both_dispatch_files_and_postprocess_folder_maps_to_subfolder(page):

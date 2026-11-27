@@ -68,7 +68,7 @@
          </size>
         </property>
         <property name="text">
-         <string>📊 Joint Data Visualization Area
+         <string>Joint Data Visualization Area
 
 Real-time joint position, velocity,
 and torque data will be displayed here</string>
@@ -101,7 +101,10 @@ and torque data will be displayed here</string>
            </size>
           </property>
            <property name="text">
-            <string>Position: 0.0</string>
+            <string>Pos --</string>
+          </property>
+          <property name="toolTip">
+           <string>Mean joint position (rad or m)</string>
           </property>
           <property name="alignment">
            <set>Qt::AlignCenter</set>
@@ -123,7 +126,10 @@ and torque data will be displayed here</string>
            </size>
           </property>
            <property name="text">
-            <string>Velocity: 0.0 rad/s</string>
+            <string>Vel --</string>
+          </property>
+          <property name="toolTip">
+           <string>Mean absolute joint velocity (rad/s or m/s)</string>
           </property>
           <property name="alignment">
            <set>Qt::AlignCenter</set>
@@ -145,7 +151,10 @@ and torque data will be displayed here</string>
            </size>
           </property>
            <property name="text">
-            <string>Torque: 0.0 Nm</string>
+            <string>Eff --</string>
+          </property>
+          <property name="toolTip">
+           <string>Mean absolute joint effort (Nm or N)</string>
           </property>
           <property name="alignment">
            <set>Qt::AlignCenter</set>
@@ -186,7 +195,7 @@ and torque data will be displayed here</string>
       </font>
      </property>
      <property name="text">
-      <string>🎯 Topic Name</string>
+      <string>—</string>
      </property>
      <property name="scaledContents">
       <bool>false</bool>

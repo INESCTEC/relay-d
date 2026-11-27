@@ -62,7 +62,7 @@ SETTINGS: Tuple[Setting, ...] = (
        minimum=-1, maximum=232, applies=RESTART),
     # ---- Recording
     _s("rec_default_max_buffer_mb", "Recording", "Default memory buffer (MB)", "int", 4096,
-       "Samples stay in RAM until Stop (a crash before Stop loses the demo being recorded); sampling stops at this size. Used when the config has no max_buffer_mb.",
+       "Camera and point-cloud frames stream to disk in the background; this limits the in-flight memory queue if disk writes fall behind. Used when the config has no max_buffer_mb.",
        minimum=64, maximum=1_000_000),
     _s("rec_warmup_s", "Recording", "Warm-up wait before recording (s)", "float", 2.0,
        "Time to wait for every input to deliver a first sample after Start.", minimum=0.0, maximum=60.0),

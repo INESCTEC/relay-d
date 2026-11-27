@@ -23,10 +23,10 @@ import h5py
 
 from relay_d.utils import user_settings
 from relay_d.utils.coloring_logger import logger
-from relay_d.acquisition.qt_app.ui.postprocess.postprocess_config_loader import PostprocessConfigLoader
-from relay_d.acquisition.qt_app.ui.postprocess.robomimic_config_handler import (
+from relay_d.training.robomimic_config import (
     RobomimicConfigHandler,
     classify_observations,
+    robomimic_template_path,
 )
 
 ROBOMIMIC, LEROBOT = "robomimic", "lerobot"
@@ -211,7 +211,7 @@ def _robomimic_base_config(dataset: DatasetInfo, policy: Optional[str]) -> dict:
     if policy is None and saved.exists():
         return RobomimicConfigHandler(str(saved)).get_config()
     model = _robomimic_policy(dataset, policy)
-    template = PostprocessConfigLoader().get_output_train_config(ROBOMIMIC, model)
+    template = robomimic_template_path(model)
     if not template or not os.path.exists(template):
         raise TrainingError(f"no robomimic config template for '{model}'")
     handler = RobomimicConfigHandler(template)

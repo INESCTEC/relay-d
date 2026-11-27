@@ -36,24 +36,21 @@
     <number>16</number>
    </property>
    <item>
-    <widget class="QVideoWidget" name="widget_video" native="true">
+    <widget class="QLabel" name="label_image">
      <property name="sizePolicy">
-      <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
+      <sizepolicy hsizetype="Ignored" vsizetype="Ignored">
        <horstretch>0</horstretch>
        <verstretch>0</verstretch>
       </sizepolicy>
      </property>
      <property name="minimumSize">
       <size>
-       <width>400</width>
+       <width>200</width>
        <height>300</height>
       </size>
      </property>
-     <property name="maximumSize">
-      <size>
-       <width>16777215</width>
-       <height>16777215</height>
-      </size>
+     <property name="alignment">
+      <set>Qt::AlignCenter</set>
      </property>
     </widget>
    </item>
@@ -86,7 +83,7 @@
       </font>
      </property>
      <property name="text">
-      <string>Topic Name</string>
+      <string>—</string>
      </property>
      <property name="scaledContents">
       <bool>false</bool>
@@ -125,7 +122,10 @@
         </size>
        </property>
        <property name="text">
-        <string>📊 Frame Rate: 30 FPS</string>
+        <string>-- FPS</string>
+       </property>
+       <property name="toolTip">
+        <string>Messages per second received on the topic (last 2 s)</string>
        </property>
        <property name="scaledContents">
         <bool>false</bool>
@@ -159,7 +159,10 @@
         </size>
        </property>
        <property name="text">
-        <string>🕒 Timestamp: 12:34:56</string>
+        <string>--:--:--</string>
+       </property>
+       <property name="toolTip">
+        <string>Header time of the latest message</string>
        </property>
        <property name="scaledContents">
         <bool>false</bool>
@@ -192,14 +195,6 @@
    </item>
   </layout>
  </widget>
- <customwidgets>
-  <customwidget>
-   <class>QVideoWidget</class>
-   <extends>QWidget</extends>
-   <header>PyQt5.QtMultimediaWidgets</header>
-   <container>1</container>
-  </customwidget>
- </customwidgets>
  <resources/>
  <connections/>
 </ui>

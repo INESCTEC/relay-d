@@ -15,7 +15,7 @@ from relay_d.utils.tf_topic import (
 )
 from threading import Lock, Thread, current_thread
 from rclpy.executors import SingleThreadedExecutor
-import importlib
+from rosidl_runtime_py.utilities import get_message
 import time
 
 
@@ -176,15 +176,16 @@ class TopicSubscribers(Node):
             )
 
             self.subscribers[container_id] = subscriber
-            self.latest_data[container_id] = None
-            self.subscriber_status[container_id] = {
-                "topic": topic_path,
-                "msg_type": str(msg_class),
-                "created_at": time.time(),
-                "message_count": 0,
-                "last_message_time": None,
-                "status": "active",
-            }
+            with self.data_lock:
+                self.latest_data[container_id] = None
+                self.subscriber_status[container_id] = {
+                    "topic": topic_path,
+                    "msg_type": str(msg_class),
+                    "created_at": time.time(),
+                    "message_count": 0,
+                    "last_message_time": None,
+                    "status": "active",
+                }
 
             logger.info(f"Successfully created subscriber for {container_id}")
             return True
@@ -291,9 +292,8 @@ class TopicSubscribers(Node):
         since a wrong type subscribes fine and then never receives a message."""
         if topic_type_msg in self.message_type_cache:
             return self.message_type_cache[topic_type_msg]
-        parts = (topic_type_msg or "").split("/")
         try:
-            msg_class = getattr(importlib.import_module(f"{parts[0]}.msg"), parts[-1])
+            msg_class = get_message(topic_type_msg or "")
         except Exception as e:
             logger.error(f"Cannot import the message type {topic_type_msg!r} of {topic_path}: {e}. "
                          f"Source the workspace that defines it, then restart.")
@@ -377,8 +377,8 @@ class TopicSubscribers(Node):
                 with self.data_lock:
                     self.latest_data.pop(container_id, None)
                     self.latest_timestamps.pop(container_id, None)
-                if container_id in self.subscriber_status:
-                    self.subscriber_status[container_id]["status"] = "stopped"
+                    if container_id in self.subscriber_status:
+                        self.subscriber_status[container_id]["status"] = "stopped"
                 if container_id in self.tf_lookup_containers:
                     del self.tf_lookup_containers[container_id]
                 self._log_throttled(f"Stopped subscriber for {container_id}")
@@ -400,8 +400,8 @@ class TopicSubscribers(Node):
             with self.data_lock:
                 self.latest_data.clear()
                 self.latest_timestamps.clear()
+                self.subscriber_status.clear()
             self.tf_lookup_containers.clear()
-            self.subscriber_status.clear()
 
             # Drop any custom-topic TF buffers/listeners created for the
             # previous config — otherwise their subscriptions pile up on
@@ -435,14 +435,23 @@ class TopicSubscribers(Node):
         self._spin_thread.start()
 
     def _spin_loop(self, executor):
-        while self._should_spin:
+        try:
+            while self._should_spin:
+                try:
+                    executor.spin_once(timeout_sec=0.01)
+                except Exception as e:
+                    if not rclpy.ok():
+                        break
+                    self._log_throttled(f"Error spinning topic_subscribers: {e}", "spin")
+        finally:
             try:
-                executor.spin_once(timeout_sec=0.01)
-            except Exception as e:
-                if not rclpy.ok():
-                    break
-                self._log_throttled(f"Error spinning topic_subscribers: {e}", "spin")
-        executor.remove_node(self)
+                executor.remove_node(self)
+            except Exception:
+                pass
+            try:
+                executor.shutdown()
+            except Exception:
+                pass
 
     def stop_spinning(self):
         """Stop the spin thread (no join when called from a callback on that thread)."""
@@ -546,17 +555,18 @@ class TopicSubscribers(Node):
             }
 
             self.subscribers[container_id] = "tf_lookup"
-            self.latest_data[container_id] = None
-            self.subscriber_status[container_id] = {
-                "topic": f"TF:{parent_frame}->{child_frame} @ {tf_topic}",
-                "msg_type": "tf_lookup",
-                "created_at": time.time(),
-                "message_count": 0,
-                "last_message_time": None,
-                "status": "active",
-                "parent_frame": parent_frame,
-                "child_frame": child_frame,
-            }
+            with self.data_lock:
+                self.latest_data[container_id] = None
+                self.subscriber_status[container_id] = {
+                    "topic": f"TF:{parent_frame}->{child_frame} @ {tf_topic}",
+                    "msg_type": "tf_lookup",
+                    "created_at": time.time(),
+                    "message_count": 0,
+                    "last_message_time": None,
+                    "status": "active",
+                    "parent_frame": parent_frame,
+                    "child_frame": child_frame,
+                }
 
             self._lookup_tf_transform(container_id, parent_frame, child_frame, buffer)
             return True
@@ -676,9 +686,12 @@ class TopicSubscribers(Node):
         logger.info("Flushed latest_data and timestamps before recording start")
 
     def get_message_count(self, container_id):
-        return self.subscriber_status.get(container_id, {}).get("message_count", 0)
+        with self.data_lock:
+            return self.subscriber_status.get(container_id, {}).get("message_count", 0)
 
     def get_subscriber_status(self, container_id=None):
-        if container_id:
-            return self.subscriber_status.get(container_id, {})
-        return dict(self.subscriber_status)
+        with self.data_lock:
+            if container_id:
+                status = self.subscriber_status.get(container_id)
+                return dict(status) if status is not None else {}
+            return {k: dict(v) for k, v in self.subscriber_status.items()}
