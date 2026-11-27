@@ -140,7 +140,15 @@ def _set_pdeathsig(parent_pid: Optional[int]) -> bool:
         try:
             PR_SET_PDEATHSIG = 1
             libc = ctypes.CDLL("libc.so.6", use_errno=True)
-            libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
+            libc.prctl.argtypes = [
+                ctypes.c_int,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+            ]
+            libc.prctl.restype = ctypes.c_int
+            libc.prctl(PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
         except Exception:
             pass
     return os.getppid() == parent_pid

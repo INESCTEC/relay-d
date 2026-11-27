@@ -304,17 +304,56 @@ def test_subprocess_policy_runner_step_timeout_kills_wedged_worker(tmp_path, mon
         runner.close()
 
 
+def _pid_is_running(pid: int) -> bool:
+    """True if ``pid`` is alive and NOT a zombie.
+
+    Inside Docker containers without ``--init`` (e.g. GitHub Actions ``container: ros:jazzy``),
+    PID 1 does not reap orphaned children, so ``os.kill(zombie_pid, 0)`` still succeeds even
+    though the process has already exited and freed all memory/VRAM/FDs.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("State:"):
+                state = line.split(":", 1)[1].strip()
+                return not state.startswith(("Z", "X"))
+    except OSError:
+        return False
+    return True
+
+
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux PR_SET_PDEATHSIG only")
 def test_policy_worker_exits_when_parent_is_sigkilled(tmp_path):
-    """Spawn a helper parent that starts SubprocessPolicyRunner, prints child PID, then gets SIGKILLed."""
+    """Spawn a helper parent whose worker is actively blocked in get_action, then SIGKILL the parent."""
+    # Sanity-check zombie detection directly (mirrors unreaped orphans under container PID 1).
+    zombie = subprocess.Popen([sys.executable, "-c", "pass"])
+    try:
+        deadline = time.monotonic() + 2.0
+        while _pid_is_running(zombie.pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not _pid_is_running(zombie.pid)
+    finally:
+        zombie.wait(timeout=2.0)
+
     mod = _write_hanging_worker_module(tmp_path)
     helper = f"""
-import sys, time
+import sys, threading, time
+import numpy as np
 from relay_d.dispatch.remote_runner import SubprocessPolicyRunner
 r = SubprocessPolicyRunner(
     backend="lerobot", checkpoint="/fake", device="cpu",
     python_executable=sys.executable, worker_module={mod!r},
 )
+# Block the worker inside a 30s get_action call so socket EOF alone cannot wake it:
+# only Linux PR_SET_PDEATHSIG(SIGTERM) terminates it when this parent is SIGKILLed.
+threading.Thread(
+    target=lambda: r.get_action({{"state": np.array([100.0], dtype=np.float32)}}),
+    daemon=True,
+).start()
+time.sleep(0.15)
 print("WORKER_PID=" + str(r._proc.pid), flush=True)
 time.sleep(60)
 """
@@ -331,17 +370,11 @@ time.sleep(60)
     try:
         os.kill(parent.pid, 9)  # abrupt SIGKILL
         parent.wait(timeout=5.0)
-        # Worker must die promptly via PR_SET_PDEATHSIG(SIGTERM) + socket EOF
+        # Worker must exit promptly via PR_SET_PDEATHSIG(SIGTERM) (zombie or reaped)
         deadline = time.monotonic() + 3.0
-        alive = True
-        while time.monotonic() < deadline:
-            try:
-                os.kill(worker_pid, 0)
-            except ProcessLookupError:
-                alive = False
-                break
+        while _pid_is_running(worker_pid) and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert not alive, f"worker pid {worker_pid} survived parent SIGKILL"
+        assert not _pid_is_running(worker_pid), f"worker pid {worker_pid} survived parent SIGKILL"
     finally:
         try:
             os.kill(worker_pid, 9)

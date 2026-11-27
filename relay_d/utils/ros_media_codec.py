@@ -20,7 +20,11 @@ Unorganized PointCloud2 (height <= 1) is likewise unsupported on both sides —
 no fixed per-frame shape to decode into.
 """
 import numpy as np
-from sensor_msgs_py import point_cloud2
+
+try:
+    from sensor_msgs_py import point_cloud2
+except ImportError:  # keep pure-numpy image decoding importable on ROS-free hosts
+    point_cloud2 = None
 
 from relay_d.utils.coloring_logger import logger
 
@@ -129,6 +133,8 @@ def decode_organized_pointcloud(pc_msg):
     fixed per-frame shape and are not supported here — or on decode failure.
     """
     try:
+        if point_cloud2 is None:
+            raise ImportError("sensor_msgs_py is required to decode PointCloud2 messages")
         if pc_msg.height <= 1:
             return None
         field_names = [field.name for field in pc_msg.fields]
